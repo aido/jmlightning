@@ -1,0 +1,48 @@
+[project]
+name = "jmlightning"
+version = "0.1.0"
+description = "JoinMarket-NG bridge module for Lightning Network nodes (Core Lightning)"
+requires-python = ">=3.11"
+dependencies = [
+    "jmcore>=0.36.0",
+    "jmwallet>=0.36.0",
+    "pyln-client>=26.6.6",
+]
+
+[project.scripts]
+jm-lightning = "jmlightning.cli:main"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true
+mypy_path = "src"
+explicit_package_bases = true
+
+[[tool.mypy.overrides]]
+module = "pyln.client.*"
+ignore_missing_imports = true
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+ignore = []
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
