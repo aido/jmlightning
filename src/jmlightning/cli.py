@@ -30,7 +30,10 @@ from loguru import logger
 from pydantic import SecretStr
 
 from jmlightning.config import CLNConfig
-from jmlightning.operations.open_channel import OpenChannelOperation
+from jmlightning.operations.open_channel import (
+    OpenChannelOperation,
+    confirm_open_channel,
+)
 
 __all__ = ["app"]
 
@@ -182,6 +185,14 @@ def open_channel(
             help="Path to mnemonic file",
         ),
     ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip interactive confirmation.",
+        ),
+    ] = False,
 ) -> None:
     """
     Open a CLN channel using UTXOs strictly validated by the
@@ -209,12 +220,15 @@ def open_channel(
         mixdepth=mixdepth,
     )
 
+    confirm = None if yes else confirm_open_channel
+
     asyncio.run(
         OpenChannelOperation(
             config=config,
             cln_socket=cln_socket,
         ).execute(
             peer_id=peer_id,
+            confirm=confirm,
         )
     )
 

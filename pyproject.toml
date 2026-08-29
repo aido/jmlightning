@@ -4,9 +4,9 @@ version = "0.1.0"
 description = "JoinMarket-NG bridge module for Lightning Network nodes (Core Lightning)"
 requires-python = ">=3.11"
 dependencies = [
-    "jmcore>=0.36.0",
-    "jmwallet>=0.36.0",
-    "pyln-client>=26.6.6",
+    "jmcore>=0.36.0,<0.39.0",
+    "jmwallet>=0.36.0,<0.39.0",
+    "pyln-client>=26.0.0,<27.0.0",
 ]
 
 [project.scripts]

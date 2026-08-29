@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import Mock
 
 import pytest
@@ -22,13 +23,30 @@ def _mock_wallet() -> Mock:
 
     signing_plan = SimpleNamespace(
         signable_count=2,
+        source_psbt=None,
     )
     wallet.prepare_psbt_signing.return_value = signing_plan
 
-    wallet.sign_psbt.return_value = SimpleNamespace(
-        psbt=b"psbt\xffsigned",
+    default_signing_result = SimpleNamespace(
+        psbt=None,
         signed_indices=[0, 1],
     )
+    wallet.sign_psbt.return_value = default_signing_result
+
+    def prepare_psbt_signing(psbt: bytes, scan_range: int) -> SimpleNamespace:
+        current_plan = wallet.prepare_psbt_signing.return_value
+        if current_plan is signing_plan:
+            signing_plan.source_psbt = psbt
+        return cast(SimpleNamespace, current_plan)
+
+    def sign_psbt(plan: SimpleNamespace) -> SimpleNamespace:
+        current_result = wallet.sign_psbt.return_value
+        if current_result is default_signing_result:
+            default_signing_result.psbt = plan.source_psbt
+        return cast(SimpleNamespace, current_result)
+
+    wallet.prepare_psbt_signing.side_effect = prepare_psbt_signing
+    wallet.sign_psbt.side_effect = sign_psbt
 
     return wallet
 
@@ -68,7 +86,7 @@ def test_build_and_sign_funding_tx_creates_funding_output(
     assert tx.outputs[1].value == plan.change
     assert len(tx.inputs) == len(plan.inputs)
     assert txid
-    assert psbt == b"psbt\xffsigned"
+    assert psbt == wallet.sign_psbt.return_value.psbt
 
 
 def test_build_and_sign_funding_tx_uses_psbt_signing(
@@ -123,7 +141,7 @@ def test_build_and_sign_funding_tx_returns_signed_psbt(
         wallet=wallet,
     )
 
-    assert signed_psbt == b"psbt\xffsigned"
+    assert signed_psbt == wallet.sign_psbt.return_value.psbt
     assert signed_psbt.startswith(b"psbt\xff")
 
 
@@ -233,6 +251,84 @@ def test_build_and_sign_funding_tx_rejects_incomplete_signing(
         )
 
 
+def test_build_and_sign_funding_tx_rejects_duplicate_signed_indices(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    wallet.sign_psbt.return_value = SimpleNamespace(
+        psbt=b"psbt\xffsigned",
+        signed_indices=[0, 0],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="duplicate signed input indices",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
+def test_build_and_sign_funding_tx_rejects_different_signed_psbt(
+    classified_utxos: list[ClassifiedUTXO],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    wallet.sign_psbt.side_effect = lambda plan: SimpleNamespace(
+        psbt=b"different-valid-psbt",
+        signed_indices=[0, 1],
+    )
+
+    monkeypatch.setattr(
+        "jmlightning.tx_builder.parse_psbt",
+        lambda _: SimpleNamespace(unsigned_tx=b"different-transaction"),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="PSBT for a different transaction",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
+def test_build_and_sign_funding_tx_rejects_invalid_signed_psbt(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    wallet.sign_psbt.side_effect = lambda plan: SimpleNamespace(
+        psbt=b"not-a-psbt",
+        signed_indices=[0, 1],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid signed PSBT",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
 def test_build_and_sign_funding_tx_propagates_psbt_signing_failure(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
@@ -251,3 +347,185 @@ def test_build_and_sign_funding_tx_propagates_psbt_signing_failure(
         )
 
     wallet.sign_input.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_empty_inputs() -> None:
+    builder = TxBuilder()
+
+    plan = ExecutionPlan(
+        inputs=[],
+        amount=100_000,
+        fee=100,
+        vsize=100,
+        change=0,
+        warnings=[],
+        rationale="test",
+    )
+
+    wallet = _mock_wallet()
+
+    with pytest.raises(
+        ValueError,
+        match="at least one input",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+    wallet.sign_psbt.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_duplicate_inputs(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+
+    coin = classified_utxos[0]
+
+    plan = ExecutionPlan(
+        inputs=[coin, coin],
+        amount=100_000,
+        fee=100,
+        vsize=100,
+        change=99_900,
+        warnings=[],
+        rationale="test",
+    )
+
+    wallet = _mock_wallet()
+
+    with pytest.raises(
+        ValueError,
+        match="duplicate inputs",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+    wallet.sign_psbt.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_negative_fee(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+
+    plan = _build_plan(classified_utxos)
+
+    invalid_plan = ExecutionPlan(
+        inputs=plan.inputs,
+        amount=plan.amount,
+        fee=-1,
+        vsize=plan.vsize,
+        change=plan.change,
+        warnings=plan.warnings,
+        rationale=plan.rationale,
+    )
+
+    wallet = _mock_wallet()
+
+    with pytest.raises(
+        ValueError,
+        match="fee cannot be negative",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=invalid_plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+    wallet.sign_psbt.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_inconsistent_amounts(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+
+    plan = _build_plan(classified_utxos)
+
+    invalid_plan = ExecutionPlan(
+        inputs=plan.inputs,
+        amount=plan.amount + 1,
+        fee=plan.fee,
+        vsize=plan.vsize,
+        change=plan.change,
+        warnings=plan.warnings,
+        rationale=plan.rationale,
+    )
+
+    wallet = _mock_wallet()
+
+    with pytest.raises(
+        ValueError,
+        match="inconsistent amounts",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=invalid_plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+    wallet.sign_psbt.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_non_positive_amount(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+
+    invalid_plan = ExecutionPlan(
+        inputs=plan.inputs,
+        amount=0,
+        fee=plan.fee,
+        vsize=plan.vsize,
+        change=plan.change,
+        warnings=plan.warnings,
+        rationale=plan.rationale,
+    )
+
+    with pytest.raises(ValueError, match="amount must be positive"):
+        builder.build_and_sign_funding_tx(
+            plan=invalid_plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )
+
+
+def test_build_and_sign_funding_tx_rejects_negative_change(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+
+    invalid_plan = ExecutionPlan(
+        inputs=plan.inputs,
+        amount=plan.amount,
+        fee=plan.fee,
+        vsize=plan.vsize,
+        change=-1,
+        warnings=plan.warnings,
+        rationale=plan.rationale,
+    )
+
+    with pytest.raises(ValueError, match="change cannot be negative"):
+        builder.build_and_sign_funding_tx(
+            plan=invalid_plan,
+            funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import ceil
+from math import ceil, isfinite
 
 from jmcore.bitcoin import estimate_vsize
 from jmcore.constants import DUST_THRESHOLD
@@ -36,6 +36,9 @@ class Planner:
         Assumes the caller has already validated that the selected coins
         are permitted for the intended capability.
         """
+        if not isfinite(fee_rate) or fee_rate <= 0:
+            raise ValueError("Fee rate must be finite and positive.")
+
         accumulated = sum(coin.utxo.value for coin in selected_coins)
 
         sweep = target_amount == 0

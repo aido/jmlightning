@@ -2,6 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
 
 
@@ -186,3 +187,264 @@ def test_open_channel_complete_preserves_completion_error_if_cancel_fails() -> N
         )
 
     assert exc_info.value.__cause__ is completion_error
+
+
+def test_cancel_channel_funding_calls_fundchannel_cancel() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    backend.cancel_channel_funding(
+        peer_id="02" + "11" * 32,
+    )
+
+    rpc.fundchannel_cancel.assert_called_once_with(
+        node_id="02" + "11" * 32,
+    )
+
+
+def test_get_channel_funding_status_reports_withheld() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    txid = "11" * 32
+
+    rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "peer_id": "02" + "11" * 32,
+                "funding_txid": txid,
+                "funding": {"withheld": True},
+            }
+        ]
+    }
+
+    assert (
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid=txid,
+        )
+        is ChannelFundingStatus.WITHHELD
+    )
+
+    rpc.listtransactions.assert_not_called()
+
+
+def test_get_channel_funding_status_reports_broadcast_channel() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    txid = "11" * 32
+
+    rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "peer_id": "02" + "11" * 32,
+                "funding_txid": txid,
+                "funding": {"withheld": False},
+            }
+        ]
+    }
+
+    assert (
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid=txid,
+        )
+        is ChannelFundingStatus.BROADCAST
+    )
+
+
+def test_get_channel_funding_status_reports_broadcast_transaction() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    txid = "11" * 32
+
+    rpc.listpeerchannels.return_value = {"channels": []}
+    rpc.listtransactions.return_value = {
+        "transactions": [{"hash": txid}],
+    }
+
+    assert (
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid=txid,
+        )
+        is ChannelFundingStatus.BROADCAST
+    )
+
+
+def test_get_channel_funding_status_reports_absent() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.listpeerchannels.return_value = {"channels": []}
+    rpc.listtransactions.return_value = {"transactions": []}
+
+    assert (
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid="11" * 32,
+        )
+        is ChannelFundingStatus.ABSENT
+    )
+
+
+def test_get_channel_funding_status_raises_if_state_cannot_be_read() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.listpeerchannels.side_effect = RuntimeError("rpc unavailable")
+
+    with pytest.raises(
+        RuntimeError,
+        match="Failed to determine CLN funding status",
+    ):
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid="11" * 32,
+        )
+
+
+def test_get_fee_rate_rejects_empty_fee_estimates() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid or empty feerates data",
+    ):
+        backend.get_fee_rate()
+
+
+def test_get_fee_rate_rejects_malformed_response() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": "invalid",
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid or empty feerates data",
+    ):
+        backend.get_fee_rate()
+
+
+def test_get_fee_rate_rejects_malformed_fee_entry() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [
+            {
+                "blocks": 6,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid fee rate",
+    ):
+        backend.get_fee_rate()
+
+
+def test_get_fee_rate_rejects_invalid_confirmation_target() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [
+            {
+                "blocks": 0,
+                "feerate": 1000,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid confirmation target",
+    ):
+        backend.get_fee_rate()
+
+
+def test_get_fee_rate_rejects_non_positive_fee_rate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [
+            {
+                "blocks": 6,
+                "feerate": 0,
+            },
+        ],
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid fee rate",
+    ):
+        backend.get_fee_rate()

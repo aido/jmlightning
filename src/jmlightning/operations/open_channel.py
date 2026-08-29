@@ -1,18 +1,54 @@
 from __future__ import annotations
 
+from collections.abc import Callable
+from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
 
-from jmcore.bitcoin import estimate_vsize
+import typer
+from jmcore.bitcoin import ParsedTransaction, estimate_vsize
 from loguru import logger
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
+from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
-from jmlightning.planner import Planner
+from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.tx_builder import TxBuilder
+
+ConfirmationCallback = Callable[
+    [str, ExecutionPlan, ParsedTransaction, str, str],
+    bool,
+]
+
+
+class FundingPhase(StrEnum):
+    PRESTART = auto()
+    LOCKED = auto()
+    STARTED = auto()
+    WITHHELD = auto()
+    BROADCAST = auto()
+
+
+class FundingCancelledError(RuntimeError):
+    """Raised when the operator declines channel funding."""
+
+
+class FundingRecoveryRequiredError(RuntimeError):
+    """Raised when funding state cannot be made safe automatically."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        peer_id: str,
+        txid: str | None,
+    ) -> None:
+        super().__init__(message)
+        self.peer_id = peer_id
+        self.txid = txid
 
 
 class OpenChannelOperation:
@@ -37,6 +73,7 @@ class OpenChannelOperation:
     async def execute(
         self,
         peer_id: str,
+        confirm: ConfirmationCallback | None = None,
     ) -> None:
         policy = PolicyEngine()
         planner = Planner()
@@ -45,7 +82,12 @@ class OpenChannelOperation:
         tx_builder = TxBuilder()
 
         selected: list[ClassifiedUTXO] = []
-        channel_funding_started = False
+        locked: list[ClassifiedUTXO] = []
+        phase = FundingPhase.PRESTART
+        txid: str | None = None
+        release_locks = True
+        operation_error: Exception | None = None
+        cleanup_errors: list[Exception] = []
 
         try:
             # --------------------------------------------------------
@@ -228,23 +270,40 @@ class OpenChannelOperation:
 
             for coin in selected:
                 jmadapter.lock(coin)
+                locked.append(coin)
+
+            phase = FundingPhase.LOCKED
 
             logger.info(
                 "Locked {} UTXOs for channel funding.",
-                len(selected),
+                len(locked),
             )
 
             # --------------------------------------------------------
             # Start CLN funding
             # --------------------------------------------------------
 
-            funding_address = cln.open_channel_start(
-                peer_id=peer_id,
-                amount=plan.amount,
-                announce=self.config.announce,
-            )
+            try:
+                funding_address = cln.open_channel_start(
+                    peer_id=peer_id,
+                    amount=plan.amount,
+                    announce=self.config.announce,
+                )
+            except Exception as exc:
+                # We cannot know whether CLN accepted the RPC request.
+                # There is no transaction id yet with which to identify
+                # a possibly-created funding operation, so do not guess
+                # and do not unlock the inputs.
+                release_locks = False
+                raise FundingRecoveryRequiredError(
+                    "CLN fundchannel_start outcome is unknown; "
+                    "JoinMarket UTXOs remain locked for recovery",
+                    peer_id=peer_id,
+                    txid=None,
+                ) from exc
 
-            channel_funding_started = True
+            phase = FundingPhase.STARTED
+            release_locks = False
 
             logger.info(
                 "CLN funding address obtained: {}",
@@ -252,77 +311,301 @@ class OpenChannelOperation:
             )
 
             # --------------------------------------------------------
-            # JoinMarket change address
+            # Prepare funding transaction while CLN funding is active
             # --------------------------------------------------------
 
-            change_address = jmadapter.get_change_address(
-                self.config.mixdepth,
-            )
+            try:
+                change_address = jmadapter.get_change_address(
+                    self.config.mixdepth,
+                )
+                tx, txid, _, signed_psbt = tx_builder.build_and_sign_funding_tx(
+                    plan=plan,
+                    funding_address=funding_address,
+                    change_address=change_address,
+                    wallet=jmadapter.require_wallet(),
+                )
+            except Exception as exc:
+                # fundchannel_start succeeded, so CLN now owns a live
+                # funding operation. Never unlock JoinMarket inputs while
+                # that operation may still exist.
+                try:
+                    cln.cancel_channel_funding(peer_id)
+                except Exception as cancel_exc:
+                    release_locks = False
+                    raise FundingRecoveryRequiredError(
+                        "Unable to cancel CLN channel funding after "
+                        "local transaction preparation failed; "
+                        "JoinMarket UTXOs remain locked for recovery",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from cancel_exc
 
-            # --------------------------------------------------------
-            # Build and sign funding transaction
-            # --------------------------------------------------------
+                phase = FundingPhase.LOCKED
+                release_locks = True
+                raise exc
 
-            _, txid, _, signed_psbt = tx_builder.build_and_sign_funding_tx(
-                plan=plan,
-                funding_address=funding_address,
-                change_address=change_address,
-                wallet=jmadapter.require_wallet(),
-            )
+            if confirm is not None and not confirm(
+                peer_id,
+                plan,
+                tx,
+                txid,
+                funding_address,
+            ):
+                logger.info("Channel funding declined by user.")
+
+                try:
+                    cln.cancel_channel_funding(peer_id)
+                except Exception as cancel_exc:
+                    release_locks = False
+                    raise FundingRecoveryRequiredError(
+                        "Unable to cancel CLN channel funding after "
+                        "user declined channel funding; "
+                        "JoinMarket UTXOs remain locked for recovery",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from cancel_exc
+
+                phase = FundingPhase.LOCKED
+                release_locks = True
+
+                raise FundingCancelledError(
+                    "Channel funding cancelled by user",
+                )
 
             # --------------------------------------------------------
             # Complete CLN funding
             # --------------------------------------------------------
 
-            cln.open_channel_complete(
-                peer_id=peer_id,
-                psbt=signed_psbt,
-            )
+            try:
+                cln.open_channel_complete(
+                    peer_id=peer_id,
+                    psbt=signed_psbt,
+                )
+            except Exception as exc:
+                try:
+                    status = cln.get_channel_funding_status(
+                        peer_id=peer_id,
+                        txid=txid,
+                    )
+                except Exception as status_exc:
+                    release_locks = False
+                    raise FundingRecoveryRequiredError(
+                        "Unable to determine CLN channel completion state; "
+                        "JoinMarket UTXOs remain locked for recovery",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from status_exc
+
+                if status is ChannelFundingStatus.WITHHELD:
+                    release_locks = False
+                    try:
+                        cln.cancel_channel_funding(peer_id)
+                    except Exception as cancel_exc:
+                        raise FundingRecoveryRequiredError(
+                            "Unable to cancel withheld CLN channel funding; "
+                            "JoinMarket UTXOs remain locked for recovery",
+                            peer_id=peer_id,
+                            txid=txid,
+                        ) from cancel_exc
+
+                    release_locks = True
+                    phase = FundingPhase.LOCKED
+                elif status is ChannelFundingStatus.ABSENT:
+                    release_locks = True
+                    phase = FundingPhase.LOCKED
+                else:
+                    release_locks = False
+                    raise FundingRecoveryRequiredError(
+                        "CLN channel completion outcome is ambiguous; "
+                        "funding may already have been broadcast",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from exc
+
+                raise
+
+            phase = FundingPhase.WITHHELD
 
             # --------------------------------------------------------
             # Broadcast through CLN
             # --------------------------------------------------------
 
-            broadcast_result = cln.send_psbt(signed_psbt)
+            try:
+                broadcast_result = cln.send_psbt(signed_psbt)
+            except Exception:
+                try:
+                    status = cln.get_channel_funding_status(
+                        peer_id=peer_id,
+                        txid=txid,
+                    )
+                except Exception as status_exc:
+                    release_locks = False
+                    raise FundingRecoveryRequiredError(
+                        "Unable to determine CLN sendpsbt outcome; "
+                        "JoinMarket UTXOs remain locked for recovery",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from status_exc
 
-            # At this point CLN has accepted the PSBT for broadcast, so
-            # there is no longer a withheld funding operation to cancel.
-            channel_funding_started = False
+                if status is ChannelFundingStatus.WITHHELD:
+                    release_locks = False
+                    try:
+                        cln.cancel_channel_funding(peer_id)
+                    except Exception as cancel_exc:
+                        raise FundingRecoveryRequiredError(
+                            "Unable to cancel withheld CLN channel funding; "
+                            "JoinMarket UTXOs remain locked for recovery",
+                            peer_id=peer_id,
+                            txid=txid,
+                        ) from cancel_exc
+
+                    release_locks = True
+                    phase = FundingPhase.LOCKED
+                    raise
+
+                if status is ChannelFundingStatus.BROADCAST:
+                    # The RPC response was lost, but CLN confirms that
+                    # the expected funding transaction is no longer
+                    # withheld. Never cancel and never unlock inputs
+                    # after broadcast.
+                    phase = FundingPhase.BROADCAST
+                    release_locks = False
+                    logger.warning(
+                        "sendpsbt outcome was ambiguous, but CLN confirms "
+                        "funding transaction {} was broadcast; treating "
+                        "channel funding as successful",
+                        txid,
+                    )
+                    return
+
+                # ABSENT means the channel and transaction are both
+                # absent from CLN's authoritative state.
+                phase = FundingPhase.LOCKED
+                raise
+
+            result_txid = broadcast_result.get("txid")
+
+            if not isinstance(result_txid, str) or result_txid != txid:
+                release_locks = False
+                raise FundingRecoveryRequiredError(
+                    "CLN sendpsbt returned an unexpected funding transaction id; "
+                    "JoinMarket UTXOs remain locked for recovery",
+                    peer_id=peer_id,
+                    txid=txid,
+                )
+
+            phase = FundingPhase.BROADCAST
+            release_locks = False
 
             logger.info(
                 "Funding transaction broadcast through CLN: {}",
-                broadcast_result.get("txid", txid),
+                txid,
             )
-
+        except FundingCancelledError:
+            raise
         except Exception as exc:
+            operation_error = exc
             logger.error(
                 "Ah jaysus, failed to open channel: {}",
                 exc,
             )
-
-            if channel_funding_started:
-                try:
-                    cln.rpc.fundchannel_cancel(
-                        node_id=peer_id,
-                    )
-                except Exception as cancel_exc:
-                    logger.warning(
-                        "Failed to cancel pending CLN channel funding: {}",
-                        cancel_exc,
-                    )
-
             raise
 
         finally:
-            for coin in selected:
-                try:
-                    jmadapter.unlock(coin)
-                except Exception as exc:
-                    logger.warning(
-                        "Failed to unlock {}:{}: {}",
-                        coin.utxo.txid,
-                        coin.utxo.vout,
-                        exc,
-                    )
+            if release_locks:
+                for coin in locked:
+                    try:
+                        jmadapter.unlock(coin)
+                    except Exception as exc:
+                        cleanup_errors.append(exc)
+                        logger.error(
+                            "Failed to unlock {}:{} after funding phase {}: {}",
+                            coin.utxo.txid,
+                            coin.utxo.vout,
+                            phase,
+                            exc,
+                        )
 
-            await jmadapter.close()
+            try:
+                await jmadapter.close()
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.error(
+                    "Failed to close JoinMarket wallet after funding phase {}: {}",
+                    phase,
+                    exc,
+                )
+
+            if cleanup_errors and operation_error is None:
+                if phase is not FundingPhase.BROADCAST:
+                    raise FundingRecoveryRequiredError(
+                        "Channel funding cleanup failed; manual recovery is required",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from cleanup_errors[0]
+
+                logger.warning(
+                    "Funding transaction {} was broadcast successfully, "
+                    "but JoinMarket cleanup failed",
+                    txid,
+                )
+
+            if cleanup_errors and operation_error is not None:
+                logger.error(
+                    "Channel funding failed and cleanup also failed; "
+                    "manual recovery is required",
+                )
+                if not isinstance(operation_error, FundingRecoveryRequiredError):
+                    raise FundingRecoveryRequiredError(
+                        "Channel funding failed and cleanup also failed; "
+                        "manual recovery is required",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ) from operation_error
+
+
+def confirm_open_channel(
+    peer_id: str,
+    plan: ExecutionPlan,
+    tx: ParsedTransaction,
+    txid: str,
+    funding_address: str,
+) -> bool:
+    typer.echo("")
+    typer.echo("Channel funding transaction")
+    typer.echo("==========================")
+    typer.echo(f"Peer:             {peer_id}")
+    typer.echo(f"Funding address:  {funding_address}")
+    typer.echo(f"Funding amount:   {plan.amount:,} sats")
+    typer.echo(f"Fee:              {plan.fee:,} sats")
+    typer.echo(f"Virtual size:     {plan.vsize} vbytes")
+    typer.echo(f"Transaction ID:   {txid}")
+    typer.echo("")
+
+    typer.echo("Inputs:")
+    for txin, coin in zip(tx.inputs, plan.inputs, strict=True):
+        typer.echo(
+            f"  {coin.utxo.txid}:{coin.utxo.vout} "
+            f"{coin.utxo.value:,} sats "
+            f"({coin.status})"
+        )
+
+    typer.echo("")
+    typer.echo("Outputs:")
+    typer.echo(f"  Channel funding: {plan.amount:,} sats")
+
+    if plan.change > 0:
+        typer.echo(f"  JoinMarket change: {plan.change:,} sats")
+
+    if plan.warnings:
+        typer.echo("")
+        typer.echo("Warnings:")
+        for warning in plan.warnings:
+            typer.echo(f"  WARNING: {warning}")
+
+    typer.echo("")
+
+    return typer.confirm(
+        "Proceed with channel funding?",
+        default=False,
+    )

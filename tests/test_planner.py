@@ -1,3 +1,5 @@
+import math
+
 import pytest
 from jmcore.bitcoin import estimate_vsize
 
@@ -194,3 +196,25 @@ def test_normal_funding_fee_includes_change_output(
 
     assert normal_plan.vsize == expected_normal_vsize
     assert normal_plan.vsize > expected_sweep_vsize
+
+
+@pytest.mark.parametrize(
+    "fee_rate",
+    [0.0, -1.0, math.nan, math.inf, -math.inf],
+)
+def test_build_plan_rejects_invalid_fee_rate(
+    classified_utxos: list[ClassifiedUTXO],
+    fee_rate: float,
+) -> None:
+    planner = Planner()
+
+    with pytest.raises(
+        ValueError,
+        match="Fee rate must be finite and positive",
+    ):
+        planner.build_plan(
+            selected_coins=classified_utxos[:2],
+            target_amount=150_000,
+            fee_rate=fee_rate,
+            funding_output_type="p2wsh",
+        )

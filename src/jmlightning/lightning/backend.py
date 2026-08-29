@@ -1,14 +1,20 @@
 from abc import ABC, abstractmethod
-from enum import StrEnum
+from enum import StrEnum, auto
 from typing import TypeAlias
 
 RPCResponse: TypeAlias = dict[str, object]
 
 
 class FeePriority(StrEnum):
-    HIGH = "high"
-    NORMAL = "normal"
-    ECONOMY = "economy"
+    HIGH = auto()
+    NORMAL = auto()
+    ECONOMY = auto()
+
+
+class ChannelFundingStatus(StrEnum):
+    ABSENT = auto()
+    WITHHELD = auto()
+    BROADCAST = auto()
 
 
 class LightningBackend(ABC):
@@ -36,7 +42,26 @@ class LightningBackend(ABC):
     @abstractmethod
     def send_psbt(self, psbt: bytes) -> RPCResponse:
         """
-        Finalize and broadcast a fully signed PSBT.
+        Finalise and broadcast a fully signed PSBT.
+        """
+
+    @abstractmethod
+    def cancel_channel_funding(
+        self,
+        peer_id: str,
+    ) -> None:
+        """
+        Cancel a channel funding operation before its funding transaction is broadcast.
+        """
+
+    @abstractmethod
+    def get_channel_funding_status(
+        self,
+        peer_id: str,
+        txid: str,
+    ) -> ChannelFundingStatus:
+        """
+        Determine whether the expected funding transaction is withheld or broadcast.
         """
 
     @abstractmethod

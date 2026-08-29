@@ -9,6 +9,7 @@ from jmcore.bitcoin import (
     parse_derivation_path,
     serialize_transaction,
 )
+from jmwallet.wallet.psbt import PSBTError, parse_psbt
 from jmwallet.wallet.service import WalletService
 
 from jmlightning.planner import ExecutionPlan
@@ -27,6 +28,38 @@ class TxBuilder:
         )
         return hash256(raw)[::-1].hex()
 
+    def _validate_plan(self, plan: ExecutionPlan) -> None:
+        """Validate the financial and input invariants of an execution plan."""
+        if not plan.inputs:
+            raise ValueError("Funding transaction requires at least one input.")
+
+        if plan.amount <= 0:
+            raise ValueError("Funding transaction amount must be positive.")
+
+        if plan.fee < 0:
+            raise ValueError("Transaction fee cannot be negative.")
+
+        if plan.change < 0:
+            raise ValueError("Transaction change cannot be negative.")
+
+        outpoints = [(coin.utxo.txid, coin.utxo.vout) for coin in plan.inputs]
+
+        if len(outpoints) != len(set(outpoints)):
+            raise ValueError("Funding transaction contains duplicate inputs.")
+
+        input_total = sum(coin.utxo.value for coin in plan.inputs)
+
+        expected_total = plan.amount + plan.fee + plan.change
+
+        if input_total != expected_total:
+            raise ValueError(
+                "Funding transaction plan has inconsistent amounts: "
+                f"inputs={input_total}, "
+                f"amount={plan.amount}, "
+                f"fee={plan.fee}, "
+                f"change={plan.change}"
+            )
+
     def build_and_sign_funding_tx(
         self,
         plan: ExecutionPlan,
@@ -34,6 +67,9 @@ class TxBuilder:
         change_address: str,
         wallet: WalletService,
     ) -> tuple[ParsedTransaction, str, int, bytes]:
+
+        self._validate_plan(plan)
+
         tx_inputs: list[TxInput] = []
 
         for coin in plan.inputs:
@@ -131,8 +167,40 @@ class TxBuilder:
         signed_result = wallet.sign_psbt(signing_plan)
         signed_psbt = signed_result.psbt
 
-        if len(signed_result.signed_indices) != len(plan.inputs):
+        signed_indices = list(signed_result.signed_indices)
+        expected_indices = set(range(len(plan.inputs)))
+
+        if len(signed_indices) != len(expected_indices):
             raise RuntimeError("JoinMarket wallet did not sign all funding inputs")
+
+        if len(set(signed_indices)) != len(signed_indices):
+            raise RuntimeError(
+                "JoinMarket wallet returned duplicate signed input indices"
+            )
+
+        if set(signed_indices) != expected_indices:
+            raise RuntimeError(
+                "JoinMarket wallet did not sign exactly the funding inputs"
+            )
+
+        try:
+            signed_parsed_psbt = parse_psbt(signed_psbt)
+        except PSBTError as exc:
+            raise RuntimeError(
+                "JoinMarket wallet returned an invalid signed PSBT"
+            ) from exc
+
+        expected_unsigned_tx = serialize_transaction(
+            tx.version,
+            tx.inputs,
+            tx.outputs,
+            tx.locktime,
+        )
+
+        if signed_parsed_psbt.unsigned_tx != expected_unsigned_tx:
+            raise RuntimeError(
+                "JoinMarket wallet returned a PSBT for a different transaction"
+            )
 
         txid = self._txid(tx)
 
