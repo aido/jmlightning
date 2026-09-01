@@ -1,0 +1,385 @@
+name: Integration tests
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+      - develop
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.11"
+  BITCOIN_VERSION: "30.2"
+  CLN_VERSION: "26.06.6"
+  JMNG_VERSION: "0.37.0"
+
+jobs:
+  regtest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout jmlightning
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            ca-certificates \
+            curl \
+            git \
+            jq \
+            python3-dev \
+            python3-pip \
+            python3-venv \
+            libffi-dev \
+            libsecp256k1-dev \
+            libsodium-dev \
+            libsqlite3-dev \
+            pkg-config
+
+      - name: Install Bitcoin Core
+        run: |
+          set -euo pipefail
+
+          BITCOIN_ARCHIVE="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"
+          BITCOIN_BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}"
+          BITCOIN_DIR="/opt/bitcoin-${BITCOIN_VERSION}"
+
+          curl --fail --location --silent --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "$RUNNER_TEMP/$BITCOIN_ARCHIVE" \
+            "$BITCOIN_BASE_URL/$BITCOIN_ARCHIVE"
+
+          curl --fail --location --silent --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "$RUNNER_TEMP/SHA256SUMS" \
+            "$BITCOIN_BASE_URL/SHA256SUMS"
+
+          cd "$RUNNER_TEMP"
+
+          grep -F " $BITCOIN_ARCHIVE" SHA256SUMS \
+            | sha256sum --check --strict -
+
+          sudo tar \
+            --extract \
+            --gzip \
+            --file "$BITCOIN_ARCHIVE" \
+            --directory /opt
+
+          test -x "$BITCOIN_DIR/bin/bitcoind"
+          test -x "$BITCOIN_DIR/bin/bitcoin-cli"
+
+          sudo ln -sf \
+            "$BITCOIN_DIR/bin/bitcoind" \
+            /usr/local/bin/bitcoind
+
+          sudo ln -sf \
+            "$BITCOIN_DIR/bin/bitcoin-cli" \
+            /usr/local/bin/bitcoin-cli
+
+          bitcoind --version
+          bitcoin-cli --version
+
+          bitcoind --version | grep -F "${BITCOIN_VERSION}"
+
+      - name: Install Core Lightning
+        env:
+          CLN_PLATFORM: "Ubuntu-24.04-amd64"
+        run: |
+          set -euo pipefail
+
+          CLN_ARCHIVE="clightning-v${CLN_VERSION}-${CLN_PLATFORM}.tar.xz"
+          CLN_BASE_URL="https://github.com/ElementsProject/lightning/releases/download/v${CLN_VERSION}"
+          CLN_INSTALL_DIR="/usr/local"
+
+          curl --fail --location --silent --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "$RUNNER_TEMP/$CLN_ARCHIVE" \
+            "$CLN_BASE_URL/$CLN_ARCHIVE"
+
+          curl --fail --location --silent --show-error \
+            --retry 5 \
+            --retry-delay 2 \
+            --output "$RUNNER_TEMP/SHA256SUMS-v${CLN_VERSION}" \
+            "$CLN_BASE_URL/SHA256SUMS-v${CLN_VERSION}"
+
+          cd "$RUNNER_TEMP"
+
+          grep -F " $CLN_ARCHIVE" "SHA256SUMS-v${CLN_VERSION}" \
+            | sha256sum --check --strict -
+
+          sudo tar \
+            --extract \
+            --file "$CLN_ARCHIVE" \
+            --directory "$CLN_INSTALL_DIR" \
+            --strip-components=2
+
+          command -v lightningd
+          command -v lightning-cli
+
+          lightningd --version
+          lightning-cli --version
+
+          lightningd --version | grep -F "$CLN_VERSION"
+
+      - name: Install JoinMarket-NG
+        run: |
+          set -euo pipefail
+
+          python -m pip install --upgrade pip
+
+          python -m pip install \
+            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmcore" \
+            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmwallet"
+
+          python -m pip install .
+          python -m pip install pytest
+
+      - name: Verify installed Python packages
+        run: |
+          python - <<'PY'
+          import jmcore
+          import jmwallet
+          import jmlightning
+
+          print("jmcore:", jmcore.__file__)
+          print("jmwallet:", jmwallet.__file__)
+          print("jmlightning:", jmlightning.__file__)
+          PY
+
+      - name: Start Bitcoin Core
+        env:
+          BTC_DATADIR: ${{ runner.temp }}/bitcoin
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$BTC_DATADIR"
+
+          bitcoind \
+            -regtest \
+            -server=1 \
+            -daemon=1 \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            -fallbackfee=0.0002 \
+            -listen=0 \
+            -dnsseed=0 \
+            -connect=0 \
+            -natpmp=0
+
+          ready=0
+
+          for _ in $(seq 1 60); do
+            if bitcoin-cli \
+              -regtest \
+              -datadir="$BTC_DATADIR" \
+              -rpcuser=test \
+              -rpcpassword=test \
+              getblockchaininfo >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Bitcoin Core failed to become RPC-ready"
+            echo
+            echo "=== Bitcoin Core log ==="
+            cat "$BTC_DATADIR/regtest/debug.log" || true
+            exit 1
+          fi
+
+          bitcoin-cli \
+            -regtest \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            getblockchaininfo
+
+      - name: Bootstrap regtest blockchain
+        env:
+          BTC_DATADIR: ${{ runner.temp }}/bitcoin
+        run: |
+          set -euo pipefail
+
+          bitcoin-cli \
+            -regtest \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            -named createwallet \
+            wallet_name=ci \
+            load_on_startup=true
+
+          address=$(
+            bitcoin-cli \
+              -regtest \
+              -datadir="$BTC_DATADIR" \
+              -rpcuser=test \
+              -rpcpassword=test \
+              -rpcwallet=ci \
+              getnewaddress
+          )
+
+          bitcoin-cli \
+            -regtest \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            -rpcwallet=ci \
+            generatetoaddress 101 "$address"
+
+          bitcoin-cli \
+            -regtest \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            getblockchaininfo
+
+      - name: Verify regtest blockchain
+        env:
+          BTC_DATADIR: ${{ runner.temp }}/bitcoin
+        run: |
+          set -euo pipefail
+
+          bitcoin-cli \
+            -regtest \
+            -datadir="$BTC_DATADIR" \
+            -rpcuser=test \
+            -rpcpassword=test \
+            getblockchaininfo
+
+          height=$(
+            bitcoin-cli \
+              -regtest \
+              -datadir="$BTC_DATADIR" \
+              -rpcuser=test \
+              -rpcpassword=test \
+              getblockcount
+          )
+
+          test "$height" -ge 101
+
+      - name: Start Core Lightning
+        env:
+          CLN_DATADIR: ${{ runner.temp }}/cln
+        run: |
+          set -euo pipefail
+
+          mkdir -p "$CLN_DATADIR"
+
+          CLN_RPC_SOCKET="$CLN_DATADIR/regtest/lightning-rpc"
+
+          lightningd \
+            --network=regtest \
+            --lightning-dir="$CLN_DATADIR" \
+            --rpc-file="$CLN_RPC_SOCKET" \
+            --bitcoin-rpcconnect=127.0.0.1 \
+            --bitcoin-rpcport=18443 \
+            --bitcoin-rpcuser=test \
+            --bitcoin-rpcpassword=test \
+            --log-file="$CLN_DATADIR/lightningd.log" \
+            --daemon
+
+          echo "CLN_RPC_SOCKET=$CLN_RPC_SOCKET" >> "$GITHUB_ENV"
+
+          ready=0
+
+          for _ in $(seq 1 120); do
+            if [ -S "$CLN_RPC_SOCKET" ]; then
+              ready=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Core Lightning RPC socket was not created"
+            echo
+            echo "=== Core Lightning log ==="
+            cat "$CLN_DATADIR/lightningd.log" || true
+            exit 1
+          fi
+
+          ready=0
+
+          for _ in $(seq 1 120); do
+            if lightning-cli \
+              --rpc-file="$CLN_RPC_SOCKET" \
+              getinfo >/dev/null 2>&1; then
+              ready=1
+              break
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "Core Lightning RPC socket exists but getinfo is not responding"
+            echo
+            echo "=== Bitcoin blockchain state ==="
+            bitcoin-cli \
+              -regtest \
+              -datadir="${{ runner.temp }}/bitcoin" \
+              -rpcuser=test \
+              -rpcpassword=test \
+              getblockchaininfo || true
+
+            echo
+            echo "=== Core Lightning log ==="
+            cat "$CLN_DATADIR/lightningd.log" || true
+
+            exit 1
+          fi
+
+          lightning-cli \
+            --rpc-file="$CLN_RPC_SOCKET" \
+            getinfo
+
+      - name: Run integration tests
+        env:
+          BITCOIN_RPC_URL: http://test:test@127.0.0.1:18443/
+          CLN_LIGHTNING_DIR: ${{ runner.temp }}/cln
+          CLN_RPC_SOCKET: ${{ runner.temp }}/cln/regtest/lightning-rpc
+        run: |
+          set -euo pipefail
+
+          # pytest tests/integration/
+
+      - name: Collect daemon logs
+        if: failure()
+        run: |
+          echo "=== Bitcoin Core ==="
+
+          if [ -f "$RUNNER_TEMP/bitcoin/regtest/debug.log" ]; then
+            tail -200 "$RUNNER_TEMP/bitcoin/regtest/debug.log"
+          fi
+
+          echo
+          echo "=== Core Lightning ==="
+
+          if [ -f "$RUNNER_TEMP/cln/lightningd.log" ]; then
+            tail -200 "$RUNNER_TEMP/cln/lightningd.log"
+          fi

@@ -2,11 +2,15 @@
 
 **JoinMarket-NG to Lightning Network Bridge** - A privacy-preserving, policy-driven bridge for funding Lightning channels and as the project evolves, executing atomic submarine swaps directly from JoinMarket-NG wallets using PeerSwap (via Core Lightning).
 
-[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Type Checker: mypy](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 
+[![CI](https://github.com/aido/jmlightning/actions/workflows/ci.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/ci.yml)
+[![Regtest Integration](https://github.com/aido/jmlightning/actions/workflows/regtest.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/regtest.yml)
+[![CodeQL](https://github.com/aido/jmlightning/actions/workflows/codeql.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/codeql.yml)
+[![codecov](https://codecov.io/gh/aido/jmlightning/graph/badge.svg?token=4QM88JZL6Q)](https://codecov.io/gh/aido/jmlightning)
 ---
 
 ## 📋 Overview
@@ -373,11 +377,13 @@ Sweep mode therefore does not bypass the policy engine.
 │
 └── tests/
     ├── conftest.py
-    ├── test_cln.py
-    ├── test_joinmarket_adapter.py
-    ├── test_planner.py
-    ├── test_policy.py
-    └── test_tx_builder.py
+    └── unit/
+        ├── test_cln.py
+        ├── test_joinmarket_adapter.py
+        ├── test_open_channel.py
+        ├── test_planner.py
+        ├── test_policy.py
+        └── test_tx_builder.py
 ```
 
 ### Main Components
