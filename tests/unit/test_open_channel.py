@@ -12,6 +12,7 @@ from jmlightning.operations.open_channel import (
     FundingCancelledError,
     FundingRecoveryRequiredError,
     OpenChannelOperation,
+    confirm_open_channel,
 )
 
 
@@ -120,6 +121,38 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
         peer_id,
     )
 
+    jmadapter.unlock.assert_called_once_with(coin)
+    jmadapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_send_psbt_failure_with_absent_state_unlocks() -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+
+    cln.send_psbt.side_effect = RuntimeError("sendpsbt failed")
+    cln.get_channel_funding_status.return_value = ChannelFundingStatus.ABSENT
+
+    patches = _patch_open_channel_doubles(
+        jmadapter,
+        cln,
+        tx_builder,
+        plan,
+    )
+
+    with patches[0], patches[1], patches[2], patches[3]:
+        operation = OpenChannelOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+
+        with pytest.raises(RuntimeError, match="sendpsbt failed"):
+            await operation.execute("02" + "11" * 32)
+
+    cln.get_channel_funding_status.assert_called_once_with(
+        peer_id="02" + "11" * 32,
+        txid="txid",
+    )
+    cln.cancel_channel_funding.assert_not_called()
     jmadapter.unlock.assert_called_once_with(coin)
     jmadapter.close.assert_awaited_once()
 
@@ -708,3 +741,53 @@ async def test_confirmation_receives_actual_transaction() -> None:
     assert captured["tx"] is tx_builder.build_and_sign_funding_tx.return_value[0]
     assert captured["txid"] == "txid"
     assert captured["funding_address"] == "bc1qfunding"
+
+
+def test_confirm_open_channel_displays_transaction_and_accepts(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    _config, coin, _jmadapter, _cln, plan, _tx_builder = (
+        _build_open_channel_test_doubles()
+    )
+    plan.inputs = [coin]
+    plan.amount = 100_000
+    plan.fee = 100
+    plan.vsize = 140
+    plan.change = 99_900
+    plan.warnings = ["high fee rate"]
+
+    tx = Mock()
+    tx.inputs = [Mock()]
+
+    monkeypatch.setattr(
+        "jmlightning.operations.open_channel.typer.confirm",
+        lambda message, default=False: True,
+    )
+
+    assert (
+        confirm_open_channel(
+            peer_id="02" + "11" * 32,
+            plan=plan,
+            tx=tx,
+            txid="aa" * 32,
+            funding_address="bc1qfunding",
+        )
+        is True
+    )
+
+    output = capsys.readouterr().out
+    assert "Channel funding transaction" in output
+    assert "Peer:" in output
+    assert "Funding address:" in output
+    assert "Funding amount:   100,000 sats" in output
+    assert "Fee:              100 sats" in output
+    assert "Virtual size:     140 vbytes" in output
+    assert "Transaction ID:" in output
+    assert "Inputs:" in output
+    assert f"{coin.utxo.txid}:{coin.utxo.vout}" in output
+    assert "Outputs:" in output
+    assert "Channel funding: 100,000 sats" in output
+    assert "JoinMarket change: 99,900 sats" in output
+    assert "Warnings:" in output
+    assert "WARNING: high fee rate" in output

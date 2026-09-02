@@ -1,8 +1,13 @@
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
 from unittest.mock import Mock
 
 import pytest
+from coincurve import PrivateKey
+from jmcore.bitcoin import create_p2wpkh_script_code
+from jmwallet.wallet.psbt import parse_psbt
+from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, Planner
@@ -12,8 +17,11 @@ from jmlightning.tx_builder import TxBuilder
 def _mock_wallet() -> Mock:
     wallet = Mock()
 
+    private_key = PrivateKey(b"\x01" * 32)
     key = Mock()
-    key.get_public_key_bytes.return_value = b"\x02" + b"\x11" * 32
+    key.get_public_key_bytes.return_value = private_key.public_key.format(
+        compressed=True,
+    )
 
     wallet.get_key_for_address.return_value = key
 
@@ -42,7 +50,24 @@ def _mock_wallet() -> Mock:
     def sign_psbt(plan: SimpleNamespace) -> SimpleNamespace:
         current_result = wallet.sign_psbt.return_value
         if current_result is default_signing_result:
-            default_signing_result.psbt = plan.source_psbt
+            parsed = parse_psbt(plan.source_psbt)
+            pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
+                compressed=True,
+            )
+            for index in range(len(parsed.input_maps)):
+                signature = sign_p2wpkh_input(
+                    parsed.transaction,
+                    index,
+                    create_p2wpkh_script_code(pubkey),
+                    100_000,
+                    private_key,
+                )
+                parsed.append_input_key_value(
+                    index,
+                    b"\x02" + pubkey,
+                    signature,
+                )
+            default_signing_result.psbt = parsed.serialize()
         return cast(SimpleNamespace, current_result)
 
     wallet.prepare_psbt_signing.side_effect = prepare_psbt_signing
@@ -110,6 +135,41 @@ def test_build_and_sign_funding_tx_uses_psbt_signing(
     wallet.sign_psbt.assert_called_once_with(signing_plan)
 
 
+def test_build_and_sign_funding_tx_removes_empty_witness_script_records(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    builder.build_and_sign_funding_tx(
+        plan=plan,
+        funding_address=(
+            "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+        ),
+        change_address="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        wallet=wallet,
+    )
+
+    signing_plan = wallet.prepare_psbt_signing.return_value
+    # The compact-size encoding of an empty PSBT_IN_WITNESS_SCRIPT record is
+    # 01 05 00. Check the exact record encoding rather than importing
+    # jmwallet's parser, because this regression must remain independent of
+    # jmwallet's internal PSBT representation.
+    assert b"\x01\x05\x00" not in signing_plan.source_psbt
+
+
+def test_remove_empty_witness_scripts_rejects_invalid_psbt() -> None:
+    with pytest.raises(ValueError, match="invalid PSBT magic"):
+        TxBuilder._remove_empty_witness_scripts(b"not-a-psbt")
+
+
+def test_remove_empty_witness_scripts_preserves_nonempty_witness_script() -> None:
+    psbt = b"psbt\xff\x01\x05\x03abc\x00"
+
+    assert TxBuilder._remove_empty_witness_scripts(psbt) == psbt
+
+
 def test_build_and_sign_funding_tx_does_not_double_sign_inputs(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
@@ -125,6 +185,144 @@ def test_build_and_sign_funding_tx_does_not_double_sign_inputs(
     )
 
     wallet.sign_input.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_changed_input_metadata(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    def sign_psbt(plan: SimpleNamespace) -> SimpleNamespace:
+        parsed = parse_psbt(plan.source_psbt)
+        pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
+            compressed=True,
+        )
+        witness = bytearray(
+            next(
+                record.value
+                for record in parsed.input_maps[0].records
+                if record.key == b"\x01"
+            )
+        )
+        witness[0] ^= 1
+        parsed.input_maps[0].records = [
+            replace(record, value=bytes(witness)) if record.key == b"\x01" else record
+            for record in parsed.input_maps[0].records
+        ]
+        for index in range(len(parsed.input_maps)):
+            parsed.append_input_key_value(
+                index, b"\x02" + pubkey, b"\x30\x06\x02\x01\x01\x02\x01\x01\x01"
+            )
+        return SimpleNamespace(
+            psbt=parsed.serialize(),
+            signed_indices=[0, 1],
+        )
+
+    wallet.sign_psbt.side_effect = sign_psbt
+
+    with pytest.raises(RuntimeError, match="changed PSBT input metadata"):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
+def test_build_and_sign_funding_tx_rejects_missing_partial_signature(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    def sign_psbt(signing_plan: SimpleNamespace) -> SimpleNamespace:
+        parsed = parse_psbt(signing_plan.source_psbt)
+        pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
+            compressed=True,
+        )
+
+        signature = sign_p2wpkh_input(
+            parsed.transaction,
+            0,
+            create_p2wpkh_script_code(pubkey),
+            100_000,
+            PrivateKey(b"\x01" * 32),
+        )
+        parsed.append_input_key_value(
+            0,
+            b"\x02" + pubkey,
+            signature,
+        )
+
+        # Deliberately leave input 1 unsigned.
+        return SimpleNamespace(
+            psbt=parsed.serialize(),
+            signed_indices=[0, 1],
+        )
+
+    wallet.sign_psbt.side_effect = sign_psbt
+
+    with pytest.raises(
+        RuntimeError,
+        match="JoinMarket wallet did not return exactly one signature for input 1",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
+def test_build_and_sign_funding_tx_rejects_invalid_partial_signature(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    def sign_psbt(signing_plan: SimpleNamespace) -> SimpleNamespace:
+        parsed = parse_psbt(signing_plan.source_psbt)
+        pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
+            compressed=True,
+        )
+        private_key = PrivateKey(b"\x01" * 32)
+        for index in range(len(parsed.input_maps)):
+            signature = bytearray(
+                sign_p2wpkh_input(
+                    parsed.transaction,
+                    index,
+                    create_p2wpkh_script_code(pubkey),
+                    100_000,
+                    private_key,
+                )
+            )
+            signature[0] ^= 1
+            parsed.append_input_key_value(
+                index,
+                b"\x02" + pubkey,
+                bytes(signature),
+            )
+        return SimpleNamespace(
+            psbt=parsed.serialize(),
+            signed_indices=[0, 1],
+        )
+
+    wallet.sign_psbt.side_effect = sign_psbt
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid P2WPKH signature for input 0",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
 
 
 def test_build_and_sign_funding_tx_returns_signed_psbt(
@@ -284,7 +482,7 @@ def test_build_and_sign_funding_tx_rejects_different_signed_psbt(
     wallet = _mock_wallet()
 
     wallet.sign_psbt.side_effect = lambda plan: SimpleNamespace(
-        psbt=b"different-valid-psbt",
+        psbt=b"psbt\xff\x00",
         signed_indices=[0, 1],
     )
 
@@ -299,8 +497,10 @@ def test_build_and_sign_funding_tx_rejects_different_signed_psbt(
     ):
         builder.build_and_sign_funding_tx(
             plan=plan,
-            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
-            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            funding_address=(
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+            ),
+            change_address="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
             wallet=wallet,
         )
 

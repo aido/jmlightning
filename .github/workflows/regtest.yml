@@ -16,12 +16,13 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
+  JMNG_VERSION: "0.37.0"
   BITCOIN_VERSION: "30.2"
   CLN_VERSION: "26.06.6"
-  JMNG_VERSION: "0.37.0"
 
 jobs:
   regtest:
+    name: Integration tests & Coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 45
 
@@ -145,13 +146,11 @@ jobs:
           set -euo pipefail
 
           python -m pip install --upgrade pip
-
           python -m pip install \
             "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmcore" \
             "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmwallet"
-
           python -m pip install .
-          python -m pip install pytest
+          python -m pip install pytest pytest-cov
 
       - name: Verify installed Python packages
         run: |
@@ -177,6 +176,7 @@ jobs:
             -regtest \
             -server=1 \
             -daemon=1 \
+            -txindex=1 \
             -datadir="$BTC_DATADIR" \
             -rpcuser=test \
             -rpcpassword=test \
@@ -358,28 +358,171 @@ jobs:
             --rpc-file="$CLN_RPC_SOCKET" \
             getinfo
 
-      - name: Run integration tests
+      - name: Start Core Lightning peer
         env:
-          BITCOIN_RPC_URL: http://test:test@127.0.0.1:18443/
-          CLN_LIGHTNING_DIR: ${{ runner.temp }}/cln
-          CLN_RPC_SOCKET: ${{ runner.temp }}/cln/regtest/lightning-rpc
+          CLN_PEER_DATADIR: ${{ runner.temp }}/cln-peer
         run: |
           set -euo pipefail
 
-          # pytest tests/integration/
+          rm -rf "$CLN_PEER_DATADIR"
+          mkdir -p "$CLN_PEER_DATADIR"
+
+          CLN_PEER_RPC_SOCKET="$CLN_PEER_DATADIR/regtest/lightning-rpc"
+
+          echo "Starting Core Lightning peer..."
+          echo "lightningd: $(command -v lightningd)"
+          lightningd --version
+
+          lightningd \
+            --network=regtest \
+            --lightning-dir="$CLN_PEER_DATADIR" \
+            --rpc-file="$CLN_PEER_RPC_SOCKET" \
+            --addr=127.0.0.1:19735 \
+            --grpc-host=127.0.0.1 \
+            --grpc-port=19736 \
+            --bitcoin-rpcconnect=127.0.0.1 \
+            --bitcoin-rpcport=18443 \
+            --bitcoin-rpcuser=test \
+            --bitcoin-rpcpassword=test \
+            --log-file="$CLN_PEER_DATADIR/lightningd.log" \
+            --daemon
+
+          echo "CLN_PEER_RPC_SOCKET=$CLN_PEER_RPC_SOCKET" >> "$GITHUB_ENV"
+
+          ready=0
+          for _ in $(seq 1 120); do
+            if [ -S "$CLN_PEER_RPC_SOCKET" ]; then
+              echo "RPC socket exists: $CLN_PEER_RPC_SOCKET"
+            fi
+
+            if lightning-cli \
+                --rpc-file="$CLN_PEER_RPC_SOCKET" \
+                getinfo; then
+              ready=1
+              break
+            fi
+
+            if [ -f "$CLN_PEER_DATADIR/lightningd.log" ]; then
+              echo "--- lightningd.log (last 30 lines) ---"
+              tail -30 "$CLN_PEER_DATADIR/lightningd.log" || true
+            fi
+
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Core Lightning peer failed to become ready"
+            echo "=== peer directory ==="
+            find "$CLN_PEER_DATADIR" -maxdepth 3 -type f -print || true
+            echo "=== lightningd.log ==="
+            cat "$CLN_PEER_DATADIR/lightningd.log" || true
+            exit 1
+          fi
+
+          PEER_ID=$(lightning-cli \
+            --rpc-file="$CLN_PEER_RPC_SOCKET" \
+            getinfo | jq -r '.id')
+
+          test -n "$PEER_ID"
+          test "$PEER_ID" != "null"
+
+          echo "CLN_PEER_ID=$PEER_ID" >> "$GITHUB_ENV"
+          echo "CLN peer ready: $PEER_ID"
+
+      - name: Connect Core Lightning peers
+        run: |
+          set -euo pipefail
+
+          lightning-cli \
+            --rpc-file="$CLN_RPC_SOCKET" \
+            connect \
+            "$CLN_PEER_ID" \
+            127.0.0.1 \
+            19735
+
+          connected=0
+          for _ in $(seq 1 60); do
+            if lightning-cli --rpc-file="$CLN_RPC_SOCKET" listpeers "$CLN_PEER_ID" \
+              | jq -e '.peers | length > 0 and .[0].connected == true' >/dev/null; then
+              connected=1
+              break
+            fi
+            sleep 1
+          done
+
+          test "$connected" -eq 1
+
+      - name: Run integration tests
+        env:
+          BITCOIN_RPC_URL: http://test:test@127.0.0.1:18443/
+          BITCOIN_RPC_USER: test
+          BITCOIN_RPC_PASSWORD: test
+          BITCOIN_DATADIR: ${{ runner.temp }}/bitcoin
+          CLN_RPC_SOCKET: ${{ runner.temp }}/cln/regtest/lightning-rpc
+          CLN_PEER_RPC_SOCKET: ${{ runner.temp }}/cln-peer/regtest/lightning-rpc
+        run: |
+          set -euo pipefail
+
+          pytest tests/integration \
+            --cov=jmlightning \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-report=html \
+            --junitxml=junit.xml \
+            -o junit_family=legacy
+
+      - name: Upload coverage to GitHub
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-${{ github.sha }}
+          path: |
+            coverage.xml
+            junit.xml
+            htmlcov/
+          if-no-files-found: error
+
+      - name: Upload coverage to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          name: regression-tests
+          flags: regtests
+          report_type: coverage
+
+
+      - name: Upload test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          name: regression-tests
+          flags: regtests
+          report_type: test_results
 
       - name: Collect daemon logs
         if: failure()
         run: |
-          echo "=== Bitcoin Core ==="
+          set +e
 
+          echo "=== Bitcoin Core ==="
           if [ -f "$RUNNER_TEMP/bitcoin/regtest/debug.log" ]; then
             tail -200 "$RUNNER_TEMP/bitcoin/regtest/debug.log"
           fi
 
           echo
-          echo "=== Core Lightning ==="
+          echo "=== Primary Core Lightning files ==="
+          find "$RUNNER_TEMP/cln" -maxdepth 4 -type f -print 2>/dev/null || true
 
-          if [ -f "$RUNNER_TEMP/cln/lightningd.log" ]; then
-            tail -200 "$RUNNER_TEMP/cln/lightningd.log"
-          fi
+          echo
+          echo "=== Primary Core Lightning log ==="
+          find "$RUNNER_TEMP/cln" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
+
+          echo
+          echo "=== Peer Core Lightning files ==="
+          find "$RUNNER_TEMP/cln-peer" -maxdepth 4 -type f -print 2>/dev/null || true
+
+          echo
+          echo "=== Peer Core Lightning log ==="
+          find "$RUNNER_TEMP/cln-peer" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true

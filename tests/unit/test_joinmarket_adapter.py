@@ -160,6 +160,69 @@ def test_lock_freezes_utxo_and_records_lock(
     assert (coin.utxo.txid, coin.utxo.vout) in adapter._locked_utxos
 
 
+def test_lock_uses_atomic_metadata_reservation(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
+
+    coin = classified_utxos[0]
+
+    adapter.lock(coin)
+
+    outpoint = f"{coin.utxo.txid}:{coin.utxo.vout}"
+    adapter.wallet.metadata_store.try_lock_outpoints.assert_called_once()
+    assert adapter.wallet.metadata_store.try_lock_outpoints.call_args.args[0] == [
+        outpoint
+    ]
+    assert adapter.wallet.metadata_store.try_lock_outpoints.call_args.kwargs["owner"]
+    adapter.wallet.metadata_store.release_outpoints.assert_called_once()
+    assert adapter.wallet.metadata_store.release_outpoints.call_args.args[0] == [
+        outpoint
+    ]
+    assert adapter.wallet.freeze_utxo.call_count == 1
+
+
+def test_lock_rejects_utxo_already_reserved_by_another_process(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.metadata_store.try_lock_outpoints.return_value = False
+
+    coin = classified_utxos[0]
+
+    with pytest.raises(ValueError, match="is already locked"):
+        adapter.lock(coin)
+
+    adapter.wallet.freeze_utxo.assert_not_called()
+    adapter.wallet.metadata_store.release_outpoints.assert_not_called()
+    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
+
+
+def test_lock_releases_atomic_reservation_when_freeze_fails(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
+    adapter.wallet.freeze_utxo.side_effect = RuntimeError("freeze failed")
+
+    coin = classified_utxos[0]
+    outpoint = f"{coin.utxo.txid}:{coin.utxo.vout}"
+
+    with pytest.raises(RuntimeError, match="freeze failed"):
+        adapter.lock(coin)
+
+    owner = adapter.wallet.metadata_store.release_outpoints.call_args.kwargs["owner"]
+    assert owner
+    adapter.wallet.metadata_store.release_outpoints.assert_called_once_with(
+        [outpoint], owner=owner
+    )
+    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
+
+
 def test_lock_rejects_already_locked_utxo(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:

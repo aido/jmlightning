@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import logging
 from typing import Protocol
+from uuid import uuid4
 
 import jmwallet.backends.descriptor_wallet as descriptor_wallet
 import jmwallet.backends.neutrino as neutrino_backend
@@ -12,6 +14,8 @@ from jmwallet.wallet.signer import SignedInput
 
 from jmlightning.config import CLNConfig
 from jmlightning.models import ClassifiedUTXO
+
+logger = logging.getLogger(__name__)
 
 
 class NetworkLike(Protocol):
@@ -262,9 +266,33 @@ class JoinMarketAdapter:
                 f"UTXO {coin.utxo.txid}:{coin.utxo.vout} is already locked"
             )
 
-        wallet.freeze_utxo(f"{coin.utxo.txid}:{coin.utxo.vout}")
+        outpoint_ref = f"{coin.utxo.txid}:{coin.utxo.vout}"
+        metadata_store = wallet.metadata_store
+        owner = uuid4().hex
+
+        if metadata_store is None:
+            raise RuntimeError("Cannot lock UTXOs without a data directory")
+
+        if not metadata_store.try_lock_outpoints([outpoint_ref], owner=owner):
+            raise ValueError(
+                f"UTXO {coin.utxo.txid}:{coin.utxo.vout} is already locked"
+            )
+
+        try:
+            wallet.freeze_utxo(outpoint_ref)
+        except Exception:
+            metadata_store.release_outpoints([outpoint_ref], owner=owner)
+            raise
 
         self._locked_utxos.add(outpoint)
+        try:
+            metadata_store.release_outpoints([outpoint_ref], owner=owner)
+        except Exception:
+            logger.warning(
+                "Failed to release temporary UTXO reservation for %s",
+                outpoint_ref,
+                exc_info=True,
+            )
 
     def unlock(
         self,

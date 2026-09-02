@@ -377,6 +377,10 @@ Sweep mode therefore does not bypass the policy engine.
 │
 └── tests/
     ├── conftest.py
+    │
+    ├── integration/
+    │   └── test_open_channel_regtest.py
+    │
     └── unit/
         ├── test_cln.py
         ├── test_joinmarket_adapter.py

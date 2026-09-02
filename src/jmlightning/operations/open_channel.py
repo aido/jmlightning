@@ -481,6 +481,7 @@ class OpenChannelOperation:
                 # ABSENT means the channel and transaction are both
                 # absent from CLN's authoritative state.
                 phase = FundingPhase.LOCKED
+                release_locks = True
                 raise
 
             result_txid = broadcast_result.get("txid")

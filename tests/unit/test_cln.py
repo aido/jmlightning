@@ -216,12 +216,13 @@ def test_get_channel_funding_status_reports_withheld() -> None:
     ):
         backend = CLNBackend("/tmp/lightning-rpc")
 
+    peer_id = "02" + "11" * 32
     txid = "11" * 32
 
     rpc.listpeerchannels.return_value = {
         "channels": [
             {
-                "peer_id": "02" + "11" * 32,
+                "peer_id": peer_id,
                 "funding_txid": txid,
                 "funding": {"withheld": True},
             }
@@ -230,12 +231,13 @@ def test_get_channel_funding_status_reports_withheld() -> None:
 
     assert (
         backend.get_channel_funding_status(
-            peer_id="02" + "11" * 32,
+            peer_id=peer_id,
             txid=txid,
         )
         is ChannelFundingStatus.WITHHELD
     )
 
+    rpc.listpeerchannels.assert_called_once_with(peer_id)
     rpc.listtransactions.assert_not_called()
 
 
@@ -248,12 +250,13 @@ def test_get_channel_funding_status_reports_broadcast_channel() -> None:
     ):
         backend = CLNBackend("/tmp/lightning-rpc")
 
+    peer_id = "02" + "11" * 32
     txid = "11" * 32
 
     rpc.listpeerchannels.return_value = {
         "channels": [
             {
-                "peer_id": "02" + "11" * 32,
+                "peer_id": peer_id,
                 "funding_txid": txid,
                 "funding": {"withheld": False},
             }
@@ -262,11 +265,13 @@ def test_get_channel_funding_status_reports_broadcast_channel() -> None:
 
     assert (
         backend.get_channel_funding_status(
-            peer_id="02" + "11" * 32,
+            peer_id=peer_id,
             txid=txid,
         )
         is ChannelFundingStatus.BROADCAST
     )
+
+    rpc.listpeerchannels.assert_called_once_with(peer_id)
 
 
 def test_get_channel_funding_status_reports_broadcast_transaction() -> None:

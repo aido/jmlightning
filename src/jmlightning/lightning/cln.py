@@ -141,7 +141,7 @@ class CLNBackend(LightningBackend):
         a second source of truth for an already-broadcast transaction.
         """
         try:
-            peer_result = self.rpc.listpeerchannels(id=peer_id)
+            peer_result = self.rpc.listpeerchannels(peer_id)
             if not isinstance(peer_result, dict):
                 raise RuntimeError("CLN listpeerchannels returned an invalid response")
 
