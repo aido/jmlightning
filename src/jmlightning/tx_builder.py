@@ -8,6 +8,7 @@ from jmcore.bitcoin import (
     create_psbt,
     hash256,
     parse_derivation_path,
+    pubkey_to_p2wpkh_script,
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, PSBTError, parse_psbt
@@ -204,6 +205,15 @@ class TxBuilder:
                     f"{coin.utxo.txid}:{coin.utxo.vout}"
                 )
 
+            expected_pubkey = key.get_public_key_bytes(compressed=True)
+            expected_script = pubkey_to_p2wpkh_script(expected_pubkey)
+            actual_script = bytes.fromhex(coin.utxo.scriptpubkey)
+            if actual_script != expected_script:
+                raise RuntimeError(
+                    "JoinMarket wallet key does not match funding input script "
+                    f"for input {len(psbt_inputs)}"
+                )
+
             psbt_inputs.append(
                 PSBTInput(
                     witness_utxo_value=coin.utxo.value,
@@ -214,9 +224,7 @@ class TxBuilder:
                     sighash_type=1,
                     bip32_derivations=[
                         BIP32Derivation(
-                            pubkey=key.get_public_key_bytes(
-                                compressed=True,
-                            ),
+                            pubkey=expected_pubkey,
                             fingerprint=wallet.master_key.fingerprint,
                             path=parse_derivation_path(
                                 coin.utxo.path,
@@ -250,6 +258,13 @@ class TxBuilder:
         signed_psbt = signed_result.psbt
 
         signed_indices = list(signed_result.signed_indices)
+        if any(
+            isinstance(index, bool) or not isinstance(index, int)
+            for index in signed_indices
+        ):
+            raise RuntimeError(
+                "JoinMarket wallet returned invalid signed input indices"
+            )
         expected_indices = set(range(len(plan.inputs)))
 
         if len(signed_indices) != len(expected_indices):

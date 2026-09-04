@@ -1,4 +1,6 @@
 import pytest
+from coincurve import PrivateKey
+from jmcore.bitcoin import pubkey_to_p2wpkh_script
 from jmwallet.wallet.models import AddressStatus, UTXOInfo
 
 from jmlightning.models import ClassifiedUTXO
@@ -12,6 +14,10 @@ def policy_engine() -> PolicyEngine:
 
 @pytest.fixture
 def classified_utxos() -> list[ClassifiedUTXO]:
+    scriptpubkey = pubkey_to_p2wpkh_script(
+        PrivateKey(b"\x01" * 32).public_key.format(compressed=True)
+    ).hex()
+
     def make_utxo(
         txid: str,
         vout: int,
@@ -24,7 +30,7 @@ def classified_utxos() -> list[ClassifiedUTXO]:
             mixdepth=0,
             address="bc1qtest",
             confirmations=6,
-            scriptpubkey="0014" + "00" * 20,
+            scriptpubkey=scriptpubkey,
             path="m/84'/0'/0'/0/0",
         )
 

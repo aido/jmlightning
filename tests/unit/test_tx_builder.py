@@ -231,6 +231,62 @@ def test_build_and_sign_funding_tx_rejects_changed_input_metadata(
         )
 
 
+def test_build_and_sign_funding_tx_rejects_key_script_mismatch(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    bad_coin = replace(
+        plan.inputs[0],
+        utxo=replace(
+            plan.inputs[0].utxo,
+            scriptpubkey="0014" + "11" * 20,
+        ),
+    )
+    bad_plan = replace(
+        plan,
+        inputs=[bad_coin, *plan.inputs[1:]],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="key does not match funding input script",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=bad_plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+    wallet.sign_psbt.assert_not_called()
+
+
+def test_build_and_sign_funding_tx_rejects_boolean_signed_index(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+    wallet.sign_psbt.return_value = SimpleNamespace(
+        psbt=b"psbt\xffsigned",
+        signed_indices=[True, 1],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid signed input indices",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
+            wallet=wallet,
+        )
+
+
 def test_build_and_sign_funding_tx_rejects_missing_partial_signature(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:

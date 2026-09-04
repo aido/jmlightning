@@ -177,11 +177,15 @@ def test_lock_uses_atomic_metadata_reservation(
         outpoint
     ]
     assert adapter.wallet.metadata_store.try_lock_outpoints.call_args.kwargs["owner"]
-    adapter.wallet.metadata_store.release_outpoints.assert_called_once()
-    assert adapter.wallet.metadata_store.release_outpoints.call_args.args[0] == [
-        outpoint
-    ]
-    assert adapter.wallet.freeze_utxo.call_count == 1
+    assert (
+        adapter.wallet.metadata_store.try_lock_outpoints.call_args.kwargs["ttl"]
+        == 24 * 60 * 60
+    )
+    adapter.wallet.metadata_store.release_outpoints.assert_not_called()
+    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
+    assert owner
+    assert (coin.utxo.txid, coin.utxo.vout) in adapter._locked_utxos
+    adapter.wallet.freeze_utxo.assert_called_once()
 
 
 def test_lock_rejects_utxo_already_reserved_by_another_process(
@@ -253,6 +257,7 @@ def test_unlock_unfreezes_utxo_and_removes_lock(
     coin = classified_utxos[0]
 
     adapter.lock(coin)
+    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
     adapter.unlock(coin)
 
     adapter.wallet.unfreeze_utxo.assert_called_once_with(
@@ -260,6 +265,11 @@ def test_unlock_unfreezes_utxo_and_removes_lock(
     )
 
     assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
+    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
+    adapter.wallet.metadata_store.release_outpoints.assert_called_once_with(
+        [f"{coin.utxo.txid}:{coin.utxo.vout}"],
+        owner=owner,
+    )
 
 
 def test_unlock_untracked_utxo_still_unfreezes(
@@ -277,6 +287,7 @@ def test_unlock_untracked_utxo_still_unfreezes(
     )
 
     assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
+    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
 
 
 def test_lock_rejects_disconnected_adapter(

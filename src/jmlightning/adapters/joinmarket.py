@@ -17,6 +17,11 @@ from jmlightning.models import ClassifiedUTXO
 
 logger = logging.getLogger(__name__)
 
+# Keep the ownership lease longer than the normal interactive funding flow.
+# JoinMarket freezes remain authoritative, so this lease only protects
+# jm-lightning cleanup from racing with another process.
+LOCK_TTL_SECONDS = 24 * 60 * 60
+
 
 class NetworkLike(Protocol):
     @property
@@ -42,6 +47,10 @@ class JoinMarketAdapter:
 
         # Outpoints locked by jm-lightning during an operation.
         self._locked_utxos: set[tuple[str, int]] = set()
+        # Metadata lock owners are retained for the lifetime of each local
+        # JoinMarket freeze. This prevents cleanup from releasing a lock
+        # acquired by another process after the temporary reservation ended.
+        self._lock_owners: dict[tuple[str, int], str] = {}
 
     def sign_input(
         self,
@@ -273,7 +282,11 @@ class JoinMarketAdapter:
         if metadata_store is None:
             raise RuntimeError("Cannot lock UTXOs without a data directory")
 
-        if not metadata_store.try_lock_outpoints([outpoint_ref], owner=owner):
+        if not metadata_store.try_lock_outpoints(
+            [outpoint_ref],
+            ttl=LOCK_TTL_SECONDS,
+            owner=owner,
+        ):
             raise ValueError(
                 f"UTXO {coin.utxo.txid}:{coin.utxo.vout} is already locked"
             )
@@ -285,14 +298,7 @@ class JoinMarketAdapter:
             raise
 
         self._locked_utxos.add(outpoint)
-        try:
-            metadata_store.release_outpoints([outpoint_ref], owner=owner)
-        except Exception:
-            logger.warning(
-                "Failed to release temporary UTXO reservation for %s",
-                outpoint_ref,
-                exc_info=True,
-            )
+        self._lock_owners[outpoint] = owner
 
     def unlock(
         self,
@@ -307,7 +313,20 @@ class JoinMarketAdapter:
             coin.utxo.vout,
         )
 
-        wallet.unfreeze_utxo(f"{coin.utxo.txid}:{coin.utxo.vout}")
+        outpoint_ref = f"{coin.utxo.txid}:{coin.utxo.vout}"
+        wallet.unfreeze_utxo(outpoint_ref)
+
+        owner = self._lock_owners.pop(outpoint, None)
+        if owner is not None:
+            metadata_store = wallet.metadata_store
+            if metadata_store is None:
+                self._lock_owners[outpoint] = owner
+                raise RuntimeError("Cannot release UTXO lock without a data directory")
+            try:
+                metadata_store.release_outpoints([outpoint_ref], owner=owner)
+            except Exception:
+                self._lock_owners[outpoint] = owner
+                raise
 
         self._locked_utxos.discard(outpoint)
 
