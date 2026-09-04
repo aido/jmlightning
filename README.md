@@ -1,45 +1,37 @@
 # ⚡ jmlightning
 
-**JoinMarket-NG to Lightning Network Bridge** - A privacy-preserving, policy-driven bridge for funding Lightning channels and as the project evolves, executing atomic submarine swaps directly from JoinMarket-NG wallets using PeerSwap (via Core Lightning).
+**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Core Lightning channels from JoinMarket-NG wallet UTXOs. Submarine swaps and channel splicing are planned extensions.
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
 [![Code Style: Ruff](https://img.shields.io/badge/code%20style-ruff-000000.svg)](https://github.com/astral-sh/ruff)
 [![Type Checker: mypy](https://img.shields.io/badge/mypy-strict-blue.svg)](https://mypy-lang.org/)
 
-[![CI](https://github.com/aido/jmlightning/actions/workflows/ci.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/ci.yml)
-[![Regtest Integration](https://github.com/aido/jmlightning/actions/workflows/regtest.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/regtest.yml)
+[![Static Analysis](https://github.com/aido/jmlightning/actions/workflows/static.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/static.yml)
+[![Unit tests](https://github.com/aido/jmlightning/actions/workflows/unit.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/unit.yml)
+[![Integration tests](https://github.com/aido/jmlightning/actions/workflows/regtest.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/regtest.yml)
 [![CodeQL](https://github.com/aido/jmlightning/actions/workflows/codeql.yml/badge.svg)](https://github.com/aido/jmlightning/actions/workflows/codeql.yml)
 [![codecov](https://codecov.io/gh/aido/jmlightning/graph/badge.svg?token=4QM88JZL6Q)](https://codecov.io/gh/aido/jmlightning)
 ---
 
 ## 📋 Overview
 
-`jmlightning` connects **JoinMarket-NG** wallets with **Core Lightning (CLN)** while keeping JoinMarket's UTXO privacy policy at the centre of the transaction flow.
+`jmlightning` connects **JoinMarket-NG** wallets with a **Lightning** node while keeping JoinMarket's UTXO privacy policy at the centre of the transaction flow.
 
 `jmlightning` uses the JoinMarket-NG wallet, wallet models and wallet configuration as the source of truth for Bitcoin funds and their privacy classification.
 
 `jmlightning` is not primarily adding a new privacy property to JoinMarket-NG; it provides a controlled, selective external-spending path that avoids having to sweep/consolidate an entire mixdepth when funding Lightning.
 
-The relationship can be thought of as:
-
-```mermaid
-flowchart TD
-    A[JoinMarket-NG] -->|wallet state, UTXOs, labels,<br/>address classification, signing| B["jmlightning<br/>(Policy, Planning, Operations, Execution)"]
-    B --> C["Core Lightning<br/>(CLN)"]
-    B --> D["Future Operations<br/>(Submarine Swaps)"]
-```
-
 JoinMarket-NG remains responsible for the wallet itself. `jmlightning` sits on top of that wallet and adds a controlled path from classified JoinMarket UTXOs to Lightning operations.
 
-This distinction is important:
+The relationship can be thought of as:
 
 - JoinMarket-NG owns the wallet and its funds.
 - JoinMarket-NG provides the wallet's UTXO and address information.
-- `jmlightning` classifies and applies an operation policy to those UTXOs.
+- `jmlightning` translates those classifications into internal objects and applies an operation policy to them.
 - `jmlightning` plans and constructs the resulting Bitcoin transaction.
 - JoinMarket-NG is used to sign transactions with the wallet.
-- CLN performs the Lightning-side channel operation.
+- The Lightning node performs the Lightning-side channel operation.
 - Future operations, such as submarine swaps, remain subject to the same UTXO policy.
 
 The project separates three concerns:
@@ -87,63 +79,174 @@ are enforced by the policy layer rather than relying on the CLI user to make the
 
 ---
 
+## 🚀 Installation
+
+### Requirements
+
+- Python **3.11 or newer**
+- JoinMarket-NG
+  - `jmcore`
+  - `jmwallet`
+- Core Lightning for channel funding
+- A CLN JSON-RPC Unix socket accessible by the process running `jmlightning`
+
+The exact dependency versions are defined by `pyproject.toml`.
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/aido/jmlightning.git
+cd jmlightning
+```
+
+### Install
+
+```bash
+pip install -e .
+```
+
+---
+
+## ⚙️ Configuration
+
+`jmlightning` reuses JoinMarket-NG configuration and wallet settings rather than introducing a second wallet configuration system.
+
+The CLI resolves JoinMarket-NG settings for the network, Bitcoin backend, data directory, wallet configuration and mnemonic. The underlying configuration precedence is provided by JoinMarket-NG; for bridge-specific command options, use the CLI options shown by `--help`.
+
+Initialise the JoinMarket-NG configuration with:
+
+```bash
+jm-lightning config-init
+```
+
+You can specify the data directory or configuration file explicitly:
+
+```bash
+jm-lightning config-init \
+  --data-dir /path/to/joinmarket-data \
+  --config-file /path/to/config.toml
+```
+
+The current `open-channel` command does **not** consume a separate `jmlightning` `[lightning]` TOML section. The CLN RPC socket is supplied with `--cln-socket`; amount, mixdepth, mnemonic file and confirmation behaviour are also command-line options.
+
+Do not commit RPC credentials, wallet secrets, mnemonics or other sensitive configuration to source control.
+
+## 💻 Usage
+
+### CLI Structure
+
+Commands follow the JoinMarket-NG-style subcommand structure:
+
+```text
+jm-lightning <command> <parameter> <parameter>
+```
+
+The CLI command selects an application operation. The operation then applies the appropriate capability policy and coordinates the required wallet, planning and backend services.
+
+---
+
+### Open a Lightning Channel
+
+A channel funding operation requests the `OPEN_CHANNEL` capability.
+
+For example:
+
+```bash
+jm-lightning open-channel \
+  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+  --amount 1000000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The important part of this command is not simply the requested amount.
+
+The application will:
+
+1. Dispatch the command to `OpenChannelOperation`.
+2. Connect to the JoinMarket wallet.
+3. Discover and classify available UTXOs.
+4. Ask the policy engine for UTXOs capable of `OPEN_CHANNEL`.
+5. Reject UTXOs that do not have that capability.
+6. Obtain a fee estimate from CLN.
+7. Select and plan the funding transaction from the approved UTXOs.
+8. Lock the selected UTXOs before starting CLN funding.
+9. Ask CLN for a funding address and construct/sign the funding transaction.
+10. Optionally ask the operator to confirm the transaction.
+11. Complete the CLN funding operation with the signed PSBT withheld.
+12. Send the PSBT through CLN, which finalises and broadcasts the funding transaction.
+13. Retain the JoinMarket freeze after successful broadcast; ambiguous failures keep the inputs locked for recovery.
+
+The operation is implemented in:
+
+```text
+src/jmlightning/operations/open_channel.py
+```
+
+The CLI itself is responsible for parsing the command and dispatching the request to the operation.
+
+Run:
+
+```bash
+jm-lightning --help
+```
+
+and:
+
+```bash
+jm-lightning open-channel --help
+```
+
+for the options supported by the installed version.
+
+---
+
+### Sweep Mode
+
+A channel funding request with:
+
+```bash
+--amount 0
+```
+
+is treated as a sweep of the policy-approved UTXOs.
+
+For example:
+
+```bash
+jm-lightning open-channel \
+  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+  --amount 0 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+Sweep mode does **not** bypass the capability policy.
+
+Only UTXOs permitted for `OPEN_CHANNEL` are included.
+
+---
+
 ## 🏗 Architecture
 
-The project is deliberately divided into layers.
-
-The domain models and policy engine are independent of CLN and JoinMarket RPC details. Adapters translate external wallet/backend state into the internal domain model, while operations coordinate application workflows and execution components perform the required Lightning and Bitcoin transaction operations.
+The project is deliberately divided into a small number of layers. The CLI dispatches to an operation; the operation coordinates policy, planning, transaction construction and CLN; the JoinMarket adapter isolates `jmwallet` details.
 
 ```mermaid
 graph TD
-    subgraph CLI ["CLI / Entrypoint"]
-        CMD["jm-lightning"]
-    end
+    CLI["jm-lightning CLI"] --> OP["OpenChannelOperation"]
+    OP --> JMA["JoinMarketAdapter"]
+    OP --> POLICY["PolicyEngine"]
+    OP --> PLANNER["Planner"]
+    OP --> TX["TxBuilder"]
+    OP --> CLN["CLNBackend"]
 
-    subgraph Operations ["Operations"]
-        OPEN["OpenChannelOperation"]
-        SWAP["SwapOperation<br/>(future)"]
-    end
-
-    subgraph Adapters ["Adapter Layer"]
-        JMA["JoinMarketAdapter"]
-        JMW["JoinMarket-NG / jmwallet"]
-    end
-
-    subgraph Core ["Policy & Domain Engine"]
-        MODELS["Models<br/>ClassifiedUTXO"]
-        POLICY["Policy Engine<br/>Capability Validation"]
-        PLANNER["Planner<br/>Funding Plan & Fee Checks"]
-    end
-
-    subgraph Lightning ["Lightning Abstraction"]
-        LBACKEND["LightningBackend"]
-        CLN["CLNBackend<br/>Core Lightning RPC"]
-    end
-
-    subgraph Execution ["Bitcoin Transaction Construction"]
-        TXB["TxBuilder<br/>Transaction Construction & Signing"]
-    end
-
-    CMD --> OPEN
-    CMD --> SWAP
-
-    OPEN --> JMA
-    OPEN --> POLICY
-    OPEN --> PLANNER
-    OPEN --> TXB
-    OPEN --> CLN
-
-    JMA --> JMW
-    JMA --> MODELS
-    MODELS --> POLICY
+    JMA --> JM["JoinMarket-NG / jmwallet"]
+    JMA --> MODEL["ClassifiedUTXO"]
+    MODEL --> POLICY
     POLICY --> PLANNER
-    PLANNER --> TXB
-    TXB --> JMW
-    TXB --> CLN
-
-    SWAP --> POLICY
-
-    CLN --> LBACKEND
+    PLANNER --> TX
+    TX --> JM
+    CLN -. implements .-> LB["LightningBackend"]
 ```
 
 ### Design Principles
@@ -154,7 +257,7 @@ The architecture is built around several principles:
 - **Operations coordinate workflows** - command-specific application logic belongs in `operations/`, not in the CLI.
 - **Separation of concerns** - JoinMarket-specific code stays in the adapter layer.
 - **Backend abstraction** - Lightning functionality is accessed through a backend interface rather than being hard-coded into the policy engine.
-- **Deterministic planning** - UTXO selection and fee calculations are handled by a dedicated planner.
+- **Dedicated planning** - fee-aware transaction planning is handled by a dedicated planner after the operation has constrained the selection to policy-approved UTXOs.
 - **Minimal trust boundaries** - external systems provide data or execution services, while the local policy engine decides whether an operation is permitted.
 - **Privacy by construction** - privacy-sensitive restrictions are encoded in software rather than left to operator discipline.
 
@@ -162,59 +265,49 @@ The architecture is built around several principles:
 
 ## 🔄 Channel Funding Flow
 
-The channel funding path is conceptually:
+This is the central flow implemented by the current code. Policy and planning happen before CLN is asked to start funding, and the selected UTXOs are locked before the CLN funding operation is created.
 
 ```mermaid
 sequenceDiagram
     autonumber
-
-    participant CLI as CLI
+    participant CLI
     participant OP as OpenChannelOperation
-    participant JMA as JoinMarketAdapter
-    participant PE as PolicyEngine
-    participant CLN as CLNBackend
-    participant P as Planner
-    participant TX as TxBuilder
     participant JM as JoinMarket-NG
+    participant P as PolicyEngine
+    participant PL as Planner
+    participant CLN as CLNBackend
+    participant TX as TxBuilder
 
     CLI->>OP: Execute open-channel
-    OP->>JMA: Fetch wallet UTXOs
-    JMA->>JM: Read wallet state
-    JM-->>JMA: UTXOs + address classifications
-    JMA-->>OP: ClassifiedUTXO[]
-
-    OP->>CLN: Start channel funding
-    CLN-->>OP: Funding address / funding parameters
-
-    OP->>PE: Request OPEN_CHANNEL capability
-    PE-->>OP: Eligible UTXOs
-
-    OP->>P: Create execution plan
-    P-->>OP: Selected inputs + fee + change
-
-    OP->>TX: Construct and sign funding transaction
-    TX->>JM: Sign using JoinMarket wallet
-    JM-->>TX: Signed transaction
-
-    OP->>CLN: Complete channel funding
-    CLN-->>OP: Funding result
+    OP->>JM: Connect and synchronise
+    OP->>JM: Get available UTXOs
+    JM-->>OP: Classified UTXO data
+    OP->>P: Filter for OPEN_CHANNEL
+    P-->>OP: Policy-approved UTXOs
+    OP->>CLN: Get fee rate
+    CLN-->>OP: Fee rate
+    OP->>JM: Select from approved outpoints
+    JM-->>OP: Selected UTXOs
+    OP->>PL: Build funding plan
+    PL-->>OP: Inputs, amount, fee, change
+    OP->>JM: Atomically reserve and freeze inputs
+    OP->>CLN: fundchannel_start(peer, amount)
+    CLN-->>OP: Funding address
+    OP->>TX: Build and sign funding transaction
+    TX->>JM: Sign PSBT
+    JM-->>TX: Signed PSBT
+    TX-->>OP: Validated transaction + PSBT
+    OP->>OP: Optional operator confirmation
+    OP->>CLN: fundchannel_complete(withhold=true)
+    CLN-->>OP: Funding withheld
+    OP->>CLN: sendpsbt(signed PSBT)
+    CLN-->>OP: Broadcast txid
+    OP->>OP: Retain JoinMarket freeze
 ```
 
-The important property is that **the Lightning backend never gets to choose arbitrary JoinMarket UTXOs**.
+The important property is that **the Lightning backend never chooses arbitrary JoinMarket UTXOs**. The inputs originate from JoinMarket-NG, are filtered by the local capability policy, selected only from that approved set, and locked before CLN funding is started.
 
-The flow is:
-
-```mermaid
-flowchart TD
-    A[JoinMarket wallet] --> B[UTXO classification]
-    B --> C[Capability policy]
-    C --> D[Eligible UTXOs]
-    D --> E[Policy-constrained planner]
-    E --> F[Transaction construction]
-    F --> G[Lightning backend]
-```
-
----
+If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the transaction was harmlessly abandoned.
 
 ## 🔒 Policy Engine & Capabilities
 
@@ -226,11 +319,13 @@ A simplified policy is:
 
 | Address Status | Allowed Capabilities | Purpose |
 |---|---|---|
-| **`cj-out`** | `OPEN_CHANNEL`, `SWAP`, `SPLICE`, `REMIX` | CoinJoin output suitable for external spending and Lightning funding |
+| **`cj-out`** | `OPEN_CHANNEL`, `SPLICE`, `SWAP`, `REMIX` | CoinJoin output permitted for direct channel funding and other currently defined capabilities |
 | **`cj-change`** | `SWAP`, `REMIX` | CoinJoin change; not permitted for direct channel funding |
-| **`deposit`** | `REMIX` | Unmixed funds that should acquire CoinJoin privacy before external use |
-| **`deposit-change`** | `REMIX` | Change from an external deposit |
-| **other restricted states** | policy-dependent | Frozen, reserved, spent/reused or otherwise unsuitable coins remain restricted |
+| **`non-cj-change`** | `SWAP`, `REMIX` | Ordinary change; not permitted for direct channel funding |
+| **`deposit`** | `SWAP`, `REMIX` | External/unmixed funds; not permitted for direct channel funding |
+| **`reused`** | `SWAP`, `REMIX` | Reused address state; not permitted for direct channel funding |
+| **`new`** | `REMIX` | Newly derived address state; not permitted for direct channel funding |
+| **`reserved`**, **`bond`**, **`flagged`**, **`used-empty`** | none | Restricted states |
 
 The exact policy is implemented in `policy.py` and should be treated as the authoritative source rather than the above table.
 
@@ -262,76 +357,22 @@ This abstraction is important because it allows new operations to be introduced 
 
 ---
 
-## 🔁 Future Submarine Swap Support
-
-The architecture also anticipates **atomic submarine swaps** as an alternative way of moving value between the on-chain and Lightning layers.
-
-This is particularly important for UTXOs that should not be used directly for public Lightning channel funding.
-
-For example, a future swap operation can use the existing capability model:
-
-```mermaid
-flowchart TD
-    A[cj-out] --> B[SWAP]
-    C[cj-change] --> B
-    D[deposit] --> E[REMIX]
-    B --> F[Swap operation]
-```
-
-This provides a controlled path for `cj-change` and other permitted coins to leave the JoinMarket wallet without simply combining them with privacy-sensitive outputs in a public transaction.
-
-The swap implementation is intentionally kept in the operations layer rather than introducing a separate swap-backend hierarchy.
-
-The intended structure is:
-
-```text
-operations/
-    └── swap.py
-```
-
-The future swap operation may integrate with services such as:
-
-- **~Boltz~**
-- **PeerSwap** via CLN
-
-The particular provider or protocol should remain an implementation detail of the swap operation.
-
-The important architectural constraint is that the swap operation must not bypass the same policy engine used by direct Lightning funding.
-
-A future swap operation should therefore follow:
-
-```mermaid
-flowchart TD
-    A[JoinMarket UTXO] --> B[Classification]
-    B --> C[Capability check]
-    C --> D[Swap operation]
-    D --> E[Swap protocol/provider]
-    E --> F[Atomic swap]
-```
-
-This keeps the privacy policy independent of the particular swap provider.
-
----
-
 ## 🧠 Policy-Constrained UTXO Selection
 
 UTXO selection is not treated as a simple "find enough sats" problem.
 
-The planner considers:
+The operation and planner together consider:
 
-- UTXO eligibility
-- required capability
+- UTXO eligibility and required capability
 - target amount
 - transaction fees
 - available inputs
 - change
-- privacy implications of combining inputs
+- the privacy implications of combining inputs
 
-Where possible, the planner prefers a **single eligible UTXO** rather than unnecessarily combining multiple UTXOs.
+For fixed-amount funding, the operation delegates coin selection to JoinMarket-NG, constrained to the policy-approved outpoints. The planner then validates the resulting selection against the requested amount, fee and change rules.
 
-For example, if a 1,000,000 sat channel can be funded using one eligible 1,100,000 sat `cj-out`, there is generally no reason to combine several smaller outputs merely because the total is sufficient.
-
-Combining inputs can create additional ownership information and should therefore be an explicit consequence of the planning process rather than an accidental side effect.
+The project should therefore not claim a stronger single-input privacy guarantee than the JoinMarket-NG selector and current CLI actually provide. Combining inputs can reveal ownership relationships and remains a privacy consideration.
 
 ### Sweep Mode
 
@@ -340,6 +381,133 @@ A sweep is different from a fixed-amount funding request.
 For `--amount 0`, the operation should consider the UTXOs that have already passed the required capability policy and construct a plan using those approved inputs.
 
 Sweep mode therefore does not bypass the policy engine.
+
+---
+
+## 🐍 Programmatic Architecture
+
+The internal modules are deliberately separated so that policy and planning do not depend on CLN RPC details. The CLI is the current supported entry point; internal classes should be treated as implementation APIs unless and until a stable public library API is documented.
+
+The important architectural point is that the planner receives **already policy-approved UTXOs**. It does not grant capabilities or override the policy engine.
+
+---
+
+## 🧪 Testing
+
+The project currently has a test suite covering:
+
+- Core Lightning backend behaviour
+- JoinMarket wallet adaptation
+- UTXO classification and policy enforcement
+- UTXO planning and selection
+- Bitcoin transaction construction
+
+Run the complete test suite with:
+
+```bash
+pytest
+```
+
+### Type Checking
+
+The project uses mypy for static type checking.
+
+Run:
+
+```bash
+mypy .
+```
+
+The source and test suite are intended to remain type-safe.
+
+### Linting
+
+Run:
+
+```bash
+ruff check .
+```
+
+### Formatting
+
+Run:
+
+```bash
+ruff format .
+```
+
+A useful development check is therefore:
+
+```bash
+ruff check .
+ruff format --check .
+mypy .
+pytest
+```
+
+---
+
+## 🔐 Security & Privacy
+
+`jmlightning` handles Bitcoin UTXOs, wallet information and Lightning funding transactions. Security and privacy are therefore first-class design requirements.
+
+### UTXO Policy Is a Security Boundary
+
+The policy engine is not merely a convenience filter.
+
+It exists to prevent operations from using UTXOs in ways that violate the wallet's privacy policy.
+
+Code that executes an operation should not independently construct an unrestricted list of JoinMarket UTXOs.
+
+Instead:
+
+
+
+should remain the normal path.
+
+### Avoid Unnecessary Input Merging
+
+Combining multiple UTXOs can reveal ownership relationships.
+
+The current operation delegates fixed-amount coin selection to JoinMarket-NG, constrained to the policy-approved outpoints. The planner then validates the resulting selection against the requested amount, fee and change rules.
+
+The project should not claim a stronger single-input privacy guarantee than the current selector and CLI actually provide. Combining inputs can reveal ownership relationships and remains a privacy consideration.
+
+### Toxic Change
+
+`cj-change` should not be treated as equivalent to a CoinJoin output.
+
+A CoinJoin change output can carry transaction-history information that makes it inappropriate for certain external payments.
+
+For this reason, the policy engine intentionally distinguishes `cj-out` from `cj-change` rather than treating both as generic "CoinJoin coins".
+
+### Lightning RPC Security
+
+CLN's JSON-RPC socket grants significant control over the Lightning node.
+
+The Unix socket should therefore have restrictive permissions and should not be exposed unnecessarily to other local users or processes.
+
+For example:
+
+```bash
+chmod 600 /run/lightningd/lightning-rpc
+```
+
+The exact ownership and permission model should match the CLN deployment.
+
+### Secrets
+
+Do not place any of the following in the repository:
+
+- JoinMarket wallet mnemonics
+- wallet seeds
+- Bitcoin RPC passwords
+- CLN credentials
+- swap provider credentials
+- private keys
+- generated wallet files
+
+Use appropriate secret-management mechanisms for production deployments.
 
 ---
 
@@ -416,11 +584,11 @@ The operation does not define the JoinMarket privacy rules itself. Those remain 
 
 #### `operations/swap.py`
 
-Placeholder for future submarine-swap operations.
+Placeholder for future swap functionality. No swap protocol is currently implemented.
 
-Swap provider and protocol-specific implementation belongs here rather than in the CLI or policy engine.
+#### `operations/splice.py`
 
-The swap operation must use the same capability-based policy model as other operations.
+Placeholder for future channel-splicing functionality.
 
 #### `models.py`
 
@@ -466,363 +634,6 @@ Provides the Core Lightning implementation using CLN's JSON-RPC interface.
 
 ---
 
-## 🚀 Installation
-
-### Requirements
-
-- Python **3.11 or newer**
-- JoinMarket-NG
-  - `jmcore`
-  - `jmwallet`
-- Core Lightning for channel funding
-- A CLN JSON-RPC Unix socket accessible by the process running `jmlightning`
-
-The exact dependency versions are defined by `pyproject.toml`.
-
-### Clone the Repository
-
-```bash
-git clone https://github.com/your-repo/jmlightning.git
-cd jmlightning
-```
-
-### Install
-
-```bash
-pip install -e .
-```
-
----
-
-## ⚙️ Configuration
-
-`jmlightning` is designed to operate within the JoinMarket-NG configuration environment.
-
-Where a setting belongs to the JoinMarket wallet or its Bitcoin backend, the JoinMarket-NG configuration should remain the source of truth rather than introducing a second, conflicting configuration system.
-
-In particular, JoinMarket-NG configuration determines the wallet environment in which `jmlightning` operates, including things such as:
-
-- Bitcoin network and backend configuration
-- JoinMarket data/configuration locations
-- wallet-related configuration
-- JoinMarket wallet/backend settings
-
-`jmlightning` adds configuration only for concerns that belong specifically to the bridge, such as Lightning backend settings and operation-specific options.
-
-Configuration is designed to support command-line options, environment variables and configuration files.
-
-The intended precedence is:
-
-```mermaid
-flowchart TD
-    A[CLI arguments] --> B[Environment variables]
-    B --> C[Configuration file]
-    C --> D[Built-in defaults]
-```
-
-Configuration is kept separate from the policy and domain models so that changing deployment configuration does not alter the privacy rules.
-
-If supported by the installed version, the configuration can be initialised with:
-
-```bash
-jm-lightning config-init
-```
-
-An example configuration may look like:
-
-```toml
-[lightning]
-cln_socket = "/run/lightningd/lightning-rpc"
-default_fee_priority = "normal"
-```
-
-Do not commit RPC credentials, wallet secrets, mnemonics or other sensitive configuration to source control.
-
----
-
-## 💻 Usage
-
-### CLI Structure
-
-Commands follow the JoinMarket-NG-style subcommand structure:
-
-```text
-jm-lightning <command> <parameter> <parameter>
-```
-
-The CLI command selects an application operation. The operation then applies the appropriate capability policy and coordinates the required wallet, planning and backend services.
-
----
-
-### Open a Lightning Channel
-
-A channel funding operation requests the `OPEN_CHANNEL` capability.
-
-For example:
-
-```bash
-jm-lightning open-channel \
-  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
-  --amount 1000000 \
-  --mixdepth 1 \
-  --cln-socket /run/lightningd/lightning-rpc
-```
-
-The important part of this command is not simply the requested amount.
-
-The application will:
-
-1. Dispatch the command to `OpenChannelOperation`.
-2. Connect to the JoinMarket wallet.
-3. Discover and classify available UTXOs.
-4. Ask the policy engine for UTXOs capable of `OPEN_CHANNEL`.
-5. Reject UTXOs that do not have that capability.
-6. Obtain the Lightning funding parameters.
-7. Plan the funding transaction, including fees.
-8. Construct and sign the Bitcoin transaction.
-9. Complete the Lightning funding operation through CLN.
-10. Broadcast the resulting transaction as required by the funding workflow.
-11. Release temporary JoinMarket UTXO locks.
-
-The operation is implemented in:
-
-```text
-src/jmlightning/operations/open_channel.py
-```
-
-The CLI itself is responsible for parsing the command and dispatching the request to the operation.
-
-### Typical Options
-
-```text
-PEER_ID
-    Lightning node public key.
-
---amount
-    Funding amount in satoshis.
-
---mixdepth
-    JoinMarket mixdepth from which eligible UTXOs are selected.
-
---cln-socket
-    Path to the Core Lightning JSON-RPC Unix socket.
-
---mnemonic-file
-    JoinMarket wallet seed/mnemonic source, where supported.
-```
-
-Run:
-
-```bash
-jm-lightning --help
-```
-
-and:
-
-```bash
-jm-lightning open-channel --help
-```
-
-for the options supported by the installed version.
-
----
-
-### Sweep Mode
-
-A channel funding request with:
-
-```bash
---amount 0
-```
-
-is treated as a sweep of the policy-approved UTXOs.
-
-For example:
-
-```bash
-jm-lightning open-channel \
-  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
-  --amount 0 \
-  --mixdepth 1 \
-  --cln-socket /run/lightningd/lightning-rpc
-```
-
-Sweep mode does **not** bypass the capability policy.
-
-Only UTXOs permitted for `OPEN_CHANNEL` are included.
-
----
-
-## 🐍 Programmatic Architecture
-
-The project is intended to be usable as a Python library as well as through the CLI.
-
-A simplified conceptual flow is:
-
-```python
-from jmlightning.policy import Capability, PolicyEngine
-from jmlightning.planner import Planner
-
-policy = PolicyEngine()
-
-eligible = policy.filter_eligible(
-    utxos=adapter.get_utxos(mixdepth=0),
-    required_capability=Capability.OPEN_CHANNEL,
-)
-
-planner = Planner()
-
-plan = planner.create_plan(
-    utxos=eligible,
-    target_amount=1_000_000,
-    fee_rate=fee_rate,
-    destination_address=funding_address,
-)
-```
-
-The exact public API should be taken from the installed version of the package.
-
-The important architectural point is that the planner receives **already policy-filtered UTXOs**.
-
-The planner is not intended to override the policy engine.
-
----
-
-## 🧪 Testing
-
-The project currently has a test suite covering:
-
-- Core Lightning backend behaviour
-- JoinMarket wallet adaptation
-- UTXO classification and policy enforcement
-- UTXO planning and selection
-- Bitcoin transaction construction
-
-Run the complete test suite with:
-
-```bash
-pytest
-```
-
-### Type Checking
-
-The project uses mypy for static type checking.
-
-Run:
-
-```bash
-mypy .
-```
-
-The source and test suite are intended to remain type-safe.
-
-### Linting
-
-Run:
-
-```bash
-ruff check .
-```
-
-### Formatting
-
-Run:
-
-```bash
-ruff format .
-```
-
-A useful development check is therefore:
-
-```bash
-ruff check .
-ruff format --check .
-mypy .
-pytest
-```
-
----
-
-## 🔐 Security & Privacy
-
-`jmlightning` handles Bitcoin UTXOs, wallet information and Lightning funding transactions. Security and privacy are therefore first-class design requirements.
-
-### UTXO Policy Is a Security Boundary
-
-The policy engine is not merely a convenience filter.
-
-It exists to prevent operations from using UTXOs in ways that violate the wallet's privacy policy.
-
-Code that executes an operation should not independently construct an unrestricted list of JoinMarket UTXOs.
-
-Instead:
-
-```mermaid
-flowchart TD
-    A[Wallet] --> B[Classification]
-    B --> C[Policy]
-    C --> D[Planning]
-    D --> E[Execution]
-```
-
-should remain the normal path.
-
-### Avoid Unnecessary Input Merging
-
-Combining multiple UTXOs can reveal ownership relationships.
-
-The planner therefore prefers appropriate single-input solutions when possible.
-
-This is a privacy preference, not merely a fee optimisation.
-
-### Toxic Change
-
-`cj-change` should not be treated as equivalent to a CoinJoin output.
-
-A CoinJoin change output can carry transaction-history information that makes it inappropriate for certain external payments.
-
-For this reason, the policy engine intentionally distinguishes `cj-out` from `cj-change` rather than treating both as generic "CoinJoin coins".
-
-### 🔒 Privacy-Oriented Funding
-
-The following options can be used to reduce unnecessary on-chain linkage when funding a Lightning channel:
-
-- `--single-input-utxo` - uses exactly one eligible `cj-out`, avoiding common-input linkage between multiple JoinMarket UTXOs.
-- `--single-input-address` - permits multiple inputs only when they belong to the same JoinMarket address, avoiding cross-address input linkage while allowing more flexible funding.
-- `--no-change` - requires the selected inputs to fund the channel and transaction fee without creating a JoinMarket change output.
-
-Using `--single-input-utxo --no-change` provides the strongest isolation: **one `cj-out` → one Lightning funding output, with no unrelated inputs or JoinMarket change.**
-
-### Lightning RPC Security
-
-CLN's JSON-RPC socket grants significant control over the Lightning node.
-
-The Unix socket should therefore have restrictive permissions and should not be exposed unnecessarily to other local users or processes.
-
-For example:
-
-```bash
-chmod 600 /run/lightningd/lightning-rpc
-```
-
-The exact ownership and permission model should match the CLN deployment.
-
-### Secrets
-
-Do not place any of the following in the repository:
-
-- JoinMarket wallet mnemonics
-- wallet seeds
-- Bitcoin RPC passwords
-- CLN credentials
-- swap provider credentials
-- private keys
-- generated wallet files
-
-Use appropriate secret-management mechanisms for production deployments.
-
----
-
 ## 🧩 Extensibility
 
 The project is designed around clear interfaces and operation boundaries rather than tying the entire application to one execution path.
@@ -833,11 +644,7 @@ Application-level functionality belongs in `operations/`.
 
 Conceptually:
 
-```mermaid
-flowchart TD
-    CLI["CLI"] --> OPEN["OpenChannelOperation"]
-    CLI["CLI"] --> SWAP["SwapOperation<br/>(future)"]
-```
+
 
 Each operation coordinates its own workflow while obtaining UTXOs through the shared capability policy.
 
@@ -859,19 +666,11 @@ LightningBackend
 
 The policy and planning layers should not need to know which Lightning implementation is being used.
 
-### Future Swap Operations
+### Future Operations
 
-Submarine swap functionality will live in:
+Submarine swaps and channel splicing are planned extensions. The current `operations/swap.py` and `operations/splice.py` files are placeholders; they do not implement those operations yet.
 
-```text
-operations/swap.py
-```
-
-The operation may communicate with external swap protocols or providers as required.
-
-Those implementation details should remain within the operation rather than introducing a separate swap-backend hierarchy unless the requirements later demonstrate a need for one.
-
-The policy engine remains independent of the swap implementation.
+When implemented, additional operations must use the same capability-based policy boundary as channel funding. Provider- or protocol-specific details should remain inside the relevant operation unless a separate abstraction is justified by actual requirements.
 
 ### JoinMarket Adapters
 
@@ -900,11 +699,7 @@ The project is being developed incrementally.
 
 Potential future development includes:
 
-- **Submarine swaps**
-  - ~Boltz integration~
-  - PeerSwap integration via CLN
-  - Additional swap protocols/providers as appropriate
-
+- **Submarine swaps**, potentially including PeerSwap via CLN
 - **Additional Lightning backends**
 
 - **More sophisticated policy-constrained coin selection**
