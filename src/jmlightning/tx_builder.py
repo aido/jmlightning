@@ -1,3 +1,5 @@
+from collections.abc import Mapping
+
 from jmcore.bitcoin import (
     BIP32Derivation,
     ParsedTransaction,
@@ -15,6 +17,7 @@ from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, PSBTError, parse_psbt
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import verify_p2wpkh_signature
 
+from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan
 
 
@@ -34,10 +37,10 @@ class TxBuilder:
     def _validate_plan(self, plan: ExecutionPlan) -> None:
         """Validate the financial and input invariants of an execution plan."""
         if not plan.inputs:
-            raise ValueError("Funding transaction requires at least one input.")
+            raise ValueError("Transaction requires at least one input.")
 
         if plan.amount <= 0:
-            raise ValueError("Funding transaction amount must be positive.")
+            raise ValueError("Transaction amount must be positive.")
 
         if plan.fee < 0:
             raise ValueError("Transaction fee cannot be negative.")
@@ -48,7 +51,7 @@ class TxBuilder:
         outpoints = [(coin.utxo.txid, coin.utxo.vout) for coin in plan.inputs]
 
         if len(outpoints) != len(set(outpoints)):
-            raise ValueError("Funding transaction contains duplicate inputs.")
+            raise ValueError("Transaction contains duplicate inputs.")
 
         input_total = sum(coin.utxo.value for coin in plan.inputs)
 
@@ -56,7 +59,7 @@ class TxBuilder:
 
         if input_total != expected_total:
             raise ValueError(
-                "Funding transaction plan has inconsistent amounts: "
+                "Transaction plan has inconsistent amounts: "
                 f"inputs={input_total}, "
                 f"amount={plan.amount}, "
                 f"fee={plan.fee}, "
@@ -69,7 +72,7 @@ class TxBuilder:
 
         jmcore 0.37.0 unconditionally serialises ``PSBT_IN_WITNESS_SCRIPT``
         even when the witness script is empty. An empty value is not a valid
-        witness script record for a P2WPKH input, and Core Lightning rejects the
+        witness script record for a P2WPKH input and Core Lightning rejects the
         resulting PSBT. Keep this compatibility workaround local to the PSBT
         boundary rather than changing the transaction model or inserting a
         fabricated script. This is a workaround for a jmcore 0.37.0 bug.
@@ -234,6 +237,26 @@ class TxBuilder:
                 )
             )
 
+        signing_inputs = {index: coin for index, coin in enumerate(plan.inputs)}
+
+        tx, txid, signed_psbt = self._build_and_sign_tx(
+            tx=tx,
+            signing_inputs=signing_inputs,
+            psbt_inputs=psbt_inputs,
+            wallet=wallet,
+        )
+
+        return tx, txid, funding_vout, signed_psbt
+
+    def _build_and_sign_tx(
+        self,
+        tx: ParsedTransaction,
+        signing_inputs: Mapping[int, ClassifiedUTXO],
+        psbt_inputs: list[PSBTInput],
+        wallet: WalletService,
+    ) -> tuple[ParsedTransaction, str, bytes]:
+        """Build and cryptographically validate a signed transaction PSBT."""
+
         unsigned_psbt = create_psbt(
             version=tx.version,
             inputs=tx.inputs,
@@ -248,9 +271,9 @@ class TxBuilder:
             scan_range=0,
         )
 
-        if signing_plan.signable_count != len(plan.inputs):
+        if signing_plan.signable_count != len(signing_inputs):
             raise RuntimeError(
-                "JoinMarket wallet did not identify all funding inputs "
+                "JoinMarket wallet did not identify all inputs "
                 "as signable wallet inputs"
             )
 
@@ -265,10 +288,10 @@ class TxBuilder:
             raise RuntimeError(
                 "JoinMarket wallet returned invalid signed input indices"
             )
-        expected_indices = set(range(len(plan.inputs)))
+        expected_indices = set(signing_inputs)
 
         if len(signed_indices) != len(expected_indices):
-            raise RuntimeError("JoinMarket wallet did not sign all funding inputs")
+            raise RuntimeError("JoinMarket wallet did not sign all inputs")
 
         if len(set(signed_indices)) != len(signed_indices):
             raise RuntimeError(
@@ -276,9 +299,7 @@ class TxBuilder:
             )
 
         if set(signed_indices) != expected_indices:
-            raise RuntimeError(
-                "JoinMarket wallet did not sign exactly the funding inputs"
-            )
+            raise RuntimeError("JoinMarket wallet did not sign exactly the inputs")
 
         try:
             signed_parsed_psbt = parse_psbt(signed_psbt)
@@ -316,11 +337,10 @@ class TxBuilder:
                 "JoinMarket wallet changed PSBT output metadata while signing"
             )
 
-        for index, (source_map, signed_map, coin) in enumerate(
+        for index, (source_map, signed_map) in enumerate(
             zip(
                 source_parsed_psbt.input_maps,
                 signed_parsed_psbt.input_maps,
-                plan.inputs,
                 strict=True,
             )
         ):
@@ -339,6 +359,10 @@ class TxBuilder:
                     f"JoinMarket wallet changed PSBT input metadata for input {index}"
                 )
 
+            if index not in signing_inputs:
+                continue
+
+            coin = signing_inputs[index]
             key = wallet.get_key_for_address(coin.utxo.address)
             if key is None:
                 raise RuntimeError(
@@ -382,4 +406,4 @@ class TxBuilder:
 
         txid = self._txid(tx)
 
-        return tx, txid, funding_vout, signed_psbt
+        return tx, txid, signed_psbt

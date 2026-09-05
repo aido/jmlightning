@@ -265,7 +265,7 @@ The architecture is built around several principles:
 
 ## 🔄 Channel Funding Flow
 
-This is the central flow implemented by the current code. Policy and planning happen before CLN is asked to start funding, and the selected UTXOs are locked before the CLN funding operation is created.
+This is the central flow implemented by the current code. Policy and planning happen before CLN is asked to start funding and the selected UTXOs are locked before the CLN funding operation is created.
 
 ```mermaid
 sequenceDiagram
@@ -305,7 +305,7 @@ sequenceDiagram
     OP->>OP: Retain JoinMarket freeze
 ```
 
-The important property is that **the Lightning backend never chooses arbitrary JoinMarket UTXOs**. The inputs originate from JoinMarket-NG, are filtered by the local capability policy, selected only from that approved set, and locked before CLN funding is started.
+The important property is that **the Lightning backend never chooses arbitrary JoinMarket UTXOs**. The inputs originate from JoinMarket-NG, are filtered by the local capability policy, selected only from that approved set and locked before CLN funding is started.
 
 If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the transaction was harmlessly abandoned.
 

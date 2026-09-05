@@ -37,11 +37,11 @@ jobs:
             "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmcore" \
             "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmwallet"
           python -m pip install .
-          python -m pip install pytest mypy ruff
+          python -m pip install pytest ruff mypy[reports]
 
       - name: Linting
         run: |
-          ruff check .
+          ruff check --output-format junit --output-file ruff-junit.xml .
 
       - name: Formatting
         run: |
@@ -49,4 +49,24 @@ jobs:
 
       - name: Type Checking
         run: |
-          mypy src tests
+          mypy --junit-xml mypy-junit.xml --html-report mypy-html .
+
+      - name: Upload results to GitHub
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-analysis-${{ github.sha }}
+          path: |
+            ruff-junit.xml
+            mypy-junit.xml
+            mypy-html/
+          if-no-files-found: error
+
+      - name: Upload results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          name: static-analysis
+          flags: static
+          report_type: test_results
