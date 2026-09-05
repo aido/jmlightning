@@ -2,3 +2,6 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+mypy-html/
+mypy-junit.xml
+ruff-junit.xml

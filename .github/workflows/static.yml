@@ -41,7 +41,7 @@ jobs:
 
       - name: Linting
         run: |
-          ruff check .
+          ruff check --output-file ruff-junit.xml .
 
       - name: Formatting
         run: |
@@ -50,3 +50,34 @@ jobs:
       - name: Type Checking
         run: |
           mypy src tests
+
+      - name: Upload results to GitHub
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: static-analysis-${{ github.sha }}
+          path: |
+            ruff-junit.xml
+            mypy-junit.xml
+            mypy-html/
+          if-no-files-found: error
+
+      - name: Upload Ruff test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: ruff-junit.xml
+          name: ruff-lint
+          flags: ruff
+          report_type: test_results
+
+      - name: Upload mypy test results to Codecov
+        if: ${{ !cancelled() }}
+        uses: codecov/codecov-action@v6
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: mypy-junit.xml
+          name: mypy-types
+          flags: mypy
+          report_type: test_results

@@ -5,8 +5,16 @@ from unittest.mock import Mock
 
 import pytest
 from coincurve import PrivateKey
-from jmcore.bitcoin import create_p2wpkh_script_code
-from jmwallet.wallet.psbt import parse_psbt
+from jmcore.bitcoin import (
+    BIP32Derivation,
+    ParsedTransaction,
+    PSBTInput,
+    TxInput,
+    TxOutput,
+    create_p2wpkh_script_code,
+    parse_derivation_path,
+)
+from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, parse_psbt
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.models import ClassifiedUTXO
@@ -54,7 +62,16 @@ def _mock_wallet() -> Mock:
             pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
                 compressed=True,
             )
+            signed_indices: list[int] = []
             for index in range(len(parsed.input_maps)):
+                input_map = parsed.input_maps[index]
+                if not any(
+                    record.key[1:] == pubkey
+                    for record in input_map.records
+                    if record.key[:1] == b"\x06"
+                ):
+                    continue
+
                 signature = sign_p2wpkh_input(
                     parsed.transaction,
                     index,
@@ -67,6 +84,9 @@ def _mock_wallet() -> Mock:
                     b"\x02" + pubkey,
                     signature,
                 )
+                signed_indices.append(index)
+
+            default_signing_result.signed_indices = signed_indices
             default_signing_result.psbt = parsed.serialize()
         return cast(SimpleNamespace, current_result)
 
@@ -323,7 +343,7 @@ def test_build_and_sign_funding_tx_rejects_missing_partial_signature(
 
     with pytest.raises(
         RuntimeError,
-        match="JoinMarket wallet did not return exactly one signature for input 1",
+        match="did not return exactly one signature for input 1",
     ):
         builder.build_and_sign_funding_tx(
             plan=plan,
@@ -469,7 +489,7 @@ def test_build_and_sign_funding_tx_rejects_incomplete_wallet_selection(
 
     with pytest.raises(
         RuntimeError,
-        match="did not identify all funding inputs",
+        match="did not identify all inputs",
     ):
         builder.build_and_sign_funding_tx(
             plan=plan,
@@ -495,7 +515,7 @@ def test_build_and_sign_funding_tx_rejects_incomplete_signing(
 
     with pytest.raises(
         RuntimeError,
-        match="did not sign all funding inputs",
+        match="did not sign all inputs",
     ):
         builder.build_and_sign_funding_tx(
             plan=plan,
@@ -503,6 +523,119 @@ def test_build_and_sign_funding_tx_rejects_incomplete_signing(
             change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
             wallet=wallet,
         )
+
+
+def test_build_and_sign_tx_supports_non_wallet_inputs(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+
+    jm_inputs = classified_utxos[:2]
+    signing_inputs = {
+        1: jm_inputs[0],
+        2: jm_inputs[1],
+    }
+
+    tx_inputs = [
+        TxInput.from_hex(
+            txid="2222222222222222222222222222222222222222222222222222222222222222",
+            vout=0,
+            sequence=0xFFFFFFFF,
+            value=100_000,
+            scriptpubkey="0014" + "11" * 20,
+        ),
+        *[
+            TxInput.from_hex(
+                txid=coin.utxo.txid,
+                vout=coin.utxo.vout,
+                sequence=0xFFFFFFFF,
+                value=coin.utxo.value,
+                scriptpubkey=coin.utxo.scriptpubkey,
+            )
+            for coin in jm_inputs
+        ],
+    ]
+
+    tx = ParsedTransaction(
+        version=2,
+        inputs=tx_inputs,
+        outputs=[
+            TxOutput.from_address(
+                "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+                200_000,
+            )
+        ],
+        witnesses=[[] for _ in tx_inputs],
+        locktime=0,
+        has_witness=True,
+    )
+
+    psbt_inputs = [
+        PSBTInput(
+            witness_utxo_value=100_000,
+            witness_utxo_script=bytes.fromhex("0014" + "11" * 20),
+            witness_script=b"",
+        ),
+    ]
+
+    for coin in jm_inputs:
+        key = wallet.get_key_for_address(coin.utxo.address)
+        assert key is not None
+        expected_pubkey = key.get_public_key_bytes(compressed=True)
+
+        psbt_inputs.append(
+            PSBTInput(
+                witness_utxo_value=coin.utxo.value,
+                witness_utxo_script=bytes.fromhex(
+                    coin.utxo.scriptpubkey,
+                ),
+                witness_script=b"",
+                sighash_type=1,
+                bip32_derivations=[
+                    BIP32Derivation(
+                        pubkey=expected_pubkey,
+                        fingerprint=wallet.master_key.fingerprint,
+                        path=parse_derivation_path(coin.utxo.path),
+                    )
+                ],
+            )
+        )
+
+    signed_psbt = builder._build_and_sign_tx(
+        tx=tx,
+        signing_inputs=signing_inputs,
+        psbt_inputs=psbt_inputs,
+        wallet=wallet,
+    )[2]
+
+    parsed = parse_psbt(signed_psbt)
+
+    assert len(parsed.input_maps) == 3
+
+    # The non-wallet input must remain unsigned.
+    non_wallet_signatures = [
+        record
+        for record in parsed.input_maps[0].records
+        if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+    ]
+    assert non_wallet_signatures == []
+
+    # Both JoinMarket inputs must have exactly one valid signature.
+    for index, coin in signing_inputs.items():
+        key = wallet.get_key_for_address(coin.utxo.address)
+        assert key is not None
+        expected_pubkey = key.get_public_key_bytes(compressed=True)
+        signature_key = bytes([PSBT_IN_PARTIAL_SIG]) + expected_pubkey
+
+        signatures = [
+            record
+            for record in parsed.input_maps[index].records
+            if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+        ]
+
+        assert len(signatures) == 1
+        assert signatures[0].key == signature_key
 
 
 def test_build_and_sign_funding_tx_rejects_duplicate_signed_indices(
@@ -527,6 +660,34 @@ def test_build_and_sign_funding_tx_rejects_duplicate_signed_indices(
             change_address=("bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"),
             wallet=wallet,
         )
+
+
+def test_build_and_sign_funding_tx_rejects_unexpected_signed_input(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_plan(classified_utxos)
+    wallet = _mock_wallet()
+
+    wallet.sign_psbt.return_value = SimpleNamespace(
+        psbt=b"psbt\xffsigned",
+        signed_indices=[0, 2],
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="did not sign exactly the inputs",
+    ):
+        builder.build_and_sign_funding_tx(
+            plan=plan,
+            funding_address=(
+                "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
+            ),
+            change_address=("bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4"),
+            wallet=wallet,
+        )
+
+    wallet.sign_psbt.assert_called_once()
 
 
 def test_build_and_sign_funding_tx_rejects_different_signed_psbt(

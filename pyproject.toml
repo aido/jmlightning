@@ -34,10 +34,15 @@ warn_unused_configs = true
 disallow_untyped_defs = true
 mypy_path = "src"
 explicit_package_bases = true
+html_report = "mypy-html"
+junit_xml = "mypy-junit.xml"
 
 [[tool.mypy.overrides]]
 module = "pyln.client.*"
 ignore_missing_imports = true
+
+[tool.ruff]
+output-format = "junit"
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "N", "W", "UP"]
