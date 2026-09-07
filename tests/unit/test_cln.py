@@ -189,6 +189,318 @@ def test_open_channel_complete_preserves_completion_error_if_cancel_fails() -> N
     assert exc_info.value.__cause__ is completion_error
 
 
+def test_splice_init_calls_rpc_without_optional_psbt_or_feerate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_init.return_value = {
+        "psbt": "cHNidP8=",
+    }
+
+    result = backend.splice_init(
+        channel_id="11" * 32,
+        relative_amount=100_000,
+    )
+
+    rpc.splice_init.assert_called_once_with(
+        channel_id="11" * 32,
+        relative_amount=100_000,
+        force_feerate=False,
+    )
+    assert result == {
+        "psbt": "cHNidP8=",
+    }
+
+
+def test_splice_init_passes_optional_psbt_and_feerate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_init.return_value = {
+        "psbt": "cHNidP8=",
+    }
+
+    result = backend.splice_init(
+        channel_id="11" * 32,
+        relative_amount=-50_000,
+        initial_psbt=b"test-psbt",
+        feerate_per_kw=5_000,
+        force_feerate=True,
+    )
+
+    rpc.splice_init.assert_called_once_with(
+        channel_id="11" * 32,
+        relative_amount=-50_000,
+        initialpsbt="dGVzdC1wc2J0",
+        feerate_per_kw=5_000,
+        force_feerate=True,
+    )
+    assert result == {
+        "psbt": "cHNidP8=",
+    }
+
+
+def test_splice_init_rejects_missing_psbt() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_init.return_value = {}
+
+    with pytest.raises(
+        RuntimeError,
+        match="splice_init response is missing psbt",
+    ):
+        backend.splice_init(
+            channel_id="11" * 32,
+            relative_amount=100_000,
+        )
+
+
+def test_splice_update_calls_rpc_and_validates_response() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_update.return_value = {
+        "psbt": "cHNidP8=",
+        "commitments_secured": True,
+        "signatures_secured": False,
+    }
+
+    result = backend.splice_update(
+        channel_id="11" * 32,
+        psbt=b"test-psbt",
+    )
+
+    rpc.splice_update.assert_called_once_with(
+        channel_id="11" * 32,
+        psbt="dGVzdC1wc2J0",
+    )
+    assert result == {
+        "psbt": "cHNidP8=",
+        "commitments_secured": True,
+        "signatures_secured": False,
+    }
+
+
+def test_splice_update_accepts_missing_optional_signatures_secured() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_update.return_value = {
+        "psbt": "cHNidP8=",
+        "commitments_secured": True,
+    }
+
+    result = backend.splice_update(
+        channel_id="11" * 32,
+        psbt=b"test-psbt",
+    )
+
+    rpc.splice_update.assert_called_once_with(
+        channel_id="11" * 32,
+        psbt="dGVzdC1wc2J0",
+    )
+    assert result == {
+        "psbt": "cHNidP8=",
+        "commitments_secured": True,
+    }
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("psbt", None),
+        ("commitments_secured", None),
+        ("signatures_secured", "invalid"),
+    ],
+)
+def test_splice_update_rejects_invalid_response_field(
+    field: str,
+    value: object,
+) -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    response: dict[str, object] = {
+        "psbt": "cHNidP8=",
+        "commitments_secured": False,
+        "signatures_secured": False,
+    }
+    response[field] = value
+    rpc.splice_update.return_value = response
+
+    with pytest.raises(
+        RuntimeError,
+        match=field,
+    ):
+        backend.splice_update(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+
+def test_splice_signed_calls_rpc_and_validates_response() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_signed.return_value = {
+        "tx": "02000000",
+        "txid": "11" * 32,
+        "psbt": "cHNidP8=",
+        "outnum": 1,
+    }
+
+    result = backend.splice_signed(
+        channel_id="11" * 32,
+        psbt=b"test-psbt",
+        sign_first=True,
+    )
+
+    rpc.splice_signed.assert_called_once_with(
+        channel_id="11" * 32,
+        psbt="dGVzdC1wc2J0",
+        sign_first=True,
+    )
+    assert result == {
+        "tx": "02000000",
+        "txid": "11" * 32,
+        "psbt": "cHNidP8=",
+        "outnum": 1,
+    }
+
+
+@pytest.mark.parametrize("field", ["tx", "txid", "psbt"])
+def test_splice_signed_rejects_missing_required_response_field(
+    field: str,
+) -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    response: dict[str, object] = {
+        "tx": "02000000",
+        "txid": "11" * 32,
+        "psbt": "cHNidP8=",
+    }
+    response.pop(field)
+    rpc.splice_signed.return_value = response
+
+    with pytest.raises(
+        RuntimeError,
+        match=field,
+    ):
+        backend.splice_signed(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+
+def test_splice_signed_rejects_invalid_outnum() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_signed.return_value = {
+        "tx": "02000000",
+        "txid": "11" * 32,
+        "psbt": "cHNidP8=",
+        "outnum": -1,
+    }
+
+    with pytest.raises(
+        RuntimeError,
+        match="invalid outnum",
+    ):
+        backend.splice_signed(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+
+def test_splice_rpc_runtime_errors_are_propagated() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_init.side_effect = RuntimeError("init failed")
+    rpc.splice_update.side_effect = RuntimeError("update failed")
+    rpc.splice_signed.side_effect = RuntimeError("signed failed")
+
+    with pytest.raises(
+        RuntimeError,
+        match="init failed",
+    ):
+        backend.splice_init(
+            channel_id="11" * 32,
+            relative_amount=100_000,
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="update failed",
+    ):
+        backend.splice_update(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+    with pytest.raises(
+        RuntimeError,
+        match="signed failed",
+    ):
+        backend.splice_signed(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+
 def test_cancel_channel_funding_calls_fundchannel_cancel() -> None:
     rpc = Mock()
 

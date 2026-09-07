@@ -8,12 +8,25 @@ from jmcore.bitcoin import (
     TxOutput,
     create_p2wpkh_script_code,
     create_psbt,
+    encode_varint,
     hash256,
     parse_derivation_path,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
 )
-from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, PSBTError, parse_psbt
+from jmwallet.wallet.psbt import (
+    PSBT_IN_BIP32_DERIVATION,
+    PSBT_IN_FINAL_SCRIPTSIG,
+    PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_SIGHASH_TYPE,
+    PSBT_IN_WITNESS_UTXO,
+    ParsedPSBT,
+    PSBTError,
+    PSBTKeyValue,
+    PSBTMap,
+    parse_psbt,
+)
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import verify_p2wpkh_signature
 
@@ -248,6 +261,230 @@ class TxBuilder:
 
         return tx, txid, funding_vout, signed_psbt
 
+    def add_splice_in_input(
+        self,
+        psbt: bytes,
+        coin: ClassifiedUTXO,
+        relative_amount: int,
+        change_address: str,
+        wallet: WalletService,
+    ) -> bytes:
+        """Add one JoinMarket input and matching change to a splice PSBT.
+
+        The transaction supplied by Core Lightning remains authoritative.
+        This method only appends the approved JoinMarket input, adds any
+        resulting change output, and updates the BIP174 unsigned-transaction
+        record. Existing PSBT map records are retained unchanged.
+
+        The transaction must not already contain signatures: changing its
+        inputs or outputs would invalidate them.
+        """
+        if relative_amount <= 0:
+            raise ValueError("Splice-in amount must be positive")
+
+        try:
+            parsed = parse_psbt(psbt)
+        except PSBTError as exc:
+            raise ValueError("Invalid splice PSBT") from exc
+
+        for input_index, input_map in enumerate(parsed.input_maps):
+            if any(
+                record.key[:1]
+                in {
+                    bytes([PSBT_IN_PARTIAL_SIG]),
+                    bytes([PSBT_IN_FINAL_SCRIPTSIG]),
+                    bytes([PSBT_IN_FINAL_SCRIPTWITNESS]),
+                }
+                for record in input_map.records
+            ):
+                raise ValueError(
+                    "Cannot modify a splice PSBT after input signing has started "
+                    f"(input {input_index})"
+                )
+
+        existing_outpoints = {
+            (tx_input.txid, tx_input.vout) for tx_input in parsed.transaction.inputs
+        }
+        coin_outpoint = (coin.utxo.txid, coin.utxo.vout)
+        if coin_outpoint in existing_outpoints:
+            raise ValueError(
+                f"Splice input is already present: {coin.utxo.txid}:{coin.utxo.vout}"
+            )
+
+        if coin.utxo.value < relative_amount:
+            raise ValueError(
+                "Splice input value is smaller than the requested splice-in amount"
+            )
+
+        key = wallet.get_key_for_address(coin.utxo.address)
+        if key is None:
+            raise RuntimeError(
+                f"Unable to resolve wallet key for {coin.utxo.txid}:{coin.utxo.vout}"
+            )
+
+        expected_pubkey = key.get_public_key_bytes(compressed=True)
+        expected_script = pubkey_to_p2wpkh_script(expected_pubkey)
+        actual_script = bytes.fromhex(coin.utxo.scriptpubkey)
+        if actual_script != expected_script:
+            raise RuntimeError(
+                "JoinMarket wallet key does not match splice input script "
+                f"for input {len(parsed.transaction.inputs)}"
+            )
+
+        change = coin.utxo.value - relative_amount
+        change_output = (
+            TxOutput.from_address(change_address, change) if change > 0 else None
+        )
+
+        new_input = TxInput.from_hex(
+            txid=coin.utxo.txid,
+            vout=coin.utxo.vout,
+            sequence=0xFFFFFFFF,
+            value=coin.utxo.value,
+            scriptpubkey=coin.utxo.scriptpubkey,
+        )
+        parsed.transaction.inputs.append(new_input)
+        parsed.transaction.witnesses.append([])
+
+        if change_output is not None:
+            parsed.transaction.outputs.append(change_output)
+
+        witness_utxo = (
+            coin.utxo.value.to_bytes(8, "little", signed=False)
+            + encode_varint(len(actual_script))
+            + actual_script
+        )
+        new_input_map = PSBTMap()
+        new_input_map.append(
+            bytes([PSBT_IN_WITNESS_UTXO]),
+            witness_utxo,
+        )
+        new_input_map.append(
+            bytes([PSBT_IN_SIGHASH_TYPE]),
+            (1).to_bytes(4, "little"),
+        )
+        new_input_map.append(
+            bytes([PSBT_IN_BIP32_DERIVATION]) + expected_pubkey,
+            wallet.master_key.fingerprint
+            + b"".join(
+                path_index.to_bytes(4, "little", signed=False)
+                for path_index in parse_derivation_path(coin.utxo.path)
+            ),
+        )
+        parsed.input_maps.append(new_input_map)
+        if change_output is not None:
+            parsed.output_maps.append(PSBTMap())
+
+        unsigned_tx = serialize_transaction(
+            parsed.transaction.version,
+            parsed.transaction.inputs,
+            parsed.transaction.outputs,
+            parsed.transaction.locktime,
+        )
+        for index, record in enumerate(parsed.global_map.records):
+            if record.key == b"\x00":
+                parsed.global_map.records[index] = PSBTKeyValue(
+                    key=record.key,
+                    value=unsigned_tx,
+                )
+                break
+        else:
+            raise RuntimeError("Splice PSBT is missing the unsigned transaction")
+
+        return parsed.serialize()
+
+    @staticmethod
+    def _validate_splice_signing_input(
+        parsed_psbt: ParsedPSBT,
+        index: int,
+        coin: ClassifiedUTXO,
+    ) -> None:
+        """Verify that a splice signing input is the approved JoinMarket UTXO."""
+        transaction_input = parsed_psbt.transaction.inputs[index]
+
+        if (
+            transaction_input.txid != coin.utxo.txid
+            or transaction_input.vout != coin.utxo.vout
+        ):
+            raise RuntimeError(
+                f"Splice signing input {index} does not match the approved "
+                "JoinMarket UTXO outpoint"
+            )
+
+        witness_records = [
+            record
+            for record in parsed_psbt.input_maps[index].records
+            if record.key[:1] == bytes([PSBT_IN_WITNESS_UTXO])
+        ]
+        if len(witness_records) != 1:
+            raise RuntimeError(
+                f"Splice signing input {index} must contain exactly one "
+                "witness UTXO record"
+            )
+
+        expected_script = bytes.fromhex(coin.utxo.scriptpubkey)
+        expected_witness_utxo = (
+            coin.utxo.value.to_bytes(8, "little", signed=False)
+            + encode_varint(len(expected_script))
+            + expected_script
+        )
+        if witness_records[0].value != expected_witness_utxo:
+            raise RuntimeError(
+                f"Splice signing input {index} does not match the approved "
+                "JoinMarket UTXO value or script"
+            )
+
+    def sign_splice_psbt(
+        self,
+        psbt: bytes,
+        signing_inputs: Mapping[int, ClassifiedUTXO],
+        wallet: WalletService,
+    ) -> tuple[ParsedTransaction, str, bytes]:
+        """Sign JM-owned inputs in an existing splice PSBT.
+
+        Core Lightning owns the splice transaction and its PSBT metadata.
+        Unlike the normal funding path, this method never reconstructs the
+        PSBT. The supplied PSBT is passed directly to jmwallet so CLN/peer
+        metadata and signatures on non-JM inputs are preserved.
+        """
+        try:
+            parsed_psbt = parse_psbt(psbt)
+        except PSBTError as exc:
+            raise RuntimeError("Invalid splice PSBT") from exc
+
+        if len(parsed_psbt.input_maps) != len(parsed_psbt.transaction.inputs):
+            raise RuntimeError("Splice PSBT input map count does not match transaction")
+
+        if len(parsed_psbt.output_maps) != len(parsed_psbt.transaction.outputs):
+            raise RuntimeError(
+                "Splice PSBT output map count does not match transaction"
+            )
+
+        for index in signing_inputs:
+            if index < 0 or index >= len(parsed_psbt.input_maps):
+                raise RuntimeError(
+                    f"Splice signing input index {index} is outside the PSBT"
+                )
+
+            if any(
+                record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+                for record in parsed_psbt.input_maps[index].records
+            ):
+                raise RuntimeError(
+                    f"Splice signing input {index} already contains a signature"
+                )
+
+            self._validate_splice_signing_input(
+                parsed_psbt, index, signing_inputs[index]
+            )
+
+        return self._sign_psbt(
+            unsigned_psbt=psbt,
+            tx=parsed_psbt.transaction,
+            signing_inputs=signing_inputs,
+            wallet=wallet,
+        )
+
     def _build_and_sign_tx(
         self,
         tx: ParsedTransaction,
@@ -265,6 +502,22 @@ class TxBuilder:
             psbt_inputs=psbt_inputs,
         )
         unsigned_psbt = self._remove_empty_witness_scripts(unsigned_psbt)
+
+        return self._sign_psbt(
+            unsigned_psbt=unsigned_psbt,
+            tx=tx,
+            signing_inputs=signing_inputs,
+            wallet=wallet,
+        )
+
+    def _sign_psbt(
+        self,
+        unsigned_psbt: bytes,
+        tx: ParsedTransaction,
+        signing_inputs: Mapping[int, ClassifiedUTXO],
+        wallet: WalletService,
+    ) -> tuple[ParsedTransaction, str, bytes]:
+        """Sign selected inputs in an existing PSBT and validate the result."""
 
         signing_plan = wallet.prepare_psbt_signing(
             unsigned_psbt,
@@ -359,7 +612,23 @@ class TxBuilder:
                     f"JoinMarket wallet changed PSBT input metadata for input {index}"
                 )
 
+            source_signatures = [
+                record
+                for record in source_map.records
+                if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            ]
+            signed_signatures = [
+                record
+                for record in signed_map.records
+                if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            ]
+
             if index not in signing_inputs:
+                if signed_signatures != source_signatures:
+                    raise RuntimeError(
+                        "JoinMarket wallet changed PSBT signatures for "
+                        f"non-JM input {index}"
+                    )
                 continue
 
             coin = signing_inputs[index]

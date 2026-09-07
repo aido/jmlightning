@@ -12,7 +12,9 @@ from jmcore.bitcoin import (
     TxInput,
     TxOutput,
     create_p2wpkh_script_code,
+    create_psbt,
     parse_derivation_path,
+    serialize_transaction,
 )
 from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, parse_psbt
 from jmwallet.wallet.signing import sign_p2wpkh_input
@@ -49,7 +51,7 @@ def _mock_wallet() -> Mock:
     )
     wallet.sign_psbt.return_value = default_signing_result
 
-    def prepare_psbt_signing(psbt: bytes, scan_range: int) -> SimpleNamespace:
+    def prepare_psbt_signing(psbt: bytes, scan_range: object) -> SimpleNamespace:
         current_plan = wallet.prepare_psbt_signing.return_value
         if current_plan is signing_plan:
             signing_plan.source_psbt = psbt
@@ -62,7 +64,8 @@ def _mock_wallet() -> Mock:
             pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
                 compressed=True,
             )
-            signed_indices: list[int] = []
+            signed_indices = []
+
             for index in range(len(parsed.input_maps)):
                 input_map = parsed.input_maps[index]
                 if not any(
@@ -88,6 +91,7 @@ def _mock_wallet() -> Mock:
 
             default_signing_result.signed_indices = signed_indices
             default_signing_result.psbt = parsed.serialize()
+
         return cast(SimpleNamespace, current_result)
 
     wallet.prepare_psbt_signing.side_effect = prepare_psbt_signing
@@ -107,6 +111,38 @@ def _build_plan(
         fee_rate=1.0,
         funding_output_type="p2wsh",
     )
+
+
+def _build_splice_psbt() -> bytes:
+    tx_input = TxInput.from_hex(
+        txid="aa" * 32,
+        vout=1,
+        sequence=0xFFFFFFFE,
+        value=200_000,
+        scriptpubkey="0014" + "11" * 20,
+    )
+    tx_output = TxOutput.from_address(
+        "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        200_000,
+    )
+    psbt = create_psbt(
+        version=2,
+        inputs=[tx_input],
+        outputs=[tx_output],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=200_000,
+                witness_utxo_script=tx_input.scriptpubkey,
+                witness_script=b"",
+                sighash_type=1,
+            )
+        ],
+    )
+    parsed = parse_psbt(psbt)
+    parsed.input_maps[0].append(b"\xfccln", b"input metadata")
+    parsed.output_maps[0].append(b"\xfccln", b"output metadata")
+    return parsed.serialize()
 
 
 def test_build_and_sign_funding_tx_creates_funding_output(
@@ -944,5 +980,372 @@ def test_build_and_sign_funding_tx_rejects_negative_change(
             plan=invalid_plan,
             funding_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )
+
+
+def test_add_splice_in_input_preserves_cln_psbt_metadata(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    original = parse_psbt(_build_splice_psbt())
+
+    updated = builder.add_splice_in_input(
+        psbt=original.serialize(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+    parsed = parse_psbt(updated)
+
+    assert len(parsed.transaction.inputs) == 2
+    assert len(parsed.transaction.outputs) == 2
+    assert parsed.transaction.inputs[0] == original.transaction.inputs[0]
+    assert parsed.input_maps[0].records == original.input_maps[0].records
+    assert parsed.output_maps[0].records == original.output_maps[0].records
+    assert parsed.transaction.inputs[1].txid == classified_utxos[2].utxo.txid
+    assert parsed.transaction.inputs[1].vout == classified_utxos[2].utxo.vout
+    assert parsed.transaction.outputs[0] == original.transaction.outputs[0]
+    assert parsed.transaction.outputs[1].value == 60_000
+
+    input_records = parsed.input_maps[1].records
+    assert [record.key[:1] for record in input_records] == [
+        b"\x01",
+        b"\x03",
+        b"\x06",
+    ]
+    assert parsed.output_maps[1].records == []
+
+    assert parsed.unsigned_tx == serialize_transaction(
+        parsed.transaction.version,
+        parsed.transaction.inputs,
+        parsed.transaction.outputs,
+        parsed.transaction.locktime,
+    )
+
+
+@pytest.mark.parametrize(
+    ("relative_amount", "error"),
+    [
+        (0, "Splice-in amount must be positive"),
+        (-1, "Splice-in amount must be positive"),
+        (100_001, "smaller than the requested splice-in amount"),
+    ],
+)
+def test_add_splice_in_input_rejects_invalid_amounts(
+    classified_utxos: list[ClassifiedUTXO],
+    relative_amount: int,
+    error: str,
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        TxBuilder().add_splice_in_input(
+            psbt=_build_splice_psbt(),
+            coin=classified_utxos[2],
+            relative_amount=relative_amount,
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )
+
+
+def test_add_splice_in_input_rejects_duplicate_outpoint(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    coin = classified_utxos[2]
+    tx_input = TxInput.from_hex(
+        txid=coin.utxo.txid,
+        vout=coin.utxo.vout,
+        sequence=0xFFFFFFFE,
+        value=coin.utxo.value,
+        scriptpubkey=coin.utxo.scriptpubkey,
+    )
+    psbt = create_psbt(
+        version=2,
+        inputs=[tx_input],
+        outputs=[
+            TxOutput.from_address(
+                "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+                100_000,
+            )
+        ],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=coin.utxo.value,
+                witness_utxo_script=tx_input.scriptpubkey,
+                witness_script=b"",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="already present"):
+        TxBuilder().add_splice_in_input(
+            psbt=psbt,
+            coin=coin,
+            relative_amount=40_000,
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )
+
+
+def test_add_splice_in_input_rejects_already_signed_psbt(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    parsed = parse_psbt(_build_splice_psbt())
+    parsed.input_maps[0].append(b"\x02" + b"\x02" + b"\x01" * 32, b"sig")
+
+    with pytest.raises(ValueError, match="after input signing has started"):
+        TxBuilder().add_splice_in_input(
+            psbt=parsed.serialize(),
+            coin=classified_utxos[2],
+            relative_amount=40_000,
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=_mock_wallet(),
+        )
+
+
+def test_sign_splice_psbt_signs_only_jm_input(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+
+    splice_psbt = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    parsed = parse_psbt(splice_psbt)
+
+    wallet.prepare_psbt_signing.return_value = SimpleNamespace(
+        signable_count=1,
+    )
+
+    signed_result = SimpleNamespace(
+        psbt=None,
+        signed_indices=[1],
+    )
+    wallet.sign_psbt.return_value = signed_result
+
+    private_key = PrivateKey(b"\x01" * 32)
+    parsed = parse_psbt(splice_psbt)
+    pubkey = wallet.get_key_for_address(
+        classified_utxos[2].utxo.address,
+    ).get_public_key_bytes(compressed=True)
+    signature = sign_p2wpkh_input(
+        parsed.transaction,
+        1,
+        create_p2wpkh_script_code(pubkey),
+        classified_utxos[2].utxo.value,
+        private_key,
+    )
+    parsed.append_input_key_value(
+        1,
+        b"\x02" + pubkey,
+        signature,
+    )
+    signed_result.psbt = parsed.serialize()
+
+    tx, txid, signed_psbt = builder.sign_splice_psbt(
+        psbt=splice_psbt,
+        signing_inputs={1: classified_utxos[2]},
+        wallet=wallet,
+    )
+
+    signed = parse_psbt(signed_psbt)
+
+    assert tx == parsed.transaction
+    assert txid
+    assert len(signed.transaction.inputs) == 2
+    assert signed.input_maps[0].records == parsed.input_maps[0].records
+    assert any(record.key[:1] == b"\x02" for record in signed.input_maps[1].records)
+
+
+def test_sign_splice_psbt_rejects_signed_jm_input(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    parsed = parse_psbt(
+        builder.add_splice_in_input(
+            psbt=_build_splice_psbt(),
+            coin=classified_utxos[2],
+            relative_amount=40_000,
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+    )
+    pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
+        compressed=True,
+    )
+    parsed.input_maps[1].append(
+        b"\x02" + pubkey,
+        b"existing-signature",
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="Splice signing input 1 already contains a signature",
+    ):
+        builder.sign_splice_psbt(
+            psbt=parsed.serialize(),
+            signing_inputs={1: classified_utxos[2]},
+            wallet=wallet,
+        )
+
+
+def test_sign_splice_psbt_rejects_mismatched_jm_outpoint(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    splice_psbt = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    mismatched_coin = replace(
+        classified_utxos[2],
+        utxo=replace(
+            classified_utxos[2].utxo,
+            txid="bb" * 32,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not match the approved JoinMarket UTXO outpoint",
+    ):
+        builder.sign_splice_psbt(
+            psbt=splice_psbt,
+            signing_inputs={1: mismatched_coin},
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+
+
+def test_sign_splice_psbt_rejects_mismatched_jm_value(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    splice_psbt = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    mismatched_coin = replace(
+        classified_utxos[2],
+        utxo=replace(
+            classified_utxos[2].utxo,
+            value=90_000,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not match the approved JoinMarket UTXO value or script",
+    ):
+        builder.sign_splice_psbt(
+            psbt=splice_psbt,
+            signing_inputs={1: mismatched_coin},
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+
+
+def test_sign_splice_psbt_rejects_mismatched_jm_script(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    splice_psbt = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    mismatched_coin = replace(
+        classified_utxos[2],
+        utxo=replace(
+            classified_utxos[2].utxo,
+            scriptpubkey="0014" + "22" * 20,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not match the approved JoinMarket UTXO value or script",
+    ):
+        builder.sign_splice_psbt(
+            psbt=splice_psbt,
+            signing_inputs={1: mismatched_coin},
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+
+
+def test_sign_splice_psbt_validates_every_jm_input(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    splice_psbt = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        relative_amount=40_000,
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    mismatched_coin = replace(
+        classified_utxos[2],
+        utxo=replace(
+            classified_utxos[2].utxo,
+            txid="bb" * 32,
+        ),
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not match the approved JoinMarket UTXO outpoint",
+    ):
+        builder.sign_splice_psbt(
+            psbt=splice_psbt,
+            signing_inputs={
+                0: mismatched_coin,
+                1: classified_utxos[2],
+            },
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+
+
+def test_sign_splice_psbt_rejects_invalid_signing_index(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    with pytest.raises(
+        RuntimeError,
+        match="outside the PSBT",
+    ):
+        TxBuilder().sign_splice_psbt(
+            psbt=_build_splice_psbt(),
+            signing_inputs={1: classified_utxos[2]},
             wallet=_mock_wallet(),
         )

@@ -55,6 +55,40 @@ class LightningBackend(ABC):
         """
 
     @abstractmethod
+    def splice_init(
+        self,
+        channel_id: str,
+        relative_amount: int,
+        initial_psbt: bytes | None = None,
+        feerate_per_kw: int | None = None,
+        force_feerate: bool = False,
+    ) -> RPCResponse:
+        """
+        Initiate a channel splice and return the resulting PSBT response.
+        """
+
+    @abstractmethod
+    def splice_update(
+        self,
+        channel_id: str,
+        psbt: bytes,
+    ) -> RPCResponse:
+        """
+        Update the active splice with the supplied PSBT.
+        """
+
+    @abstractmethod
+    def splice_signed(
+        self,
+        channel_id: str,
+        psbt: bytes,
+        sign_first: bool = False,
+    ) -> RPCResponse:
+        """
+        Complete an active splice using the fully signed PSBT.
+        """
+
+    @abstractmethod
     def get_channel_funding_status(
         self,
         peer_id: str,

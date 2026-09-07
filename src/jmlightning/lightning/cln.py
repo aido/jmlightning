@@ -127,6 +127,115 @@ class CLNBackend(LightningBackend):
         except Exception as exc:
             raise RuntimeError(f"Failed to cancel channel funding: {exc}") from exc
 
+    def splice_init(
+        self,
+        channel_id: str,
+        relative_amount: int,
+        initial_psbt: bytes | None = None,
+        feerate_per_kw: int | None = None,
+        force_feerate: bool = False,
+    ) -> dict[str, object]:
+        """Initiate a CLN channel splice."""
+        try:
+            kwargs: dict[str, object] = {
+                "channel_id": channel_id,
+                "relative_amount": relative_amount,
+                "force_feerate": force_feerate,
+            }
+
+            if initial_psbt is not None:
+                kwargs["initialpsbt"] = psbt_to_base64(initial_psbt)
+
+            if feerate_per_kw is not None:
+                kwargs["feerate_per_kw"] = feerate_per_kw
+
+            result = self.rpc.splice_init(**kwargs)
+
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN splice_init returned an invalid response")
+
+            psbt = result.get("psbt")
+            if not isinstance(psbt, str) or not psbt:
+                raise RuntimeError("CLN splice_init response is missing psbt")
+
+            return dict(result)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to initiate channel splice: {exc}") from exc
+
+    def splice_update(
+        self,
+        channel_id: str,
+        psbt: bytes,
+    ) -> dict[str, object]:
+        """Update an active CLN channel splice."""
+        try:
+            result = self.rpc.splice_update(
+                channel_id=channel_id,
+                psbt=psbt_to_base64(psbt),
+            )
+
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN splice_update returned an invalid response")
+
+            returned_psbt = result.get("psbt")
+            if not isinstance(returned_psbt, str) or not returned_psbt:
+                raise RuntimeError("CLN splice_update response is missing psbt")
+
+            commitments_secured = result.get("commitments_secured")
+            if not isinstance(commitments_secured, bool):
+                raise RuntimeError(
+                    "CLN splice_update response has invalid commitments_secured"
+                )
+
+            if "signatures_secured" in result and not isinstance(
+                result["signatures_secured"], bool
+            ):
+                raise RuntimeError(
+                    "CLN splice_update response has invalid signatures_secured"
+                )
+
+            return dict(result)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to update channel splice: {exc}") from exc
+
+    def splice_signed(
+        self,
+        channel_id: str,
+        psbt: bytes,
+        sign_first: bool = False,
+    ) -> dict[str, object]:
+        """Complete an active CLN channel splice."""
+        try:
+            result = self.rpc.splice_signed(
+                channel_id=channel_id,
+                psbt=psbt_to_base64(psbt),
+                sign_first=sign_first,
+            )
+
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN splice_signed returned an invalid response")
+
+            for field in ("tx", "txid", "psbt"):
+                value = result.get(field)
+                if not isinstance(value, str) or not value:
+                    raise RuntimeError(f"CLN splice_signed response is missing {field}")
+
+            outnum = result.get("outnum")
+            if outnum is not None and (
+                not isinstance(outnum, int) or isinstance(outnum, bool) or outnum < 0
+            ):
+                raise RuntimeError("CLN splice_signed response has invalid outnum")
+
+            return dict(result)
+        except RuntimeError:
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to complete channel splice: {exc}") from exc
+
     def get_channel_funding_status(
         self,
         peer_id: str,
