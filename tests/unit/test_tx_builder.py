@@ -100,7 +100,7 @@ def _mock_wallet() -> Mock:
     return wallet
 
 
-def _build_plan(
+def _build_funding_plan(
     classified_utxos: list[ClassifiedUTXO],
 ) -> ExecutionPlan:
     planner = Planner()
@@ -145,11 +145,28 @@ def _build_splice_psbt() -> bytes:
     return parsed.serialize()
 
 
+def _build_splice_plan(
+    classified_utxos: list[ClassifiedUTXO],
+    amount: int = 40_000,
+    fee: int = 0,
+    change: int = 60_000,
+) -> ExecutionPlan:
+    return ExecutionPlan(
+        inputs=[classified_utxos[2]],
+        amount=amount,
+        fee=fee,
+        vsize=0,
+        change=change,
+        warnings=[],
+        rationale="test splice plan",
+    )
+
+
 def test_build_and_sign_funding_tx_creates_funding_output(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     tx, txid, funding_vout, psbt = builder.build_and_sign_funding_tx(
@@ -174,7 +191,7 @@ def test_build_and_sign_funding_tx_uses_psbt_signing(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     builder.build_and_sign_funding_tx(
@@ -195,7 +212,7 @@ def test_build_and_sign_funding_tx_removes_empty_witness_script_records(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     builder.build_and_sign_funding_tx(
@@ -230,7 +247,7 @@ def test_build_and_sign_funding_tx_does_not_double_sign_inputs(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     builder.build_and_sign_funding_tx(
@@ -247,7 +264,7 @@ def test_build_and_sign_funding_tx_rejects_changed_input_metadata(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     def sign_psbt(plan: SimpleNamespace) -> SimpleNamespace:
@@ -291,7 +308,7 @@ def test_build_and_sign_funding_tx_rejects_key_script_mismatch(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     bad_coin = replace(
@@ -324,7 +341,7 @@ def test_build_and_sign_funding_tx_rejects_boolean_signed_index(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
     wallet.sign_psbt.return_value = SimpleNamespace(
         psbt=b"psbt\xffsigned",
@@ -347,7 +364,7 @@ def test_build_and_sign_funding_tx_rejects_missing_partial_signature(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     def sign_psbt(signing_plan: SimpleNamespace) -> SimpleNamespace:
@@ -393,7 +410,7 @@ def test_build_and_sign_funding_tx_rejects_invalid_partial_signature(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     def sign_psbt(signing_plan: SimpleNamespace) -> SimpleNamespace:
@@ -441,7 +458,7 @@ def test_build_and_sign_funding_tx_returns_signed_psbt(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     _, _, _, signed_psbt = builder.build_and_sign_funding_tx(
@@ -459,7 +476,7 @@ def test_build_and_sign_funding_tx_returns_correct_txid(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     tx, txid, _, _ = builder.build_and_sign_funding_tx(
@@ -516,7 +533,7 @@ def test_build_and_sign_funding_tx_rejects_incomplete_wallet_selection(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.prepare_psbt_signing.return_value = SimpleNamespace(
@@ -541,7 +558,7 @@ def test_build_and_sign_funding_tx_rejects_incomplete_signing(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.return_value = SimpleNamespace(
@@ -678,7 +695,7 @@ def test_build_and_sign_funding_tx_rejects_duplicate_signed_indices(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.return_value = SimpleNamespace(
@@ -702,7 +719,7 @@ def test_build_and_sign_funding_tx_rejects_unexpected_signed_input(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.return_value = SimpleNamespace(
@@ -731,7 +748,7 @@ def test_build_and_sign_funding_tx_rejects_different_signed_psbt(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.side_effect = lambda plan: SimpleNamespace(
@@ -762,7 +779,7 @@ def test_build_and_sign_funding_tx_rejects_invalid_signed_psbt(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.side_effect = lambda plan: SimpleNamespace(
@@ -786,7 +803,7 @@ def test_build_and_sign_funding_tx_propagates_psbt_signing_failure(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
     wallet = _mock_wallet()
 
     wallet.sign_psbt.side_effect = RuntimeError("signing failed")
@@ -871,7 +888,7 @@ def test_build_and_sign_funding_tx_rejects_negative_fee(
 ) -> None:
     builder = TxBuilder()
 
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
 
     invalid_plan = ExecutionPlan(
         inputs=plan.inputs,
@@ -905,7 +922,7 @@ def test_build_and_sign_funding_tx_rejects_inconsistent_amounts(
 ) -> None:
     builder = TxBuilder()
 
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
 
     invalid_plan = ExecutionPlan(
         inputs=plan.inputs,
@@ -938,7 +955,7 @@ def test_build_and_sign_funding_tx_rejects_non_positive_amount(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
 
     invalid_plan = ExecutionPlan(
         inputs=plan.inputs,
@@ -963,7 +980,7 @@ def test_build_and_sign_funding_tx_rejects_negative_change(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     builder = TxBuilder()
-    plan = _build_plan(classified_utxos)
+    plan = _build_funding_plan(classified_utxos)
 
     invalid_plan = ExecutionPlan(
         inputs=plan.inputs,
@@ -994,7 +1011,7 @@ def test_add_splice_in_input_preserves_cln_psbt_metadata(
     updated = builder.add_splice_in_input(
         psbt=original.serialize(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )
@@ -1027,23 +1044,27 @@ def test_add_splice_in_input_preserves_cln_psbt_metadata(
 
 
 @pytest.mark.parametrize(
-    ("relative_amount", "error"),
+    ("amount", "change", "error"),
     [
-        (0, "Splice-in amount must be positive"),
-        (-1, "Splice-in amount must be positive"),
-        (100_001, "smaller than the requested splice-in amount"),
+        (40_000, 59_999, "Transaction plan has inconsistent amounts"),
+        (100_001, -1, "Transaction change cannot be negative."),
     ],
 )
 def test_add_splice_in_input_rejects_invalid_amounts(
     classified_utxos: list[ClassifiedUTXO],
-    relative_amount: int,
+    amount: int,
+    change: int,
     error: str,
 ) -> None:
     with pytest.raises(ValueError, match=error):
         TxBuilder().add_splice_in_input(
             psbt=_build_splice_psbt(),
             coin=classified_utxos[2],
-            relative_amount=relative_amount,
+            plan=_build_splice_plan(
+                classified_utxos,
+                amount=amount,
+                change=change,
+            ),
             change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             wallet=_mock_wallet(),
         )
@@ -1083,7 +1104,7 @@ def test_add_splice_in_input_rejects_duplicate_outpoint(
         TxBuilder().add_splice_in_input(
             psbt=psbt,
             coin=coin,
-            relative_amount=40_000,
+            plan=_build_splice_plan(classified_utxos),
             change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             wallet=_mock_wallet(),
         )
@@ -1099,7 +1120,7 @@ def test_add_splice_in_input_rejects_already_signed_psbt(
         TxBuilder().add_splice_in_input(
             psbt=parsed.serialize(),
             coin=classified_utxos[2],
-            relative_amount=40_000,
+            plan=_build_splice_plan(classified_utxos),
             change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             wallet=_mock_wallet(),
         )
@@ -1114,7 +1135,7 @@ def test_sign_splice_psbt_signs_only_jm_input(
     splice_psbt = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )
@@ -1174,7 +1195,7 @@ def test_sign_splice_psbt_rejects_signed_jm_input(
         builder.add_splice_in_input(
             psbt=_build_splice_psbt(),
             coin=classified_utxos[2],
-            relative_amount=40_000,
+            plan=_build_splice_plan(classified_utxos),
             change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
             wallet=wallet,
         )
@@ -1206,7 +1227,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_outpoint(
     splice_psbt = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )
@@ -1240,7 +1261,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_value(
     splice_psbt = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )
@@ -1274,7 +1295,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_script(
     splice_psbt = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )
@@ -1308,7 +1329,7 @@ def test_sign_splice_psbt_validates_every_jm_input(
     splice_psbt = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
-        relative_amount=40_000,
+        plan=_build_splice_plan(classified_utxos),
         change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
         wallet=wallet,
     )

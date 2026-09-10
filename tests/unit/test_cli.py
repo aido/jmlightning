@@ -11,6 +11,7 @@ from typer.testing import CliRunner
 
 import jmlightning.cli as cli
 from jmlightning.operations.open_channel import confirm_open_channel
+from jmlightning.operations.splice import confirm_splice_in
 
 runner = CliRunner()
 
@@ -334,6 +335,210 @@ def test_open_channel_passes_confirmation_callback_by_default(
     )
 
     assert confirms == [confirm_open_channel]
+
+
+def test_splice_in_runs_operation_without_confirmation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    config = object()
+    operation_calls: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "setup_cli",
+        lambda **kwargs: settings,
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_mnemonic",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: config,
+    )
+
+    class FakeOperation:
+        def __init__(
+            self,
+            *,
+            config: Any,
+            cln_socket: Path,
+        ) -> None:
+            operation_calls["config"] = config
+            operation_calls["cln_socket"] = cln_socket
+
+        def execute(
+            self,
+            *,
+            channel_id: str,
+            confirm: Any,
+        ) -> None:
+            operation_calls["channel_id"] = channel_id
+            operation_calls["confirm"] = confirm
+
+    monkeypatch.setattr(
+        cli,
+        "SpliceOperation",
+        FakeOperation,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.splice_in(
+        channel_id="22" * 32,
+        amount=250_000,
+        cln_socket=Path("/tmp/lightning-rpc"),
+        mixdepth=2,
+        yes=True,
+    )
+
+    assert operation_calls == {
+        "config": config,
+        "cln_socket": Path("/tmp/lightning-rpc"),
+        "channel_id": "22" * 32,
+        "confirm": None,
+    }
+
+
+def test_splice_in_exits_when_mnemonic_cannot_be_resolved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+
+    monkeypatch.setattr(
+        cli,
+        "setup_cli",
+        lambda **kwargs: settings,
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_mnemonic",
+        lambda *args, **kwargs: None,
+    )
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.splice_in(
+            channel_id="11" * 32,
+            amount=100_000,
+        )
+
+    assert exc_info.value.exit_code == 1
+
+
+def test_splice_in_passes_confirmation_callback_by_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    confirms: list[Any] = []
+
+    monkeypatch.setattr(
+        cli,
+        "setup_cli",
+        lambda **kwargs: settings,
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_mnemonic",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: object(),
+    )
+
+    class FakeOperation:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def execute(
+            self,
+            *,
+            channel_id: str,
+            confirm: Any,
+        ) -> None:
+            confirms.append(confirm)
+
+    monkeypatch.setattr(
+        cli,
+        "SpliceOperation",
+        FakeOperation,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.splice_in(
+        channel_id="22" * 32,
+        amount=250_000,
+    )
+
+    assert confirms == [confirm_splice_in]
+
+
+def test_splice_in_skips_confirmation_with_yes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    confirms: list[Any] = []
+
+    monkeypatch.setattr(
+        cli,
+        "setup_cli",
+        lambda **kwargs: settings,
+    )
+    monkeypatch.setattr(
+        cli,
+        "resolve_mnemonic",
+        lambda *args, **kwargs: resolved,
+    )
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: object(),
+    )
+
+    class FakeOperation:
+        def __init__(self, **kwargs: Any) -> None:
+            pass
+
+        def execute(
+            self,
+            *,
+            channel_id: str,
+            confirm: Any,
+        ) -> None:
+            confirms.append(confirm)
+
+    monkeypatch.setattr(
+        cli,
+        "SpliceOperation",
+        FakeOperation,
+    )
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.splice_in(
+        channel_id="22" * 32,
+        amount=250_000,
+        yes=True,
+    )
+
+    assert confirms == [None]
 
 
 def _close_awaitable(awaitable: Any) -> None:

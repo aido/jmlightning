@@ -265,22 +265,28 @@ class TxBuilder:
         self,
         psbt: bytes,
         coin: ClassifiedUTXO,
-        relative_amount: int,
+        plan: ExecutionPlan,
         change_address: str,
         wallet: WalletService,
     ) -> bytes:
         """Add one JoinMarket input and matching change to a splice PSBT.
 
         The transaction supplied by Core Lightning remains authoritative.
-        This method only appends the approved JoinMarket input, adds any
-        resulting change output, and updates the BIP174 unsigned-transaction
-        record. Existing PSBT map records are retained unchanged.
+        This method applies the already-approved JoinMarket execution plan:
+        it appends the planned input, adds the planned change output, and
+        updates the BIP174 unsigned-transaction record. Existing PSBT map
+        records are retained unchanged.
 
         The transaction must not already contain signatures: changing its
         inputs or outputs would invalidate them.
         """
-        if relative_amount <= 0:
-            raise ValueError("Splice-in amount must be positive")
+        self._validate_plan(plan)
+
+        if len(plan.inputs) != 1:
+            raise ValueError("Splice-in plan must contain exactly one input")
+
+        if plan.inputs[0] is not coin:
+            raise ValueError("Splice-in plan does not match the selected input")
 
         try:
             parsed = parse_psbt(psbt)
@@ -311,9 +317,10 @@ class TxBuilder:
                 f"Splice input is already present: {coin.utxo.txid}:{coin.utxo.vout}"
             )
 
-        if coin.utxo.value < relative_amount:
+        if coin.utxo.value < plan.amount + plan.fee:
             raise ValueError(
-                "Splice input value is smaller than the requested splice-in amount"
+                "Splice input value is smaller than the planned "
+                "splice-in amount and fee"
             )
 
         key = wallet.get_key_for_address(coin.utxo.address)
@@ -331,7 +338,11 @@ class TxBuilder:
                 f"for input {len(parsed.transaction.inputs)}"
             )
 
-        change = coin.utxo.value - relative_amount
+        expected_change = coin.utxo.value - plan.amount - plan.fee
+        if expected_change != plan.change:
+            raise ValueError("Splice-in plan change does not match selected input")
+
+        change = plan.change
         change_output = (
             TxOutput.from_address(change_address, change) if change > 0 else None
         )

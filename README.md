@@ -1,6 +1,6 @@
 # ⚡ jmlightning
 
-**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Core Lightning channels from JoinMarket-NG wallet UTXOs. Submarine swaps and channel splicing are planned extensions.
+**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels from JoinMarket-NG wallet UTXOs. Submarine swaps and channel splicing are planned extensions.
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -42,7 +42,7 @@ The project separates three concerns:
 
 The initial focus is Lightning channel funding. The architecture is designed to support additional operations, including submarine swaps, without allowing execution code to bypass JoinMarket's UTXO policy.
 
-### The Core Privacy Problem
+### The Privacy Problem
 
 A JoinMarket wallet can contain UTXOs with very different privacy characteristics.
 
@@ -233,7 +233,7 @@ The project is deliberately divided into a small number of layers. The CLI dispa
 
 ```mermaid
 graph TD
-    CLI["jm-lightning CLI"] --> OP["OpenChannelOperation"]
+    CLI["jm-lightning CLI"] --> OP["LightningOperation"]
     OP --> JMA["JoinMarketAdapter"]
     OP --> POLICY["PolicyEngine"]
     OP --> PLANNER["Planner"]

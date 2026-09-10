@@ -34,6 +34,10 @@ from jmlightning.operations.open_channel import (
     OpenChannelOperation,
     confirm_open_channel,
 )
+from jmlightning.operations.splice import (
+    SpliceOperation,
+    confirm_splice_in,
+)
 
 __all__ = ["app"]
 
@@ -228,6 +232,107 @@ def open_channel(
             cln_socket=cln_socket,
         ).execute(
             peer_id=peer_id,
+            confirm=confirm,
+        )
+    )
+
+
+@app.command()
+def splice_in(
+    channel_id: Annotated[
+        str,
+        typer.Argument(
+            help="The Lightning channel ID to splice into",
+        ),
+    ],
+    amount: Annotated[
+        int,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Splice-in amount in sats",
+        ),
+    ],
+    cln_socket: Annotated[
+        Path,
+        typer.Option(
+            "--cln-socket",
+            help="Path to CLN unix socket",
+        ),
+    ] = Path("/run/lightningd/lightning-rpc"),
+    mixdepth: Annotated[
+        int | None,
+        typer.Option(
+            "--mixdepth",
+            "-m",
+            help="Source mixdepth (default 0)",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="JoinMarket data directory",
+        ),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="JoinMarket config file path",
+        ),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--mnemonic-file",
+            "-f",
+            help="Path to mnemonic file",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip interactive confirmation.",
+        ),
+    ] = False,
+) -> None:
+    """Splice a JoinMarket UTXO into an existing CLN channel."""
+
+    settings = setup_cli(
+        data_dir=data_dir,
+        config_file=config_file,
+    )
+
+    resolved = resolve_mnemonic(
+        settings,
+        mnemonic_file=mnemonic_file,
+    )
+
+    if not resolved:
+        logger.error("Could not resolve JoinMarket mnemonic.")
+        raise typer.Exit(1)
+
+    config = build_cln_config(
+        settings=settings,
+        resolved_mnemonic=resolved,
+        amount=amount,
+        mixdepth=mixdepth,
+    )
+
+    confirm = None if yes else confirm_splice_in
+
+    asyncio.run(
+        SpliceOperation(
+            config=config,
+            cln_socket=cln_socket,
+        ).execute(
+            channel_id=channel_id,
             confirm=confirm,
         )
     )

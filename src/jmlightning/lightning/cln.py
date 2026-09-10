@@ -130,7 +130,7 @@ class CLNBackend(LightningBackend):
     def splice_init(
         self,
         channel_id: str,
-        relative_amount: int,
+        amount: int,
         initial_psbt: bytes | None = None,
         feerate_per_kw: int | None = None,
         force_feerate: bool = False,
@@ -139,7 +139,7 @@ class CLNBackend(LightningBackend):
         try:
             kwargs: dict[str, object] = {
                 "channel_id": channel_id,
-                "relative_amount": relative_amount,
+                "amount": amount,
                 "force_feerate": force_feerate,
             }
 

@@ -58,7 +58,7 @@ class LightningBackend(ABC):
     def splice_init(
         self,
         channel_id: str,
-        relative_amount: int,
+        amount: int,
         initial_psbt: bytes | None = None,
         feerate_per_kw: int | None = None,
         force_feerate: bool = False,

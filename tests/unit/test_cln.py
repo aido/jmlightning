@@ -204,12 +204,12 @@ def test_splice_init_calls_rpc_without_optional_psbt_or_feerate() -> None:
 
     result = backend.splice_init(
         channel_id="11" * 32,
-        relative_amount=100_000,
+        amount=100_000,
     )
 
     rpc.splice_init.assert_called_once_with(
         channel_id="11" * 32,
-        relative_amount=100_000,
+        amount=100_000,
         force_feerate=False,
     )
     assert result == {
@@ -232,7 +232,7 @@ def test_splice_init_passes_optional_psbt_and_feerate() -> None:
 
     result = backend.splice_init(
         channel_id="11" * 32,
-        relative_amount=-50_000,
+        amount=-50_000,
         initial_psbt=b"test-psbt",
         feerate_per_kw=5_000,
         force_feerate=True,
@@ -240,7 +240,7 @@ def test_splice_init_passes_optional_psbt_and_feerate() -> None:
 
     rpc.splice_init.assert_called_once_with(
         channel_id="11" * 32,
-        relative_amount=-50_000,
+        amount=-50_000,
         initialpsbt="dGVzdC1wc2J0",
         feerate_per_kw=5_000,
         force_feerate=True,
@@ -267,7 +267,7 @@ def test_splice_init_rejects_missing_psbt() -> None:
     ):
         backend.splice_init(
             channel_id="11" * 32,
-            relative_amount=100_000,
+            amount=100_000,
         )
 
 
@@ -329,6 +329,48 @@ def test_splice_update_accepts_missing_optional_signatures_secured() -> None:
         "psbt": "cHNidP8=",
         "commitments_secured": True,
     }
+
+
+def test_splice_update_rejects_non_dict_response() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_update.return_value = None
+
+    with pytest.raises(
+        RuntimeError,
+        match="splice_update returned an invalid response",
+    ):
+        backend.splice_update(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
+
+
+def test_splice_update_propagates_rpc_failure() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.splice_update.side_effect = RuntimeError("RPC unavailable")
+
+    with pytest.raises(
+        RuntimeError,
+        match="RPC unavailable",
+    ):
+        backend.splice_update(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+        )
 
 
 @pytest.mark.parametrize(
@@ -479,7 +521,7 @@ def test_splice_rpc_runtime_errors_are_propagated() -> None:
     ):
         backend.splice_init(
             channel_id="11" * 32,
-            relative_amount=100_000,
+            amount=100_000,
         )
 
     with pytest.raises(

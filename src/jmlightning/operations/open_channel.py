@@ -18,7 +18,7 @@ from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.tx_builder import TxBuilder
 
-ConfirmationCallback = Callable[
+OpenChannelConfirmationCallback = Callable[
     [str, ExecutionPlan, ParsedTransaction, str, str],
     bool,
 ]
@@ -73,7 +73,7 @@ class OpenChannelOperation:
     async def execute(
         self,
         peer_id: str,
-        confirm: ConfirmationCallback | None = None,
+        confirm: OpenChannelConfirmationCallback | None = None,
     ) -> None:
         policy = PolicyEngine()
         planner = Planner()
