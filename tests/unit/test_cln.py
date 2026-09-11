@@ -208,9 +208,10 @@ def test_splice_init_calls_rpc_without_optional_psbt_or_feerate() -> None:
     )
 
     rpc.splice_init.assert_called_once_with(
-        channel_id="11" * 32,
-        amount=100_000,
-        force_feerate=False,
+        "11" * 32,
+        100_000,
+        None,
+        None,
     )
     assert result == {
         "psbt": "cHNidP8=",
@@ -235,19 +236,39 @@ def test_splice_init_passes_optional_psbt_and_feerate() -> None:
         amount=-50_000,
         initial_psbt=b"test-psbt",
         feerate_per_kw=5_000,
-        force_feerate=True,
     )
 
     rpc.splice_init.assert_called_once_with(
-        channel_id="11" * 32,
-        amount=-50_000,
-        initialpsbt="dGVzdC1wc2J0",
-        feerate_per_kw=5_000,
-        force_feerate=True,
+        "11" * 32,
+        -50_000,
+        "dGVzdC1wc2J0",
+        5_000,
     )
     assert result == {
         "psbt": "cHNidP8=",
     }
+
+
+def test_splice_init_rejects_unsupported_force_feerate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not support force_feerate",
+    ):
+        backend.splice_init(
+            channel_id="11" * 32,
+            amount=100_000,
+            force_feerate=True,
+        )
+
+    rpc.splice_init.assert_not_called()
 
 
 def test_splice_init_rejects_missing_psbt() -> None:
@@ -292,8 +313,8 @@ def test_splice_update_calls_rpc_and_validates_response() -> None:
     )
 
     rpc.splice_update.assert_called_once_with(
-        channel_id="11" * 32,
-        psbt="dGVzdC1wc2J0",
+        "11" * 32,
+        "dGVzdC1wc2J0",
     )
     assert result == {
         "psbt": "cHNidP8=",
@@ -322,8 +343,8 @@ def test_splice_update_accepts_missing_optional_signatures_secured() -> None:
     )
 
     rpc.splice_update.assert_called_once_with(
-        channel_id="11" * 32,
-        psbt="dGVzdC1wc2J0",
+        "11" * 32,
+        "dGVzdC1wc2J0",
     )
     assert result == {
         "psbt": "cHNidP8=",
@@ -430,13 +451,11 @@ def test_splice_signed_calls_rpc_and_validates_response() -> None:
     result = backend.splice_signed(
         channel_id="11" * 32,
         psbt=b"test-psbt",
-        sign_first=True,
     )
 
     rpc.splice_signed.assert_called_once_with(
-        channel_id="11" * 32,
-        psbt="dGVzdC1wc2J0",
-        sign_first=True,
+        "11" * 32,
+        "dGVzdC1wc2J0",
     )
     assert result == {
         "tx": "02000000",
@@ -444,6 +463,28 @@ def test_splice_signed_calls_rpc_and_validates_response() -> None:
         "psbt": "cHNidP8=",
         "outnum": 1,
     }
+
+
+def test_splice_signed_rejects_unsupported_sign_first() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    with pytest.raises(
+        RuntimeError,
+        match="does not support sign_first",
+    ):
+        backend.splice_signed(
+            channel_id="11" * 32,
+            psbt=b"test-psbt",
+            sign_first=True,
+        )
+
+    rpc.splice_signed.assert_not_called()
 
 
 @pytest.mark.parametrize("field", ["tx", "txid", "psbt"])
@@ -693,6 +734,30 @@ def test_get_channel_funding_status_raises_if_state_cannot_be_read() -> None:
             peer_id="02" + "11" * 32,
             txid="11" * 32,
         )
+
+
+def test_get_splice_feerate_per_kw_returns_splice_rate() -> None:
+    rpc = Mock()
+    backend = CLNBackend("/tmp/lightning-rpc")
+    backend.rpc = rpc
+    rpc.feerates.return_value = {
+        "perkw": {
+            "splice": 258,
+        }
+    }
+
+    assert backend.get_splice_feerate_per_kw() == 258
+    rpc.feerates.assert_called_once_with(style="perkw")
+
+
+def test_get_splice_feerate_per_kw_rejects_missing_rate() -> None:
+    rpc = Mock()
+    backend = CLNBackend("/tmp/lightning-rpc")
+    backend.rpc = rpc
+    rpc.feerates.return_value = {"perkw": {}}
+
+    with pytest.raises(RuntimeError, match="invalid splice rate"):
+        backend.get_splice_feerate_per_kw()
 
 
 def test_get_fee_rate_rejects_empty_fee_estimates() -> None:

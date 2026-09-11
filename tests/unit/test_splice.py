@@ -13,6 +13,7 @@ from jmlightning.operations.splice import (
     SpliceRecoveryRequiredError,
     confirm_splice_in,
 )
+from jmlightning.planner import ExecutionPlan
 
 
 def _coin(txid: str = "11" * 32, vout: int = 0) -> ClassifiedUTXO:
@@ -36,7 +37,7 @@ def _build_splice_test_doubles() -> tuple[
     ClassifiedUTXO,
     Mock,
     Mock,
-    Mock,
+    ExecutionPlan,
     Mock,
 ]:
     config = Mock()
@@ -53,9 +54,10 @@ def _build_splice_test_doubles() -> tuple[
     jmadapter.select_utxos.return_value = [coin.utxo]
     jmadapter.get_change_address.return_value = "bc1qchange"
     jmadapter.require_wallet.return_value = Mock()
+    jmadapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
 
     cln = Mock()
-    cln.get_fee_rate.return_value = 1.0
+    cln.get_splice_feerate_per_kw.return_value = 250
     cln.funding_output_type = "p2wsh"
     cln.splice_init.return_value = {"psbt": "cHNidP8="}
     cln.splice_update.return_value = {
@@ -69,16 +71,25 @@ def _build_splice_test_doubles() -> tuple[
         "psbt": "c2lnbmVkLXBzYnQ=",
     }
 
-    plan = Mock()
-    plan.inputs = [coin]
-    plan.amount = 100_000
-    plan.fee = 100
-    plan.vsize = 100
-    plan.change = 99_900
-    plan.warnings = []
+    plan = ExecutionPlan(
+        inputs=[coin],
+        amount=100_000,
+        fee=100,
+        vsize=100,
+        change=99_900,
+        warnings=[],
+        rationale="test plan",
+    )
 
     tx_builder = Mock()
+    tx_builder.estimate_splice_fee.return_value = (100, 100)
     tx_builder.add_splice_in_input.return_value = b"candidate-psbt"
+    tx_builder.find_splice_input_index.return_value = 1
+    tx_builder.sign_splice_psbt.return_value = (
+        Mock(),
+        "33" * 32,
+        b"signed-jm-psbt",
+    )
 
     return config, coin, jmadapter, cln, plan, tx_builder
 
@@ -86,7 +97,7 @@ def _build_splice_test_doubles() -> tuple[
 def _patch_splice_doubles(
     jmadapter: Mock,
     cln: Mock,
-    plan: Mock,
+    plan: ExecutionPlan,
     tx_builder: Mock,
 ) -> tuple[Any, Any, Any, Any]:
     return (
@@ -250,11 +261,21 @@ async def test_splice_update_repeats_until_commitments_secured() -> None:
     assert cln.splice_update.call_count == 2
     assert cln.splice_update.call_args_list[0].kwargs["psbt"] == b"candidate-psbt"
     assert cln.splice_update.call_args_list[1].kwargs["psbt"] == b"first-updated"
+    tx_builder.find_splice_input_index.assert_called_once_with(
+        psbt=b"second-updated",
+        coin=coin,
+    )
+    tx_builder.sign_splice_psbt.assert_called_once_with(
+        psbt=b"second-updated",
+        signing_inputs={1: coin},
+        wallet=jmadapter.require_wallet.return_value,
+    )
     cln.splice_signed.assert_called_once_with(
         channel_id="22" * 32,
-        psbt=b"second-updated",
+        psbt=b"signed-jm-psbt",
     )
     jmadapter.lock.assert_called_once_with(coin)
+    jmadapter.get_raw_transaction.assert_awaited_once_with(coin.utxo.txid)
     jmadapter.unlock.assert_not_called()
 
 
@@ -292,8 +313,14 @@ async def test_confirmation_happens_before_splice_signed() -> None:
         events.append("confirm")
         return True
 
+    def sign_splice_psbt(**kwargs: object) -> tuple[Mock, str, bytes]:
+        events.append("sign")
+        return Mock(), "33" * 32, b"signed-jm-psbt"
+
+    tx_builder.sign_splice_psbt.side_effect = sign_splice_psbt
+
     def splice_signed(**kwargs: object) -> dict[str, object]:
-        events.append("signed")
+        events.append("splice_signed")
         return {
             "psbt": "c2lnbmVkLXBzYnQ=",
             "tx": "02000000",
@@ -310,7 +337,7 @@ async def test_confirmation_happens_before_splice_signed() -> None:
         )
         await operation.execute("22" * 32, confirm=confirm)
 
-    assert events == ["confirm", "signed"]
+    assert events == ["confirm", "sign", "splice_signed"]
 
 
 @pytest.mark.anyio
@@ -364,6 +391,30 @@ async def test_confirmation_receives_actual_plan_and_psbt() -> None:
 
 
 @pytest.mark.anyio
+async def test_splice_signing_failure_requires_recovery() -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+    tx_builder.sign_splice_psbt.side_effect = RuntimeError("signing failed")
+
+    patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
+    with patches[0], patches[1], patches[2], patches[3]:
+        operation = SpliceOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+
+        with pytest.raises(
+            SpliceRecoveryRequiredError,
+            match="Unable to sign the splice PSBT",
+        ) as exc_info:
+            await operation.execute("22" * 32)
+
+    assert exc_info.value.locked_outpoints == (("11" * 32, 0),)
+    cln.splice_signed.assert_not_called()
+    jmadapter.unlock.assert_not_called()
+    jmadapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_successful_splice_keeps_inputs_locked() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
 
@@ -378,14 +429,29 @@ async def test_successful_splice_keeps_inputs_locked() -> None:
     cln.splice_init.assert_called_once_with(
         channel_id="22" * 32,
         amount=config.amount,
+        feerate_per_kw=250,
+    )
+    tx_builder.estimate_splice_fee.assert_called_once_with(
+        psbt=b"psbt\xff",
+        feerate_per_kw=250,
+        add_change_output=True,
     )
     cln.splice_update.assert_called_once_with(
         channel_id="22" * 32,
         psbt=b"candidate-psbt",
     )
+    tx_builder.find_splice_input_index.assert_called_once_with(
+        psbt=b"updated-psbt",
+        coin=coin,
+    )
+    tx_builder.sign_splice_psbt.assert_called_once_with(
+        psbt=b"updated-psbt",
+        signing_inputs={1: coin},
+        wallet=jmadapter.require_wallet.return_value,
+    )
     cln.splice_signed.assert_called_once_with(
         channel_id="22" * 32,
-        psbt=b"updated-psbt",
+        psbt=b"signed-jm-psbt",
     )
     jmadapter.lock.assert_called_once_with(coin)
     jmadapter.close.assert_awaited_once()

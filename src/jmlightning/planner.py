@@ -9,7 +9,7 @@ from jmcore.constants import DUST_THRESHOLD
 from jmlightning.models import ClassifiedUTXO
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class ExecutionPlan:
     inputs: list[ClassifiedUTXO]
     amount: int

@@ -1,4 +1,6 @@
+import secrets
 from collections.abc import Mapping
+from dataclasses import replace
 
 from jmcore.bitcoin import (
     BIP32Derivation,
@@ -8,16 +10,21 @@ from jmcore.bitcoin import (
     TxOutput,
     create_p2wpkh_script_code,
     create_psbt,
+    decode_varint,
     encode_varint,
     hash256,
     parse_derivation_path,
+    parse_transaction_bytes,
     pubkey_to_p2wpkh_script,
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_UNSIGNED_TX,
+    PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_PARTIAL_SIG,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
@@ -32,6 +39,19 @@ from jmwallet.wallet.signing import verify_p2wpkh_signature
 
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan
+
+# BIP370 PSBT v2 global fields. jmwallet 0.37.0 only supports the
+# BIP174/v0 global fields, so the v2 transaction-structure fields are
+# removed when converting a CLN splice PSBT to v0.
+PSBT_GLOBAL_TX_VERSION = 0x02
+PSBT_GLOBAL_FALLBACK_LOCKTIME = 0x03
+PSBT_GLOBAL_INPUT_COUNT = 0x04
+PSBT_GLOBAL_OUTPUT_COUNT = 0x05
+PSBT_GLOBAL_TX_MODIFIABLE = 0x06
+
+# Core Lightning proprietary PSBT key for interactive transaction serial IDs.
+# Key: proprietary type (0xfc), prefix length (9), "lightning", subtype 1.
+CLN_PSBT_SERIAL_ID_KEY = b"\xfc\x09lightning\x01"
 
 
 class TxBuilder:
@@ -78,6 +98,231 @@ class TxBuilder:
                 f"fee={plan.fee}, "
                 f"change={plan.change}"
             )
+
+    @staticmethod
+    def _normalise_psbt_v2_to_v0(psbt: bytes) -> bytes:
+        """Convert a BIP370 PSBT v2 to the BIP174 v0 form used by jmwallet.
+
+        Core Lightning emits splice PSBTs using PSBT v2. jmwallet's PSBT
+        parser deliberately accepts v0 only, so normalise the transaction
+        structure at the PSBT boundary while retaining every non-structural
+        record verbatim.
+        """
+        magic = b"psbt\xff"
+        if not psbt.startswith(magic):
+            raise ValueError("invalid PSBT magic")
+
+        def _read_compact_size(data: bytes, offset: int) -> tuple[int, int]:
+            if offset >= len(data):
+                raise ValueError("truncated PSBT compact size")
+            first = data[offset]
+            offset += 1
+            if first < 0xFD:
+                return first, offset
+            size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[first]
+            end = offset + size
+            if end > len(data):
+                raise ValueError("truncated PSBT compact size")
+            value = int.from_bytes(data[offset:end], "little")
+            minimum = {0xFD: 0xFD, 0xFE: 0x10000, 0xFF: 0x100000000}[first]
+            if value < minimum:
+                raise ValueError("noncanonical PSBT compact size")
+            return value, end
+
+        def _write_compact_size(value: int) -> bytes:
+            if value < 0:
+                raise ValueError("negative PSBT compact size")
+            if value < 0xFD:
+                return bytes([value])
+            if value <= 0xFFFF:
+                return b"\xfd" + value.to_bytes(2, "little")
+            if value <= 0xFFFFFFFF:
+                return b"\xfe" + value.to_bytes(4, "little")
+            return b"\xff" + value.to_bytes(8, "little")
+
+        def _read_map(
+            data: bytes, offset: int
+        ) -> tuple[list[tuple[bytes, bytes]], int]:
+            records: list[tuple[bytes, bytes]] = []
+            while True:
+                key_len, offset = _read_compact_size(data, offset)
+                if key_len == 0:
+                    return records, offset
+                key_end = offset + key_len
+                if key_end > len(data):
+                    raise ValueError("truncated PSBT key")
+                key = data[offset:key_end]
+                offset = key_end
+                value_len, offset = _read_compact_size(data, offset)
+                value_end = offset + value_len
+                if value_end > len(data):
+                    raise ValueError("truncated PSBT value")
+                records.append((key, data[offset:value_end]))
+                offset = value_end
+
+        def _write_map(records: list[tuple[bytes, bytes]]) -> bytes:
+            result = bytearray()
+            for key, value in records:
+                result.extend(_write_compact_size(len(key)))
+                result.extend(key)
+                result.extend(_write_compact_size(len(value)))
+                result.extend(value)
+            result.append(0)
+            return bytes(result)
+
+        offset = len(magic)
+        global_records, offset = _read_map(psbt, offset)
+
+        version_records = [
+            value
+            for key, value in global_records
+            if key == bytes([PSBT_GLOBAL_VERSION])
+        ]
+        if not version_records:
+            return psbt
+        if len(version_records) != 1 or len(version_records[0]) != 4:
+            raise ValueError("invalid PSBT version record")
+
+        version = int.from_bytes(version_records[0], "little")
+        if version == 0:
+            return psbt
+        if version != 2:
+            raise ValueError(f"unsupported PSBT version: {version}")
+
+        input_count_records = [
+            value
+            for key, value in global_records
+            if key == bytes([PSBT_GLOBAL_INPUT_COUNT])
+        ]
+        output_count_records = [
+            value
+            for key, value in global_records
+            if key == bytes([PSBT_GLOBAL_OUTPUT_COUNT])
+        ]
+        tx_version_records = [
+            value
+            for key, value in global_records
+            if key == bytes([PSBT_GLOBAL_TX_VERSION])
+        ]
+        locktime_records = [
+            value
+            for key, value in global_records
+            if key == bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME])
+        ]
+
+        if len(input_count_records) != 1 or len(output_count_records) != 1:
+            raise ValueError("PSBT v2 is missing input/output counts")
+        if len(tx_version_records) != 1 or len(tx_version_records[0]) != 4:
+            raise ValueError("PSBT v2 has an invalid transaction version")
+        if len(locktime_records) > 1 or (
+            locktime_records and len(locktime_records[0]) != 4
+        ):
+            raise ValueError("PSBT v2 has an invalid fallback locktime")
+
+        def _decode_count(value: bytes, context: str) -> int:
+            if not value:
+                raise ValueError(f"PSBT v2 {context} count is empty")
+            count, end = _read_compact_size(value, 0)
+            if end != len(value):
+                raise ValueError(f"PSBT v2 {context} count has trailing data")
+            return count
+
+        input_count = _decode_count(input_count_records[0], "input")
+        output_count = _decode_count(output_count_records[0], "output")
+
+        input_maps: list[list[tuple[bytes, bytes]]] = []
+        for _ in range(input_count):
+            records, offset = _read_map(psbt, offset)
+            input_maps.append(records)
+
+        output_maps: list[list[tuple[bytes, bytes]]] = []
+        for _ in range(output_count):
+            records, offset = _read_map(psbt, offset)
+            output_maps.append(records)
+
+        if offset != len(psbt):
+            raise ValueError("trailing data after PSBT maps")
+
+        def _singleton(
+            records: list[tuple[bytes, bytes]], key_type: bytes, context: str
+        ) -> bytes:
+            values = [value for key, value in records if key == key_type]
+            if len(values) != 1:
+                raise ValueError(f"PSBT v2 {context} record must occur exactly once")
+            return values[0]
+
+        tx = bytearray()
+        tx.extend(tx_version_records[0])
+        tx.extend(_write_compact_size(input_count))
+        for index, records in enumerate(input_maps):
+            txid = _singleton(records, b"\x0e", f"input {index} previous txid")
+            vout = _singleton(records, b"\x0f", f"input {index} output index")
+            sequence_values = [value for key, value in records if key == b"\x10"]
+            if len(txid) != 32 or len(vout) != 4:
+                raise ValueError(f"PSBT v2 input {index} has invalid outpoint")
+            if len(sequence_values) > 1 or (
+                sequence_values and len(sequence_values[0]) != 4
+            ):
+                raise ValueError(f"PSBT v2 input {index} has invalid sequence")
+            tx.extend(txid)
+            tx.extend(vout)
+            tx.append(0)
+            tx.extend(sequence_values[0] if sequence_values else b"\xff\xff\xff\xff")
+
+        tx.extend(_write_compact_size(output_count))
+        for index, records in enumerate(output_maps):
+            amount = _singleton(records, b"\x03", f"output {index} amount")
+            script = _singleton(records, b"\x04", f"output {index} script")
+            if len(amount) != 8:
+                raise ValueError(f"PSBT v2 output {index} has invalid amount")
+            tx.extend(amount)
+            tx.extend(_write_compact_size(len(script)))
+            tx.extend(script)
+
+        tx.extend(locktime_records[0] if locktime_records else b"\x00\x00\x00\x00")
+
+        # Keep all metadata and remove only v2 structural globals. The v0
+        # unsigned transaction replaces the v2 transaction fields.
+        v2_globals_to_remove = {
+            bytes([PSBT_GLOBAL_UNSIGNED_TX]),
+            bytes([PSBT_GLOBAL_TX_VERSION]),
+            bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME]),
+            bytes([PSBT_GLOBAL_INPUT_COUNT]),
+            bytes([PSBT_GLOBAL_OUTPUT_COUNT]),
+            bytes([PSBT_GLOBAL_TX_MODIFIABLE]),
+            bytes([PSBT_GLOBAL_VERSION]),
+        }
+        v0_globals = [
+            (key, value)
+            for key, value in global_records
+            if key not in v2_globals_to_remove
+        ]
+        v0_globals.insert(0, (bytes([PSBT_GLOBAL_UNSIGNED_TX]), bytes(tx)))
+
+        result = bytearray(magic)
+        result.extend(_write_map(v0_globals))
+        for records in input_maps:
+            result.extend(
+                _write_map(
+                    [
+                        (key, value)
+                        for key, value in records
+                        if key not in {b"\x0e", b"\x0f", b"\x10"}
+                    ]
+                )
+            )
+        for records in output_maps:
+            result.extend(
+                _write_map(
+                    [
+                        (key, value)
+                        for key, value in records
+                        if key not in {b"\x03", b"\x04"}
+                    ]
+                )
+            )
+
+        return bytes(result)
 
     @staticmethod
     def _remove_empty_witness_scripts(psbt: bytes) -> bytes:
@@ -261,6 +506,143 @@ class TxBuilder:
 
         return tx, txid, funding_vout, signed_psbt
 
+    @staticmethod
+    def _new_cln_serial_id(existing: set[int]) -> int:
+        """Generate a fresh initiator-role serial ID for a splice PSBT."""
+        while True:
+            # CLN encodes the transaction role in the low bit. jm-lightning
+            # is the splice initiator when it adds its own input/output, so
+            # these serial IDs must have even parity.
+            serial_id = secrets.randbits(63) << 1
+            if serial_id != 0 and serial_id not in existing:
+                return serial_id
+
+    @staticmethod
+    def _cln_input_weight(parsed_psbt: ParsedPSBT, index: int) -> int:
+        """Calculate CLN's splice weight for one input.
+
+        This mirrors ``psbt_input_get_weight(..., PSBT_GUESS_2OF2)`` in
+        Core Lightning 26.06.6 for standard SegWit inputs.
+        """
+        input_map = parsed_psbt.input_maps[index]
+        witness_records = [
+            record
+            for record in input_map.records
+            if record.key[:1] == bytes([PSBT_IN_WITNESS_UTXO])
+        ]
+
+        script: bytes | None = None
+        if len(witness_records) == 1:
+            value = witness_records[0].value
+            if len(value) < 9:
+                raise ValueError("Invalid witness UTXO record")
+            script_len, offset = decode_varint(value, 8)
+            if offset + script_len != len(value):
+                raise ValueError("Invalid witness UTXO record")
+            script = value[offset:]
+
+        if script is None:
+            non_witness_records = [
+                record
+                for record in input_map.records
+                if record.key[:1] == bytes([PSBT_IN_NON_WITNESS_UTXO])
+            ]
+            if len(non_witness_records) == 1:
+                previous_transaction = parse_transaction_bytes(
+                    non_witness_records[0].value,
+                )
+                vout = parsed_psbt.transaction.inputs[index].vout
+                if vout >= len(previous_transaction.outputs):
+                    raise ValueError("Invalid non-witness UTXO record")
+                script = previous_transaction.outputs[vout].script
+
+        if script is None:
+            raise ValueError("Splice input is missing UTXO data")
+
+        # These values mirror CLN's bitcoin_tx_input_weight() and
+        # bitcoin_tx_input_witness_weight()/bitcoin_tx_2of2_input_witness_weight().
+        if script.startswith(b"\x00\x14"):
+            return 271  # P2WPKH
+        if script.startswith(b"\x00\x20"):
+            return 387  # P2WSH, guessed as the channel's 2-of-2 input
+        if script.startswith(b"\x51\x20"):
+            return 230  # P2TR
+
+        raise ValueError("Unsupported splice input script type")
+
+    @staticmethod
+    def _cln_output_weight(script: bytes) -> int:
+        """Calculate CLN's weight for one standard transaction output."""
+        return (8 + len(encode_varint(len(script))) + len(script)) * 4
+
+    @staticmethod
+    def _cln_core_weight(num_inputs: int, num_outputs: int) -> int:
+        """Calculate CLN's common transaction-field weight."""
+        return (
+            4 + len(encode_varint(num_inputs)) + len(encode_varint(num_outputs)) + 4
+        ) * 4 + 2
+
+    def estimate_splice_fee(
+        self,
+        psbt: bytes,
+        feerate_per_kw: int,
+        add_change_output: bool = True,
+    ) -> tuple[int, int]:
+        """Estimate the initiator fee using CLN's splice weight calculation.
+
+        ``feerate_per_kw`` uses CLN's native satoshis per 1000 weight
+        units. The returned tuple is ``(fee, weight)``.
+        """
+        if feerate_per_kw <= 0:
+            raise ValueError("Fee rate must be positive")
+
+        try:
+            parsed_psbt = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
+        except PSBTError as exc:
+            raise ValueError("Invalid splice PSBT") from exc
+
+        input_weight = sum(
+            self._cln_input_weight(parsed_psbt, index)
+            for index in range(len(parsed_psbt.input_maps))
+        )
+        output_weight = sum(
+            self._cln_output_weight(output.script)
+            for output in parsed_psbt.transaction.outputs
+        )
+
+        # jm-lightning adds one P2WPKH JoinMarket input and, unless the
+        # splice is a sweep, one P2WPKH change output.
+        input_weight += 271
+        output_count = len(parsed_psbt.transaction.outputs)
+        if add_change_output:
+            output_weight += 124
+            output_count += 1
+
+        weight = (
+            input_weight
+            + output_weight
+            + self._cln_core_weight(
+                len(parsed_psbt.transaction.inputs) + 1,
+                output_count,
+            )
+        )
+
+        fee = (feerate_per_kw * weight) // 1000
+        return fee, weight
+
+    @staticmethod
+    def _cln_serial_ids(parsed_psbt: ParsedPSBT) -> set[int]:
+        """Return all existing Core Lightning serial IDs in a PSBT."""
+        serial_ids: set[int] = set()
+        for psbt_map in [*parsed_psbt.input_maps, *parsed_psbt.output_maps]:
+            for record in psbt_map.records:
+                if record.key != CLN_PSBT_SERIAL_ID_KEY:
+                    continue
+                if len(record.value) != 8:
+                    raise ValueError("Invalid Core Lightning serial ID")
+                serial_ids.add(int.from_bytes(record.value, "big"))
+        return serial_ids
+
     def add_splice_in_input(
         self,
         psbt: bytes,
@@ -268,6 +650,7 @@ class TxBuilder:
         plan: ExecutionPlan,
         change_address: str,
         wallet: WalletService,
+        prev_tx: bytes,
     ) -> bytes:
         """Add one JoinMarket input and matching change to a splice PSBT.
 
@@ -276,6 +659,11 @@ class TxBuilder:
         it appends the planned input, adds the planned change output, and
         updates the BIP174 unsigned-transaction record. Existing PSBT map
         records are retained unchanged.
+
+        Core Lightning's interactive transaction protocol requires every
+        input and output to carry a proprietary serial ID and every input to
+        carry its full previous transaction. These records are therefore
+        added here for the JoinMarket input and change output.
 
         The transaction must not already contain signatures: changing its
         inputs or outputs would invalidate them.
@@ -289,9 +677,34 @@ class TxBuilder:
             raise ValueError("Splice-in plan does not match the selected input")
 
         try:
+            psbt = self._normalise_psbt_v2_to_v0(psbt)
             parsed = parse_psbt(psbt)
-        except PSBTError as exc:
-            raise ValueError("Invalid splice PSBT") from exc
+            previous_transaction = parse_transaction_bytes(prev_tx)
+        except (PSBTError, ValueError) as exc:
+            raise ValueError("Invalid splice PSBT or previous transaction") from exc
+
+        if self._txid(previous_transaction) != coin.utxo.txid:
+            raise ValueError(
+                "Splice input previous transaction does not match the approved "
+                f"UTXO {coin.utxo.txid}:{coin.utxo.vout}"
+            )
+
+        if coin.utxo.vout >= len(previous_transaction.outputs):
+            raise ValueError(
+                "Splice input previous transaction does not contain the approved "
+                f"output {coin.utxo.vout}"
+            )
+
+        previous_output = previous_transaction.outputs[coin.utxo.vout]
+        actual_script = bytes.fromhex(coin.utxo.scriptpubkey)
+        if (
+            previous_output.value != coin.utxo.value
+            or previous_output.script != actual_script
+        ):
+            raise ValueError(
+                "Splice input previous transaction output does not match the "
+                "approved JoinMarket UTXO"
+            )
 
         for input_index, input_map in enumerate(parsed.input_maps):
             if any(
@@ -331,7 +744,6 @@ class TxBuilder:
 
         expected_pubkey = key.get_public_key_bytes(compressed=True)
         expected_script = pubkey_to_p2wpkh_script(expected_pubkey)
-        actual_script = bytes.fromhex(coin.utxo.scriptpubkey)
         if actual_script != expected_script:
             raise RuntimeError(
                 "JoinMarket wallet key does not match splice input script "
@@ -360,12 +772,23 @@ class TxBuilder:
         if change_output is not None:
             parsed.transaction.outputs.append(change_output)
 
+        serial_ids = self._cln_serial_ids(parsed)
+        jm_input_serial_id = self._new_cln_serial_id(serial_ids)
+        serial_ids.add(jm_input_serial_id)
+        change_serial_id = (
+            self._new_cln_serial_id(serial_ids) if change_output is not None else None
+        )
+
         witness_utxo = (
             coin.utxo.value.to_bytes(8, "little", signed=False)
             + encode_varint(len(actual_script))
             + actual_script
         )
         new_input_map = PSBTMap()
+        new_input_map.append(
+            bytes([PSBT_IN_NON_WITNESS_UTXO]),
+            prev_tx,
+        )
         new_input_map.append(
             bytes([PSBT_IN_WITNESS_UTXO]),
             witness_utxo,
@@ -382,9 +805,19 @@ class TxBuilder:
                 for path_index in parse_derivation_path(coin.utxo.path)
             ),
         )
+        new_input_map.append(
+            CLN_PSBT_SERIAL_ID_KEY,
+            jm_input_serial_id.to_bytes(8, "big"),
+        )
         parsed.input_maps.append(new_input_map)
         if change_output is not None:
-            parsed.output_maps.append(PSBTMap())
+            assert change_serial_id is not None
+            change_map = PSBTMap()
+            change_map.append(
+                CLN_PSBT_SERIAL_ID_KEY,
+                change_serial_id.to_bytes(8, "big"),
+            )
+            parsed.output_maps.append(change_map)
 
         unsigned_tx = serialize_transaction(
             parsed.transaction.version,
@@ -404,8 +837,8 @@ class TxBuilder:
 
         return parsed.serialize()
 
-    @staticmethod
     def _validate_splice_signing_input(
+        self,
         parsed_psbt: ParsedPSBT,
         index: int,
         coin: ClassifiedUTXO,
@@ -445,6 +878,79 @@ class TxBuilder:
                 "JoinMarket UTXO value or script"
             )
 
+        non_witness_records = [
+            record
+            for record in parsed_psbt.input_maps[index].records
+            if record.key[:1] == bytes([PSBT_IN_NON_WITNESS_UTXO])
+        ]
+        if len(non_witness_records) != 1:
+            raise RuntimeError(
+                f"Splice signing input {index} must contain exactly one "
+                "non-witness UTXO record"
+            )
+
+        try:
+            previous_transaction = parse_transaction_bytes(
+                non_witness_records[0].value,
+            )
+        except ValueError as exc:
+            raise RuntimeError(
+                f"Splice signing input {index} has an invalid non-witness UTXO"
+            ) from exc
+
+        if self._txid(previous_transaction) != coin.utxo.txid:
+            raise RuntimeError(
+                f"Splice signing input {index} non-witness UTXO does not "
+                "match the approved JoinMarket UTXO outpoint"
+            )
+
+        if coin.utxo.vout >= len(previous_transaction.outputs):
+            raise RuntimeError(
+                f"Splice signing input {index} non-witness UTXO does not "
+                f"contain output {coin.utxo.vout}"
+            )
+
+        previous_output = previous_transaction.outputs[coin.utxo.vout]
+        if (
+            previous_output.value != coin.utxo.value
+            or previous_output.script != expected_script
+        ):
+            raise RuntimeError(
+                f"Splice signing input {index} non-witness UTXO does not "
+                "match the approved JoinMarket UTXO value or script"
+            )
+
+    def find_splice_input_index(
+        self,
+        psbt: bytes,
+        coin: ClassifiedUTXO,
+    ) -> int:
+        """Find the approved JoinMarket input in a negotiated splice PSBT."""
+        try:
+            parsed_psbt = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
+        except PSBTError as exc:
+            raise RuntimeError("Invalid splice PSBT") from exc
+
+        matches = [
+            index
+            for index, transaction_input in enumerate(parsed_psbt.transaction.inputs)
+            if (transaction_input.txid, transaction_input.vout)
+            == (coin.utxo.txid, coin.utxo.vout)
+        ]
+
+        if not matches:
+            raise RuntimeError(
+                "Negotiated splice PSBT does not contain the approved JoinMarket UTXO"
+            )
+
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Negotiated splice PSBT contains the approved "
+                "JoinMarket UTXO more than once"
+            )
+
+        return matches[0]
+
     def sign_splice_psbt(
         self,
         psbt: bytes,
@@ -459,6 +965,7 @@ class TxBuilder:
         metadata and signatures on non-JM inputs are preserved.
         """
         try:
+            psbt = self._normalise_psbt_v2_to_v0(psbt)
             parsed_psbt = parse_psbt(psbt)
         except PSBTError as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
@@ -489,12 +996,99 @@ class TxBuilder:
                 parsed_psbt, index, signing_inputs[index]
             )
 
-        return self._sign_psbt(
-            unsigned_psbt=psbt,
+        # jmwallet's PSBT signer validates every P2WSH input as a JoinMarket
+        # fidelity bond. A splice PSBT also contains CLN's channel funding
+        # input, which is a P2WSH 2-of-2 output and is not a JoinMarket input.
+        #
+        # Sign against a temporary PSBT where non-JM P2WSH witness_utxos are
+        # represented as unowned P2WPKH outputs. The BIP143 sighash for the JM
+        # P2WPKH input does not commit to the other inputs' prevout scripts or
+        # amounts. The original PSBT is retained and only the returned JM
+        # partial signatures are merged back into it.
+        signing_psbt = self._sanitise_splice_signing_psbt(
+            parsed_psbt,
+            signing_inputs,
+        )
+
+        _signed_tx, txid, signed_signing_psbt = self._sign_psbt(
+            unsigned_psbt=signing_psbt,
             tx=parsed_psbt.transaction,
             signing_inputs=signing_inputs,
             wallet=wallet,
         )
+
+        try:
+            signed_parsed_psbt = parse_psbt(signed_signing_psbt)
+        except PSBTError as exc:
+            raise RuntimeError(
+                "JoinMarket wallet returned an invalid signed PSBT"
+            ) from exc
+
+        for index in signing_inputs:
+            signatures = [
+                record
+                for record in signed_parsed_psbt.input_maps[index].records
+                if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            ]
+            if len(signatures) != 1:
+                raise RuntimeError(
+                    "JoinMarket wallet did not return exactly one signature "
+                    f"for input {index}"
+                )
+            parsed_psbt.input_maps[index].append(
+                signatures[0].key,
+                signatures[0].value,
+            )
+
+        signed_psbt = parsed_psbt.serialize()
+        return parsed_psbt.transaction, txid, signed_psbt
+
+    def _sanitise_splice_signing_psbt(
+        self,
+        parsed_psbt: ParsedPSBT,
+        signing_inputs: Mapping[int, ClassifiedUTXO],
+    ) -> bytes:
+        """Build the restricted PSBT presented to jmwallet for signing.
+
+        jmwallet 0.37.0 validates every P2WSH input as a fidelity bond during
+        PSBT review. A CLN splice necessarily contains the channel's P2WSH
+        funding input, so that input must not be interpreted as a JoinMarket
+        fidelity bond. Only the approved JoinMarket inputs are allowed to
+        retain their real UTXO metadata in the signing PSBT.
+        """
+        signing_psbt = parse_psbt(parsed_psbt.serialize())
+
+        dummy_script = b"\x00\x14" + b"\x00" * 20
+        for index, input_map in enumerate(signing_psbt.input_maps):
+            if index in signing_inputs:
+                continue
+
+            for record_index, record in enumerate(input_map.records):
+                if record.key[:1] != bytes([PSBT_IN_WITNESS_UTXO]):
+                    continue
+
+                if len(record.value) < 9:
+                    raise RuntimeError(
+                        f"Splice signing input {index} has an invalid witness UTXO"
+                    )
+                script_length, offset = decode_varint(record.value, 8)
+                if offset + script_length != len(record.value):
+                    raise RuntimeError(
+                        f"Splice signing input {index} has an invalid witness UTXO"
+                    )
+
+                script = record.value[offset:]
+                if not script.startswith(b"\x00\x20"):
+                    break
+
+                value = record.value[:8]
+                input_map.records[record_index] = replace(
+                    record,
+                    value=value + bytes([len(dummy_script)]) + dummy_script,
+                )
+                break
+
+        return signing_psbt.serialize()
 
     def _build_and_sign_tx(
         self,

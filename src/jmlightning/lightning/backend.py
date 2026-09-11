@@ -99,6 +99,10 @@ class LightningBackend(ABC):
         """
 
     @abstractmethod
+    def get_splice_feerate_per_kw(self) -> int:
+        """Return CLN's current splice feerate in sat/kw."""
+
+    @abstractmethod
     def get_fee_rate(
         self,
         priority: FeePriority = FeePriority.NORMAL,

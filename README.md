@@ -547,7 +547,9 @@ Use appropriate secret-management mechanisms for production deployments.
     ├── conftest.py
     │
     ├── integration/
-    │   └── test_open_channel_regtest.py
+    │   ├── helpers.py
+    │   ├── test_open_channel_regtest.py
+    │   └── test_splice_regtest.py
     │
     └── unit/
         ├── test_cln.py
@@ -555,6 +557,7 @@ Use appropriate secret-management mechanisms for production deployments.
         ├── test_open_channel.py
         ├── test_planner.py
         ├── test_policy.py
+        ├── test_splice.py
         └── test_tx_builder.py
 ```
 

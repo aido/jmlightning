@@ -327,7 +327,7 @@ def splice_in(
 
     confirm = None if yes else confirm_splice_in
 
-    asyncio.run(
+    splice_txid = asyncio.run(
         SpliceOperation(
             config=config,
             cln_socket=cln_socket,
@@ -336,6 +336,7 @@ def splice_in(
             confirm=confirm,
         )
     )
+    typer.echo(f"Splice transaction: {splice_txid}")
 
 
 def main() -> None:

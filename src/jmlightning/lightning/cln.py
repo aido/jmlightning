@@ -137,19 +137,17 @@ class CLNBackend(LightningBackend):
     ) -> dict[str, object]:
         """Initiate a CLN channel splice."""
         try:
-            kwargs: dict[str, object] = {
-                "channel_id": channel_id,
-                "amount": amount,
-                "force_feerate": force_feerate,
-            }
+            if force_feerate:
+                raise RuntimeError(
+                    "pyln-client splice_init wrapper does not support force_feerate"
+                )
 
-            if initial_psbt is not None:
-                kwargs["initialpsbt"] = psbt_to_base64(initial_psbt)
-
-            if feerate_per_kw is not None:
-                kwargs["feerate_per_kw"] = feerate_per_kw
-
-            result = self.rpc.splice_init(**kwargs)
+            result = self.rpc.splice_init(
+                channel_id,
+                amount,
+                (psbt_to_base64(initial_psbt) if initial_psbt is not None else None),
+                feerate_per_kw,
+            )
 
             if not isinstance(result, dict):
                 raise RuntimeError("CLN splice_init returned an invalid response")
@@ -172,8 +170,8 @@ class CLNBackend(LightningBackend):
         """Update an active CLN channel splice."""
         try:
             result = self.rpc.splice_update(
-                channel_id=channel_id,
-                psbt=psbt_to_base64(psbt),
+                channel_id,
+                psbt_to_base64(psbt),
             )
 
             if not isinstance(result, dict):
@@ -210,10 +208,14 @@ class CLNBackend(LightningBackend):
     ) -> dict[str, object]:
         """Complete an active CLN channel splice."""
         try:
+            if sign_first:
+                raise RuntimeError(
+                    "pyln-client splice_signed wrapper does not support sign_first"
+                )
+
             result = self.rpc.splice_signed(
-                channel_id=channel_id,
-                psbt=psbt_to_base64(psbt),
-                sign_first=sign_first,
+                channel_id,
+                psbt_to_base64(psbt),
             )
 
             if not isinstance(result, dict):
@@ -334,6 +336,26 @@ class CLNBackend(LightningBackend):
             raise RuntimeError(
                 f"Failed to send funding PSBT through CLN: {exc}"
             ) from exc
+
+    def get_splice_feerate_per_kw(self) -> int:
+        """Return CLN's current splice feerate in sat/kw."""
+        try:
+            result = self.rpc.feerates(style="perkw")
+        except Exception as exc:
+            raise RuntimeError(f"Failed to retrieve CLN splice feerate: {exc}") from exc
+
+        if not isinstance(result, dict):
+            raise RuntimeError("CLN feerates returned an invalid response")
+
+        perkw = result.get("perkw")
+        if not isinstance(perkw, dict):
+            raise RuntimeError("CLN feerates response is missing perkw data")
+
+        splice = perkw.get("splice")
+        if not isinstance(splice, int) or isinstance(splice, bool) or splice <= 0:
+            raise RuntimeError("CLN feerates response has an invalid splice rate")
+
+        return splice
 
     def get_fee_rate(
         self,

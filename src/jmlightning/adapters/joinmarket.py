@@ -52,6 +52,23 @@ class JoinMarketAdapter:
         # acquired by another process after the temporary reservation ended.
         self._lock_owners: dict[tuple[str, int], str] = {}
 
+    async def get_raw_transaction(self, txid: str) -> bytes:
+        """Return the complete raw transaction for a JoinMarket UTXO."""
+        wallet = self._require_wallet()
+        transaction = await wallet.backend.get_transaction(txid)
+
+        if transaction is None or not transaction.raw:
+            raise RuntimeError(
+                f"Unable to retrieve previous transaction for UTXO {txid}"
+            )
+
+        try:
+            return bytes.fromhex(transaction.raw)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"JoinMarket backend returned invalid raw transaction for {txid}"
+            ) from exc
+
     def sign_input(
         self,
         tx: ParsedTransaction,

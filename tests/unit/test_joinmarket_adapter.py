@@ -576,3 +576,25 @@ def test_create_backend_does_not_set_creation_height_when_unconfigured() -> None
 
     assert result is backend
     backend.set_wallet_creation_height.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_get_raw_transaction_returns_backend_transaction() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_transaction = AsyncMock(
+        return_value=SimpleNamespace(raw="02000000")
+    )
+
+    assert await adapter.get_raw_transaction("11" * 32) == bytes.fromhex("02000000")
+    adapter.wallet.backend.get_transaction.assert_awaited_once_with("11" * 32)
+
+
+@pytest.mark.anyio
+async def test_get_raw_transaction_rejects_missing_transaction() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_transaction = AsyncMock(return_value=None)
+
+    with pytest.raises(RuntimeError, match="Unable to retrieve previous transaction"):
+        await adapter.get_raw_transaction("11" * 32)

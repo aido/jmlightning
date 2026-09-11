@@ -73,7 +73,7 @@ class SpliceOperation:
         self,
         channel_id: str,
         confirm: SpliceConfirmationCallback | None = None,
-    ) -> None:
+    ) -> str:
         policy = PolicyEngine()
         planner = Planner()
         jmadapter = JoinMarketAdapter(config=self.config)
@@ -150,13 +150,12 @@ class SpliceOperation:
             # Fee rate
             # --------------------------------------------------------
 
-            fee_rate = cln.get_fee_rate(
-                self.config.fee_priority,
-            )
+            splice_feerate_per_kw = cln.get_splice_feerate_per_kw()
 
             logger.info(
-                "Using fee rate: {:.3f} sat/vB",
-                fee_rate,
+                "Using CLN splice fee rate: {} sat/kw ({:.3f} sat/vB)",
+                splice_feerate_per_kw,
+                splice_feerate_per_kw / 250.0,
             )
 
             # --------------------------------------------------------
@@ -202,9 +201,24 @@ class SpliceOperation:
                     plan = planner.build_plan(
                         selected_coins=selected,
                         target_amount=self.config.amount,
-                        fee_rate=fee_rate,
+                        fee_rate=splice_feerate_per_kw / 250.0,
                         funding_output_type=cln.funding_output_type,
                     )
+
+                    # The normal planner does not know about the existing
+                    # channel 2-of-2 input that CLN charges to the initiator.
+                    # Reserve its CLN weight before committing to this UTXO.
+                    conservative_vsize = plan.vsize + 97
+                    conservative_fee = ceil(
+                        conservative_vsize * splice_feerate_per_kw / 250.0
+                    )
+                    if selected[0].utxo.value < self.config.amount + conservative_fee:
+                        if previous_outpoints == current_outpoints:
+                            raise ValueError("Insufficient funds after fees.")
+                        previous_outpoints = current_outpoints
+                        selection_target = self.config.amount + conservative_fee
+                        continue
+
                     break
                 except ValueError as exc:
                     if str(exc) != "Insufficient funds after fees.":
@@ -227,7 +241,7 @@ class SpliceOperation:
                         ],
                     )
 
-                    estimated_fee = ceil(vsize * fee_rate)
+                    estimated_fee = ceil(vsize * splice_feerate_per_kw / 250.0)
 
                     selection_target = self.config.amount + estimated_fee
 
@@ -264,6 +278,7 @@ class SpliceOperation:
                 result = cln.splice_init(
                     channel_id=channel_id,
                     amount=plan.amount,
+                    feerate_per_kw=splice_feerate_per_kw,
                 )
             except Exception as exc:
                 # splice_init has no transaction id with which to identify
@@ -313,11 +328,59 @@ class SpliceOperation:
             release_locks = False
 
             # --------------------------------------------------------
+            # Calculate the exact initiator fee for this splice
+            # --------------------------------------------------------
+
+            try:
+                splice_fee, splice_weight = tx_builder.estimate_splice_fee(
+                    psbt=initial_psbt,
+                    feerate_per_kw=splice_feerate_per_kw,
+                    add_change_output=self.config.amount != 0,
+                )
+            except (RuntimeError, ValueError) as exc:
+                release_locks = False
+                raise SpliceRecoveryRequiredError(
+                    "Unable to calculate the splice fee from the CLN PSBT; "
+                    "JoinMarket UTXO remains locked for recovery",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=tuple(
+                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                    ),
+                ) from exc
+
+            splice_change = selected[0].utxo.value - plan.amount - splice_fee
+            if splice_change < 0:
+                release_locks = False
+                raise SpliceRecoveryRequiredError(
+                    "Selected JoinMarket UTXO cannot fund the CLN splice fee; "
+                    "JoinMarket UTXO remains locked for recovery",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=tuple(
+                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                    ),
+                )
+
+            plan.fee = splice_fee
+            plan.change = splice_change
+            plan.vsize = (splice_weight + 3) // 4
+
+            logger.info(
+                "CLN splice weight: {} wu, required fee: {} sats",
+                splice_weight,
+                splice_fee,
+            )
+
+            # --------------------------------------------------------
             # Add the JoinMarket input
             # --------------------------------------------------------
 
             change_address = jmadapter.get_change_address(
                 self.config.mixdepth,
+            )
+            previous_tx = await jmadapter.get_raw_transaction(
+                selected[0].utxo.txid,
             )
             splice_psbt = tx_builder.add_splice_in_input(
                 psbt=initial_psbt,
@@ -325,6 +388,7 @@ class SpliceOperation:
                 plan=plan,
                 change_address=change_address,
                 wallet=jmadapter.require_wallet(),
+                prev_tx=previous_tx,
             )
 
             # --------------------------------------------------------
@@ -426,6 +490,36 @@ class SpliceOperation:
                         (coin.utxo.txid, coin.utxo.vout) for coin in locked
                     ),
                 )
+
+            # --------------------------------------------------------
+            # Sign the JoinMarket input(s)
+            # --------------------------------------------------------
+
+            # Locate the approved JoinMarket input in the final negotiated
+            # PSBT rather than relying on input ordering. The peer may add
+            # inputs during interactive negotiation.
+            try:
+                jm_input_index = tx_builder.find_splice_input_index(
+                    psbt=splice_psbt,
+                    coin=plan.inputs[0],
+                )
+                signing_inputs = {jm_input_index: plan.inputs[0]}
+
+                _signed_tx, _signed_txid, splice_psbt = tx_builder.sign_splice_psbt(
+                    psbt=splice_psbt,
+                    signing_inputs=signing_inputs,
+                    wallet=jmadapter.require_wallet(),
+                )
+            except Exception as exc:
+                raise SpliceRecoveryRequiredError(
+                    "Unable to sign the splice PSBT; "
+                    "JoinMarket UTXO remains locked for recovery",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=tuple(
+                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                    ),
+                ) from exc
 
             # --------------------------------------------------------
             # Submit the final signed splice to CLN
@@ -592,6 +686,10 @@ class SpliceOperation:
                             (coin.utxo.txid, coin.utxo.vout) for coin in locked
                         ),
                     ) from operation_error
+
+        if txid is None:
+            raise RuntimeError("Splice completed without a transaction id")
+        return txid
 
 
 def confirm_splice_in(
