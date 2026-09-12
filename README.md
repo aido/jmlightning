@@ -1,6 +1,6 @@
 # ⚡ jmlightning
 
-**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels from JoinMarket-NG wallet UTXOs. Submarine swaps and channel splicing are planned extensions.
+**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels from JoinMarket-NG wallet UTXOs, including channel splice-in operations. Submarine swaps remain a planned extension.
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -201,6 +201,61 @@ for the options supported by the installed version.
 
 ---
 
+### Splice In to an Existing Lightning Channel
+
+A splice-in operation adds a JoinMarket UTXO to an existing Lightning channel without closing the channel. The operation requests the `SPLICE` capability, so only UTXOs permitted by the policy engine may be selected.
+
+For example:
+
+```bash
+jm-lightning splice-in \
+  1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef \
+  --amount 1000000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The channel ID identifies the existing CLN channel to splice into. The requested amount is the amount of new channel capacity contributed by the JoinMarket input; the CLN splice transaction also contains the existing channel funding input and the transaction fee.
+
+The application will:
+
+1. Dispatch the command to `SpliceOperation`.
+2. Connect to the JoinMarket wallet.
+3. Discover and classify available UTXOs.
+4. Ask the policy engine for UTXOs capable of `SPLICE`.
+5. Reject UTXOs that do not have that capability.
+6. Obtain CLN's recommended splice fee rate.
+7. Select exactly one policy-approved JoinMarket UTXO and build a conservative fee-aware plan.
+8. Lock the selected UTXO before starting the CLN splice.
+9. Ask CLN to initialise the splice and obtain the negotiated PSBT.
+10. Calculate the exact initiator fee from the CLN splice PSBT.
+11. Add the JoinMarket input and required PSBT metadata to the CLN transaction.
+12. Exchange the PSBT with CLN until the splice commitments are secured.
+13. Optionally ask the operator to confirm the negotiated splice transaction.
+14. Sign only the JoinMarket input with the JoinMarket wallet.
+15. Submit the signed PSBT to CLN with `splice_signed`.
+16. Retain the JoinMarket freeze after CLN accepts the splice; ambiguous failures keep the input locked for recovery.
+
+CLN remains the owner of the splice transaction. `jmlightning` does not rebuild the existing channel funding transaction independently; it contributes a policy-approved JoinMarket input to the PSBT negotiated by CLN.
+
+The operation is implemented in:
+
+```text
+src/jmlightning/operations/splice.py
+```
+
+The CLI itself is responsible for parsing the command and dispatching the request to the operation.
+
+Run:
+
+```bash
+jm-lightning splice-in --help
+```
+
+for the options supported by the installed version.
+
+---
+
 ### Sweep Mode
 
 A channel funding request with:
@@ -309,6 +364,60 @@ The important property is that **the Lightning backend never chooses arbitrary J
 
 If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the transaction was harmlessly abandoned.
 
+## 🔀 Channel Splice-In Flow
+
+A splice-in follows the same policy-first approach as channel funding, but CLN owns the existing channel and negotiates the splice transaction. `jmlightning` contributes a policy-approved JoinMarket input, signs only that input and then returns the completed PSBT to CLN.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI
+    participant OP as SpliceOperation
+    participant JM as JoinMarket-NG
+    participant P as PolicyEngine
+    participant PL as Planner
+    participant CLN as CLNBackend
+    participant TX as TxBuilder
+
+    CLI->>OP: Execute splice-in(channel_id, amount)
+    OP->>JM: Connect and synchronise
+    OP->>JM: Get available UTXOs
+    JM-->>OP: Classified UTXO data
+    OP->>P: Filter for SPLICE
+    P-->>OP: Policy-approved UTXOs
+    OP->>CLN: Get splice fee rate
+    CLN-->>OP: Fee rate
+    OP->>JM: Select one approved outpoint
+    JM-->>OP: Selected UTXO
+    OP->>PL: Build conservative splice plan
+    PL-->>OP: Input, amount, fee, change
+    OP->>JM: Lock selected UTXO
+    OP->>CLN: splice_init(channel_id, amount, feerate)
+    CLN-->>OP: Initial splice PSBT
+    OP->>TX: Calculate exact CLN splice fee
+    TX-->>OP: Exact fee and weight
+    OP->>JM: Get raw previous transaction
+    JM-->>OP: Previous transaction
+    OP->>TX: Add JoinMarket input and metadata
+    TX-->>OP: Splice PSBT
+    loop Until commitments are secured
+        OP->>CLN: splice_update(PSBT)
+        CLN-->>OP: Updated PSBT and status
+    end
+    OP->>OP: Optional operator confirmation
+    OP->>TX: Sign JoinMarket input only
+    TX->>JM: Sign JM input
+    JM-->>TX: JM signature
+    TX-->>OP: Signed splice PSBT
+    OP->>CLN: splice_signed(signed PSBT)
+    CLN-->>OP: Accepted splice transaction
+    OP->>OP: Retain JoinMarket freeze
+```
+
+The important property is that **CLN remains the transaction authority for the splice**. The existing channel funding input, CLN PSBT metadata and any peer-side transaction changes are preserved while the JoinMarket side validates and contributes only its approved input and signature.
+
+As with channel funding, an ambiguous RPC outcome deliberately leaves the JoinMarket input locked for recovery rather than assuming the splice was abandoned.
+
 ## 🔒 Policy Engine & Capabilities
 
 UTXOs are represented internally as classified coins with a set of capabilities.
@@ -401,6 +510,8 @@ The project currently has a test suite covering:
 - UTXO classification and policy enforcement
 - UTXO planning and selection
 - Bitcoin transaction construction
+- channel opening and splice-in operations
+- CLN/JoinMarket regtest workflows for channel funding and splice-in
 
 Run the complete test suite with:
 
@@ -591,7 +702,17 @@ Placeholder for future swap functionality. No swap protocol is currently impleme
 
 #### `operations/splice.py`
 
-Placeholder for future channel-splicing functionality.
+Implements channel splice-in using a JoinMarket UTXO. `SpliceOperation` coordinates:
+
+- JoinMarket wallet UTXO discovery
+- UTXO classification and `SPLICE` capability validation
+- CLN splice fee retrieval and fee-aware planning
+- JoinMarket UTXO locking
+- CLN splice PSBT negotiation
+- JoinMarket input construction and signing
+- CLN splice completion and recovery-safe cleanup
+
+CLN remains responsible for the existing channel and the negotiated splice transaction; the operation signs only the JoinMarket input.
 
 #### `models.py`
 
