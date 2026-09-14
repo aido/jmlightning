@@ -792,7 +792,7 @@ The policy and planning layers should not need to know which Lightning implement
 
 ### Future Operations
 
-Submarine swaps and channel splicing are planned extensions. The current `operations/swap.py` and `operations/splice.py` files are placeholders; they do not implement those operations yet.
+Submarine swaps is a planned extension. The current `operations/swap.py` file is a placeholders; it does not implement that operation yet.
 
 When implemented, additional operations must use the same capability-based policy boundary as channel funding. Provider- or protocol-specific details should remain inside the relevant operation unless a separate abstraction is justified by actual requirements.
 

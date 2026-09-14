@@ -30,6 +30,10 @@ from loguru import logger
 from pydantic import SecretStr
 
 from jmlightning.config import CLNConfig
+from jmlightning.operations.multi_open_channel import (
+    MultiOpenChannelOperation,
+    confirm_multi_open_channel,
+)
 from jmlightning.operations.open_channel import (
     OpenChannelOperation,
     confirm_open_channel,
@@ -232,6 +236,117 @@ def open_channel(
             cln_socket=cln_socket,
         ).execute(
             peer_id=peer_id,
+            confirm=confirm,
+        )
+    )
+
+
+@app.command()
+def multi_open_channel(
+    destination: Annotated[
+        list[str],
+        typer.Option(
+            "--destination",
+            "-p",
+            help="Channel destination as PEER_ID:AMOUNT_SATS (repeatable)",
+        ),
+    ],
+    cln_socket: Annotated[
+        Path,
+        typer.Option(
+            "--cln-socket",
+            help="Path to CLN unix socket",
+        ),
+    ] = Path("/run/lightningd/lightning-rpc"),
+    mixdepth: Annotated[
+        int | None,
+        typer.Option(
+            "--mixdepth",
+            "-m",
+            help="Source mixdepth (default 0)",
+        ),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="JoinMarket data directory",
+        ),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="JoinMarket config file path",
+        ),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--mnemonic-file",
+            "-f",
+            help="Path to mnemonic file",
+        ),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option(
+            "--yes",
+            "-y",
+            help="Skip interactive confirmation.",
+        ),
+    ] = False,
+) -> None:
+    """Fund multiple CLN channels with one JoinMarket transaction."""
+    if not destination:
+        raise typer.BadParameter("At least one --destination is required")
+
+    destinations: list[tuple[str, int]] = []
+    for value in destination:
+        try:
+            peer_id, amount_text = value.rsplit(":", 1)
+            amount = int(amount_text)
+        except ValueError as exc:
+            raise typer.BadParameter("Destination must be PEER_ID:AMOUNT_SATS") from exc
+
+        if not peer_id or amount <= 0:
+            raise typer.BadParameter(
+                "Destination must contain a peer ID and positive amount"
+            )
+        destinations.append((peer_id, amount))
+
+    settings = setup_cli(
+        data_dir=data_dir,
+        config_file=config_file,
+    )
+
+    resolved = resolve_mnemonic(
+        settings,
+        mnemonic_file=mnemonic_file,
+    )
+
+    if not resolved:
+        logger.error("Could not resolve JoinMarket mnemonic.")
+        raise typer.Exit(1)
+
+    config = build_cln_config(
+        settings=settings,
+        resolved_mnemonic=resolved,
+        amount=sum(amount for _, amount in destinations),
+        mixdepth=mixdepth,
+    )
+
+    confirm = None if yes else confirm_multi_open_channel
+
+    asyncio.run(
+        MultiOpenChannelOperation(
+            config=config,
+            cln_socket=cln_socket,
+        ).execute(
+            destinations=destinations,
             confirm=confirm,
         )
     )

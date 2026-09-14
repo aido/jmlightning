@@ -506,6 +506,102 @@ class TxBuilder:
 
         return tx, txid, funding_vout, signed_psbt
 
+    def build_and_sign_multifunding_tx(
+        self,
+        plan: ExecutionPlan,
+        funding_addresses: list[str],
+        change_address: str,
+        wallet: WalletService,
+    ) -> tuple[ParsedTransaction, str, bytes]:
+        """Build and sign one transaction funding multiple channels."""
+        self._validate_plan(plan)
+
+        if len(plan.funding_outputs) != len(funding_addresses):
+            raise ValueError("Funding output and address counts must match")
+
+        if not plan.funding_outputs:
+            raise ValueError("Multifunding plan requires funding outputs")
+
+        if sum(output.amount for output in plan.funding_outputs) != plan.amount:
+            raise ValueError("Multifunding plan has inconsistent funding amounts")
+
+        tx_inputs = [
+            TxInput.from_hex(
+                txid=coin.utxo.txid,
+                vout=coin.utxo.vout,
+                sequence=0xFFFFFFFF,
+                value=coin.utxo.value,
+                scriptpubkey=coin.utxo.scriptpubkey,
+            )
+            for coin in plan.inputs
+        ]
+
+        tx_outputs = [
+            TxOutput.from_address(address, output.amount)
+            for address, output in zip(
+                funding_addresses,
+                plan.funding_outputs,
+                strict=True,
+            )
+        ]
+
+        if plan.change > 0:
+            tx_outputs.append(TxOutput.from_address(change_address, plan.change))
+
+        tx = ParsedTransaction(
+            version=2,
+            inputs=tx_inputs,
+            outputs=tx_outputs,
+            witnesses=[[] for _ in tx_inputs],
+            locktime=0,
+            has_witness=True,
+        )
+
+        psbt_inputs: list[PSBTInput] = []
+
+        for coin in plan.inputs:
+            key = wallet.get_key_for_address(coin.utxo.address)
+
+            if key is None:
+                raise RuntimeError(
+                    "Unable to resolve wallet key for "
+                    f"{coin.utxo.txid}:{coin.utxo.vout}"
+                )
+
+            expected_pubkey = key.get_public_key_bytes(compressed=True)
+            expected_script = pubkey_to_p2wpkh_script(expected_pubkey)
+            actual_script = bytes.fromhex(coin.utxo.scriptpubkey)
+            if actual_script != expected_script:
+                raise RuntimeError(
+                    "JoinMarket wallet key does not match funding input script "
+                    f"for input {len(psbt_inputs)}"
+                )
+
+            psbt_inputs.append(
+                PSBTInput(
+                    witness_utxo_value=coin.utxo.value,
+                    witness_utxo_script=actual_script,
+                    witness_script=b"",
+                    sighash_type=1,
+                    bip32_derivations=[
+                        BIP32Derivation(
+                            pubkey=expected_pubkey,
+                            fingerprint=wallet.master_key.fingerprint,
+                            path=parse_derivation_path(coin.utxo.path),
+                        )
+                    ],
+                )
+            )
+
+        signing_inputs = {index: coin for index, coin in enumerate(plan.inputs)}
+
+        return self._build_and_sign_tx(
+            tx=tx,
+            signing_inputs=signing_inputs,
+            psbt_inputs=psbt_inputs,
+            wallet=wallet,
+        )
+
     @staticmethod
     def _new_cln_serial_id(existing: set[int]) -> int:
         """Generate a fresh initiator-role serial ID for a splice PSBT."""

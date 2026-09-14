@@ -32,11 +32,11 @@ class FundingPhase(StrEnum):
     BROADCAST = auto()
 
 
-class FundingCancelledError(RuntimeError):
+class OpenChannelCancelledError(RuntimeError):
     """Raised when the operator declines channel funding."""
 
 
-class FundingRecoveryRequiredError(RuntimeError):
+class OpenChannelRecoveryRequiredError(RuntimeError):
     """Raised when funding state cannot be made safe automatically."""
 
     def __init__(
@@ -295,7 +295,7 @@ class OpenChannelOperation:
                 # a possibly-created funding operation, so do not guess
                 # and do not unlock the inputs.
                 release_locks = False
-                raise FundingRecoveryRequiredError(
+                raise OpenChannelRecoveryRequiredError(
                     "CLN fundchannel_start outcome is unknown; "
                     "JoinMarket UTXOs remain locked for recovery",
                     peer_id=peer_id,
@@ -332,7 +332,7 @@ class OpenChannelOperation:
                     cln.cancel_channel_funding(peer_id)
                 except Exception as cancel_exc:
                     release_locks = False
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "Unable to cancel CLN channel funding after "
                         "local transaction preparation failed; "
                         "JoinMarket UTXOs remain locked for recovery",
@@ -357,7 +357,7 @@ class OpenChannelOperation:
                     cln.cancel_channel_funding(peer_id)
                 except Exception as cancel_exc:
                     release_locks = False
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "Unable to cancel CLN channel funding after "
                         "user declined channel funding; "
                         "JoinMarket UTXOs remain locked for recovery",
@@ -368,7 +368,7 @@ class OpenChannelOperation:
                 phase = FundingPhase.LOCKED
                 release_locks = True
 
-                raise FundingCancelledError(
+                raise OpenChannelCancelledError(
                     "Channel funding cancelled by user",
                 )
 
@@ -389,7 +389,7 @@ class OpenChannelOperation:
                     )
                 except Exception as status_exc:
                     release_locks = False
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "Unable to determine CLN channel completion state; "
                         "JoinMarket UTXOs remain locked for recovery",
                         peer_id=peer_id,
@@ -401,7 +401,7 @@ class OpenChannelOperation:
                     try:
                         cln.cancel_channel_funding(peer_id)
                     except Exception as cancel_exc:
-                        raise FundingRecoveryRequiredError(
+                        raise OpenChannelRecoveryRequiredError(
                             "Unable to cancel withheld CLN channel funding; "
                             "JoinMarket UTXOs remain locked for recovery",
                             peer_id=peer_id,
@@ -415,7 +415,7 @@ class OpenChannelOperation:
                     phase = FundingPhase.LOCKED
                 else:
                     release_locks = False
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "CLN channel completion outcome is ambiguous; "
                         "funding may already have been broadcast",
                         peer_id=peer_id,
@@ -440,7 +440,7 @@ class OpenChannelOperation:
                     )
                 except Exception as status_exc:
                     release_locks = False
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "Unable to determine CLN sendpsbt outcome; "
                         "JoinMarket UTXOs remain locked for recovery",
                         peer_id=peer_id,
@@ -452,7 +452,7 @@ class OpenChannelOperation:
                     try:
                         cln.cancel_channel_funding(peer_id)
                     except Exception as cancel_exc:
-                        raise FundingRecoveryRequiredError(
+                        raise OpenChannelRecoveryRequiredError(
                             "Unable to cancel withheld CLN channel funding; "
                             "JoinMarket UTXOs remain locked for recovery",
                             peer_id=peer_id,
@@ -488,7 +488,7 @@ class OpenChannelOperation:
 
             if not isinstance(result_txid, str) or result_txid != txid:
                 release_locks = False
-                raise FundingRecoveryRequiredError(
+                raise OpenChannelRecoveryRequiredError(
                     "CLN sendpsbt returned an unexpected funding transaction id; "
                     "JoinMarket UTXOs remain locked for recovery",
                     peer_id=peer_id,
@@ -502,7 +502,7 @@ class OpenChannelOperation:
                 "Funding transaction broadcast through CLN: {}",
                 txid,
             )
-        except FundingCancelledError:
+        except OpenChannelCancelledError:
             raise
         except Exception as exc:
             operation_error = exc
@@ -539,7 +539,7 @@ class OpenChannelOperation:
 
             if cleanup_errors and operation_error is None:
                 if phase is not FundingPhase.BROADCAST:
-                    raise FundingRecoveryRequiredError(
+                    raise OpenChannelRecoveryRequiredError(
                         "Channel funding cleanup failed; manual recovery is required",
                         peer_id=peer_id,
                         txid=txid,
@@ -556,8 +556,8 @@ class OpenChannelOperation:
                     "Channel funding failed and cleanup also failed; "
                     "manual recovery is required",
                 )
-                if not isinstance(operation_error, FundingRecoveryRequiredError):
-                    raise FundingRecoveryRequiredError(
+                if not isinstance(operation_error, OpenChannelRecoveryRequiredError):
+                    raise OpenChannelRecoveryRequiredError(
                         "Channel funding failed and cleanup also failed; "
                         "manual recovery is required",
                         peer_id=peer_id,

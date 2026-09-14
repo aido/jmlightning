@@ -9,9 +9,9 @@ from jmwallet.wallet.models import UTXOInfo
 from jmlightning.lightning.backend import ChannelFundingStatus, FeePriority
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.open_channel import (
-    FundingCancelledError,
-    FundingRecoveryRequiredError,
+    OpenChannelCancelledError,
     OpenChannelOperation,
+    OpenChannelRecoveryRequiredError,
     confirm_open_channel,
 )
 
@@ -322,7 +322,7 @@ async def test_send_psbt_failure_with_unknown_state_keeps_utxo_locked() -> None:
         )
 
         with pytest.raises(
-            FundingRecoveryRequiredError,
+            OpenChannelRecoveryRequiredError,
             match="Unable to determine CLN sendpsbt outcome",
         ):
             await operation.execute("02" + "11" * 32)
@@ -351,7 +351,7 @@ async def test_send_psbt_txid_mismatch_keeps_utxo_locked() -> None:
         )
 
         with pytest.raises(
-            FundingRecoveryRequiredError,
+            OpenChannelRecoveryRequiredError,
             match="unexpected funding transaction id",
         ):
             await operation.execute("02" + "11" * 32)
@@ -380,7 +380,7 @@ async def test_fundchannel_start_unknown_outcome_keeps_utxo_locked() -> None:
         )
 
         with pytest.raises(
-            FundingRecoveryRequiredError,
+            OpenChannelRecoveryRequiredError,
             match="fundchannel_start outcome is unknown",
         ):
             await operation.execute("02" + "11" * 32)
@@ -412,7 +412,7 @@ async def test_cancel_failure_keeps_utxo_locked() -> None:
         )
 
         with pytest.raises(
-            FundingRecoveryRequiredError,
+            OpenChannelRecoveryRequiredError,
             match="Unable to cancel withheld CLN channel funding",
         ):
             await operation.execute("02" + "11" * 32)
@@ -519,7 +519,7 @@ async def test_failure_after_fundchannel_start_cancel_failure_keeps_utxo_locked(
         )
 
         with pytest.raises(
-            FundingRecoveryRequiredError,
+            OpenChannelRecoveryRequiredError,
             match="local transaction preparation failed",
         ):
             await operation.execute("02" + "11" * 32)
@@ -680,7 +680,7 @@ async def test_confirmation_rejection_prevents_funding() -> None:
         )
 
         with pytest.raises(
-            FundingCancelledError,
+            OpenChannelCancelledError,
             match="Channel funding cancelled by user",
         ):
             await operation.execute(
