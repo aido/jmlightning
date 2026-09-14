@@ -135,9 +135,9 @@ def lightning_rpc(socket: str) -> LightningRpc:
 
 async def prepare_regtest(tmp_path: Path) -> dict[str, Any]:
     bitcoin_datadir = Path(_required_env("BITCOIN_DATADIR"))
-    cln_socket = _required_env("CLN_RPC_SOCKET")
-    peer_id = _required_env("CLN_PEER_ID")
-    peer_socket = _required_env("CLN_PEER_RPC_SOCKET")
+    cln_socket = _required_env("CLN_PEER1_RPC_SOCKET")
+    peer_id = _required_env("CLN_PEER2_ID")
+    peer_socket = _required_env("CLN_PEER2_RPC_SOCKET")
     rpc_url = _required_env("BITCOIN_RPC_URL")
 
     data_dir = tmp_path / "joinmarket"

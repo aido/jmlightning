@@ -281,33 +281,33 @@ jobs:
 
           test "$height" -ge 101
 
-      - name: Start Core Lightning
+      - name: Start First Core Lightning peer
         env:
-          CLN_DATADIR: ${{ runner.temp }}/cln
+          CLN_PEER1_DATADIR: ${{ runner.temp }}/cln-peer-1
         run: |
           set -euo pipefail
 
-          mkdir -p "$CLN_DATADIR"
+          mkdir -p "$CLN_PEER1_DATADIR"
 
-          CLN_RPC_SOCKET="$CLN_DATADIR/regtest/lightning-rpc"
+          CLN_PEER1_RPC_SOCKET="$CLN_PEER1_DATADIR/regtest/lightning-rpc"
 
           lightningd \
             --network=regtest \
-            --lightning-dir="$CLN_DATADIR" \
-            --rpc-file="$CLN_RPC_SOCKET" \
+            --lightning-dir="$CLN_PEER1_DATADIR" \
+            --rpc-file="$CLN_PEER1_RPC_SOCKET" \
             --bitcoin-rpcconnect=127.0.0.1 \
             --bitcoin-rpcport=18443 \
             --bitcoin-rpcuser=test \
             --bitcoin-rpcpassword=test \
-            --log-file="$CLN_DATADIR/lightningd.log" \
+            --log-file="$CLN_PEER1_DATADIR/lightningd.log" \
             --daemon
 
-          echo "CLN_RPC_SOCKET=$CLN_RPC_SOCKET" >> "$GITHUB_ENV"
+          echo "CLN_PEER1_RPC_SOCKET=$CLN_PEER1_RPC_SOCKET" >> "$GITHUB_ENV"
 
           ready=0
 
           for _ in $(seq 1 120); do
-            if [ -S "$CLN_RPC_SOCKET" ]; then
+            if [ -S "$CLN_PEER1_RPC_SOCKET" ]; then
               ready=1
               break
             fi
@@ -319,7 +319,7 @@ jobs:
             echo "Core Lightning RPC socket was not created"
             echo
             echo "=== Core Lightning log ==="
-            cat "$CLN_DATADIR/lightningd.log" || true
+            cat "$CLN_PEER1_DATADIR/lightningd.log" || true
             exit 1
           fi
 
@@ -327,7 +327,7 @@ jobs:
 
           for _ in $(seq 1 120); do
             if lightning-cli \
-              --rpc-file="$CLN_RPC_SOCKET" \
+              --rpc-file="$CLN_PEER1_RPC_SOCKET" \
               getinfo >/dev/null 2>&1; then
               ready=1
               break
@@ -349,34 +349,34 @@ jobs:
 
             echo
             echo "=== Core Lightning log ==="
-            cat "$CLN_DATADIR/lightningd.log" || true
+            cat "$CLN_PEER1_DATADIR/lightningd.log" || true
 
             exit 1
           fi
 
           lightning-cli \
-            --rpc-file="$CLN_RPC_SOCKET" \
+            --rpc-file="$CLN_PEER1_RPC_SOCKET" \
             getinfo
 
-      - name: Start Core Lightning peer
+      - name: Start Second Core Lightning peer
         env:
-          CLN_PEER_DATADIR: ${{ runner.temp }}/cln-peer
+          CLN_PEER2_DATADIR: ${{ runner.temp }}/cln-peer-2
         run: |
           set -euo pipefail
 
-          rm -rf "$CLN_PEER_DATADIR"
-          mkdir -p "$CLN_PEER_DATADIR"
+          rm -rf "$CLN_PEER2_DATADIR"
+          mkdir -p "$CLN_PEER2_DATADIR"
 
-          CLN_PEER_RPC_SOCKET="$CLN_PEER_DATADIR/regtest/lightning-rpc"
+          CLN_PEER2_RPC_SOCKET="$CLN_PEER2_DATADIR/regtest/lightning-rpc"
 
-          echo "Starting Core Lightning peer..."
+          echo "Starting Second Core Lightning peer..."
           echo "lightningd: $(command -v lightningd)"
           lightningd --version
 
           lightningd \
             --network=regtest \
-            --lightning-dir="$CLN_PEER_DATADIR" \
-            --rpc-file="$CLN_PEER_RPC_SOCKET" \
+            --lightning-dir="$CLN_PEER2_DATADIR" \
+            --rpc-file="$CLN_PEER2_RPC_SOCKET" \
             --addr=127.0.0.1:19735 \
             --grpc-host=127.0.0.1 \
             --grpc-port=19736 \
@@ -384,73 +384,136 @@ jobs:
             --bitcoin-rpcport=18443 \
             --bitcoin-rpcuser=test \
             --bitcoin-rpcpassword=test \
-            --log-file="$CLN_PEER_DATADIR/lightningd.log" \
+            --log-file="$CLN_PEER2_DATADIR/lightningd.log" \
             --daemon
 
-          echo "CLN_PEER_RPC_SOCKET=$CLN_PEER_RPC_SOCKET" >> "$GITHUB_ENV"
+          echo "CLN_PEER2_RPC_SOCKET=$CLN_PEER2_RPC_SOCKET" >> "$GITHUB_ENV"
 
           ready=0
           for _ in $(seq 1 120); do
-            if [ -S "$CLN_PEER_RPC_SOCKET" ]; then
-              echo "RPC socket exists: $CLN_PEER_RPC_SOCKET"
+            if [ -S "$CLN_PEER2_RPC_SOCKET" ]; then
+              echo "RPC socket exists: $CLN_PEER2_RPC_SOCKET"
             fi
 
             if lightning-cli \
-                --rpc-file="$CLN_PEER_RPC_SOCKET" \
+                --rpc-file="$CLN_PEER2_RPC_SOCKET" \
                 getinfo; then
               ready=1
               break
             fi
 
-            if [ -f "$CLN_PEER_DATADIR/lightningd.log" ]; then
+            if [ -f "$CLN_PEER2_DATADIR/lightningd.log" ]; then
               echo "--- lightningd.log (last 30 lines) ---"
-              tail -30 "$CLN_PEER_DATADIR/lightningd.log" || true
+              tail -30 "$CLN_PEER2_DATADIR/lightningd.log" || true
             fi
 
             sleep 1
           done
 
           if [ "$ready" -ne 1 ]; then
-            echo "::error::Core Lightning peer failed to become ready"
+            echo "::error::Second Core Lightning peer failed to become ready"
             echo "=== peer directory ==="
-            find "$CLN_PEER_DATADIR" -maxdepth 3 -type f -print || true
+            find "$CLN_PEER2_DATADIR" -maxdepth 3 -type f -print || true
             echo "=== lightningd.log ==="
-            cat "$CLN_PEER_DATADIR/lightningd.log" || true
+            cat "$CLN_PEER2_DATADIR/lightningd.log" || true
             exit 1
           fi
 
-          PEER_ID=$(lightning-cli \
-            --rpc-file="$CLN_PEER_RPC_SOCKET" \
+          PEER2_ID=$(lightning-cli \
+            --rpc-file="$CLN_PEER2_RPC_SOCKET" \
             getinfo | jq -r '.id')
 
-          test -n "$PEER_ID"
-          test "$PEER_ID" != "null"
+          test -n "$PEER2_ID"
+          test "$PEER2_ID" != "null"
 
-          echo "CLN_PEER_ID=$PEER_ID" >> "$GITHUB_ENV"
-          echo "CLN peer ready: $PEER_ID"
+          echo "CLN_PEER2_ID=$PEER2_ID" >> "$GITHUB_ENV"
+          echo "Second CLN peer ready: $PEER2_ID"
+
+      - name: Start Third Core Lightning peer
+        env:
+          CLN_PEER3_DATADIR: ${{ runner.temp }}/cln-peer-3
+        run: |
+          set -euo pipefail
+
+          rm -rf "$CLN_PEER3_DATADIR"
+          mkdir -p "$CLN_PEER3_DATADIR"
+
+          CLN_PEER3_RPC_SOCKET="$CLN_PEER3_DATADIR/regtest/lightning-rpc"
+
+          echo "Starting third Core Lightning peer..."
+          lightningd --version
+
+          lightningd \
+            --network=regtest \
+            --lightning-dir="$CLN_PEER3_DATADIR" \
+            --rpc-file="$CLN_PEER3_RPC_SOCKET" \
+            --addr=127.0.0.1:19737 \
+            --grpc-host=127.0.0.1 \
+            --grpc-port=19738 \
+            --bitcoin-rpcconnect=127.0.0.1 \
+            --bitcoin-rpcport=18443 \
+            --bitcoin-rpcuser=test \
+            --bitcoin-rpcpassword=test \
+            --log-file="$CLN_PEER3_DATADIR/lightningd.log" \
+            --daemon
+
+          echo "CLN_PEER3_RPC_SOCKET=$CLN_PEER3_RPC_SOCKET" >> "$GITHUB_ENV"
+
+          ready=0
+          for _ in $(seq 1 120); do
+            if lightning-cli --rpc-file="$CLN_PEER3_RPC_SOCKET" getinfo; then
+              ready=1
+              break
+            fi
+            sleep 1
+          done
+
+          if [ "$ready" -ne 1 ]; then
+            echo "::error::Third Core Lightning peer failed to become ready"
+            cat "$CLN_PEER3_DATADIR/lightningd.log" || true
+            exit 1
+          fi
+
+          PEER3_ID=$(lightning-cli \
+            --rpc-file="$CLN_PEER3_RPC_SOCKET" \
+            getinfo | jq -r '.id')
+
+          test -n "$PEER3_ID"
+          test "$PEER3_ID" != "null"
+
+          echo "CLN_PEER3_ID=$PEER3_ID" >> "$GITHUB_ENV"
+          echo "Third CLN peer ready: $PEER3_ID"
 
       - name: Connect Core Lightning peers
         run: |
           set -euo pipefail
 
           lightning-cli \
-            --rpc-file="$CLN_RPC_SOCKET" \
+            --rpc-file="$CLN_PEER1_RPC_SOCKET" \
             connect \
-            "$CLN_PEER_ID" \
+            "$CLN_PEER2_ID" \
             127.0.0.1 \
             19735
 
-          connected=0
-          for _ in $(seq 1 60); do
-            if lightning-cli --rpc-file="$CLN_RPC_SOCKET" listpeers "$CLN_PEER_ID" \
-              | jq -e '.peers | length > 0 and .[0].connected == true' >/dev/null; then
-              connected=1
-              break
-            fi
-            sleep 1
-          done
+          lightning-cli \
+            --rpc-file="$CLN_PEER1_RPC_SOCKET" \
+            connect \
+            "$CLN_PEER3_ID" \
+            127.0.0.1 \
+            19737
 
-          test "$connected" -eq 1
+          for peer_id in "$CLN_PEER2_ID" "$CLN_PEER3_ID"; do
+            connected=0
+            for _ in $(seq 1 60); do
+              if lightning-cli --rpc-file="$CLN_PEER1_RPC_SOCKET" listpeers "$peer_id" \
+                | jq -e '.peers | length > 0 and .[0].connected == true' >/dev/null; then
+                connected=1
+                break
+              fi
+              sleep 1
+            done
+            test "$connected" -eq 1
+          done
 
       - name: Run integration tests
         env:
@@ -458,8 +521,9 @@ jobs:
           BITCOIN_RPC_USER: test
           BITCOIN_RPC_PASSWORD: test
           BITCOIN_DATADIR: ${{ runner.temp }}/bitcoin
-          CLN_RPC_SOCKET: ${{ runner.temp }}/cln/regtest/lightning-rpc
-          CLN_PEER_RPC_SOCKET: ${{ runner.temp }}/cln-peer/regtest/lightning-rpc
+          CLN_PEER1_RPC_SOCKET: ${{ runner.temp }}/cln-peer-1/regtest/lightning-rpc
+          CLN_PEER2_RPC_SOCKET: ${{ runner.temp }}/cln-peer-2/regtest/lightning-rpc
+          CLN_PEER3_RPC_SOCKET: ${{ runner.temp }}/cln-peer-3/regtest/lightning-rpc
         run: |
           set -euo pipefail
 
@@ -513,16 +577,24 @@ jobs:
 
           echo
           echo "=== Primary Core Lightning files ==="
-          find "$RUNNER_TEMP/cln" -maxdepth 4 -type f -print 2>/dev/null || true
+          find "$RUNNER_TEMP/cln-peer-1" -maxdepth 4 -type f -print 2>/dev/null || true
 
           echo
           echo "=== Primary Core Lightning log ==="
-          find "$RUNNER_TEMP/cln" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
+          find "$RUNNER_TEMP/cln-peer-1" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
 
           echo
-          echo "=== Peer Core Lightning files ==="
-          find "$RUNNER_TEMP/cln-peer" -maxdepth 4 -type f -print 2>/dev/null || true
+          echo "=== Second Core Lightning peer files ==="
+          find "$RUNNER_TEMP/cln-peer-2" -maxdepth 4 -type f -print 2>/dev/null || true
 
           echo
-          echo "=== Peer Core Lightning log ==="
-          find "$RUNNER_TEMP/cln-peer" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
+          echo "=== Second Core Lightning peer log ==="
+          find "$RUNNER_TEMP/cln-peer-2" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
+
+          echo
+          echo "=== Third Core Lightning peer files ==="
+          find "$RUNNER_TEMP/cln-peer-3" -maxdepth 4 -type f -print 2>/dev/null || true
+
+          echo
+          echo "=== Third Core Lightning peer log ==="
+          find "$RUNNER_TEMP/cln-peer-3" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
