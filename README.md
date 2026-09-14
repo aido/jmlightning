@@ -201,6 +201,59 @@ for the options supported by the installed version.
 
 ---
 
+### Open Multiple Lightning Channels
+
+A multi-channel funding operation opens multiple CLN channels using **one shared Bitcoin transaction**. It requests the same `OPEN_CHANNEL` capability as a single channel open, so every JoinMarket input must independently satisfy the existing channel-funding policy.
+
+Each destination is supplied as a repeatable `--destination` option containing a peer ID and channel amount:
+
+```bash
+jm-lightning multi-open-channel \
+  --destination 02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890:1000000 \
+  --destination 03def4567890abcdef1234567890abcdef1234567890abcdef1234567890:1500000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The amounts are the individual channel funding amounts. The JoinMarket planner selects enough policy-approved UTXOs to fund their combined value, the transaction fee and any required change.
+
+The application will:
+
+1. Dispatch the command to `MultiOpenChannelOperation`.
+2. Connect to the JoinMarket wallet.
+3. Discover and classify available UTXOs.
+4. Ask the policy engine for UTXOs capable of `OPEN_CHANNEL`.
+5. Reject UTXOs that do not have that capability.
+6. Obtain a fee estimate from CLN.
+7. Select and plan the combined funding transaction from the approved UTXOs.
+8. Lock the selected UTXOs before starting CLN funding.
+9. Ask CLN for a funding address for each destination.
+10. Construct and sign one Bitcoin transaction containing all channel funding outputs and any JoinMarket change.
+11. Optionally ask the operator to confirm the shared transaction.
+12. Complete each CLN channel against the same signed PSBT while withholding broadcast.
+13. Send the signed PSBT once through CLN, which finalises and broadcasts the shared funding transaction.
+14. Retain the JoinMarket freezes after successful broadcast; ambiguous failures keep the inputs locked for recovery.
+
+The operation is implemented in:
+
+```text
+src/jmlightning/operations/multi_open_channel.py
+```
+
+The CLI itself is responsible for parsing the repeatable destinations and dispatching the request to the operation.
+
+Run:
+
+```bash
+jm-lightning multi-open-channel --help
+```
+
+for the options supported by the installed version.
+
+The important property is that the channel funding outputs share **one Bitcoin transaction**. This avoids creating one independent on-chain funding transaction per channel while preserving the same JoinMarket capability policy used by the single-channel operation.
+
+---
+
 ### Splice In to an Existing Lightning Channel
 
 A splice-in operation adds a JoinMarket UTXO to an existing Lightning channel without closing the channel. The operation requests the `SPLICE` capability, so only UTXOs permitted by the policy engine may be selected.
@@ -363,6 +416,56 @@ sequenceDiagram
 The important property is that **the Lightning backend never chooses arbitrary JoinMarket UTXOs**. The inputs originate from JoinMarket-NG, are filtered by the local capability policy, selected only from that approved set and locked before CLN funding is started.
 
 If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the transaction was harmlessly abandoned.
+
+## 🔗 Multi-Channel Funding Flow
+
+Multi-channel funding extends the single-channel flow by starting funding for each peer, collecting the resulting funding addresses and then constructing one shared transaction. Each channel is completed against the same signed PSBT and the transaction is broadcast only once.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI
+    participant OP as MultiOpenChannelOperation
+    participant JM as JoinMarket-NG
+    participant P as PolicyEngine
+    participant PL as Planner
+    participant CLN as CLNBackend
+    participant TX as TxBuilder
+
+    CLI->>OP: Execute multi-open-channel
+    OP->>JM: Connect and synchronise
+    OP->>JM: Get available UTXOs
+    JM-->>OP: Classified UTXO data
+    OP->>P: Filter for OPEN_CHANNEL
+    P-->>OP: Policy-approved UTXOs
+    OP->>CLN: Get fee rate
+    CLN-->>OP: Fee rate
+    OP->>JM: Select from approved outpoints
+    JM-->>OP: Selected UTXOs
+    OP->>PL: Build shared funding plan
+    PL-->>OP: Inputs, amounts, fee, change
+    OP->>JM: Atomically reserve and freeze inputs
+    loop For each destination
+        OP->>CLN: fundchannel_start(peer, amount)
+        CLN-->>OP: Funding address
+    end
+    OP->>TX: Build one shared funding transaction
+    TX->>JM: Sign PSBT
+    JM-->>TX: Signed PSBT
+    TX-->>OP: Validated transaction + PSBT
+    OP->>OP: Optional operator confirmation
+    loop For each destination
+        OP->>CLN: fundchannel_complete(peer, signed PSBT)
+        CLN-->>OP: Funding withheld
+    end
+    OP->>CLN: sendpsbt(signed PSBT)
+    CLN-->>OP: Broadcast txid
+    OP->>OP: Retain JoinMarket freezes
+```
+
+The important property is that **all channel funding outputs are created in the same Bitcoin transaction**. CLN remains responsible for each channel's funding state while `jmlightning` constructs and signs the shared transaction from JoinMarket-approved inputs.
+
+If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the shared transaction was harmlessly abandoned.
 
 ## 🔀 Channel Splice-In Flow
 
@@ -651,6 +754,7 @@ Use appropriate secret-management mechanisms for production deployments.
 │       └── operations/
 │           ├── __init__.py
 │           ├── open_channel.py
+│           ├── multi_open_channel.py
 │           ├── splice.py
 │           └── swap.py
 │
@@ -659,6 +763,7 @@ Use appropriate secret-management mechanisms for production deployments.
     │
     ├── integration/
     │   ├── helpers.py
+    │   ├── test_multi_open_channel_regtest.py
     │   ├── test_open_channel_regtest.py
     │   └── test_splice_regtest.py
     │
@@ -682,7 +787,7 @@ The CLI is intentionally kept thin. It handles command-line arguments and config
 
 #### `operations/open_channel.py`
 
-Implements the Lightning channel-opening operation.
+Implements the single Lightning channel-opening operation.
 
 `OpenChannelOperation` coordinates:
 
@@ -695,6 +800,24 @@ Implements the Lightning channel-opening operation.
 - CLN channel funding
 
 The operation does not define the JoinMarket privacy rules itself. Those remain in the policy engine.
+
+#### `operations/multi_open_channel.py`
+
+Implements multi-channel funding with one shared Bitcoin transaction.
+
+`MultiOpenChannelOperation` coordinates:
+
+- JoinMarket wallet UTXO discovery
+- UTXO classification and `OPEN_CHANNEL` capability validation
+- fee retrieval and multi-output planning
+- JoinMarket UTXO locking
+- CLN funding initialisation for multiple peers
+- construction and signing of one shared funding transaction
+- completion of each CLN channel against the shared PSBT
+- one final CLN broadcast
+- recovery-safe cleanup when funding outcomes are ambiguous
+
+The operation uses the same policy boundary as `OpenChannelOperation`; adding multiple destinations does not expand the set of UTXOs permitted for channel funding.
 
 #### `operations/swap.py`
 
@@ -815,6 +938,7 @@ The project is being developed incrementally.
 - Capability-based policy enforcement
 - Policy-constrained UTXO selection
 - Core Lightning channel funding
+- Multi-channel funding with shared transactions
 - Transaction construction and signing
 - Operation-oriented CLI architecture
 - Strong typing and automated tests
