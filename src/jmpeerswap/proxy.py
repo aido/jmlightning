@@ -1,0 +1,255 @@
+from __future__ import annotations
+
+import json
+import os
+import socket
+import stat
+import threading
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
+
+class DeferredResponse:
+    """Marker for a request handled asynchronously by the proxy."""
+
+
+DEFERRED_RESPONSE = DeferredResponse()
+
+
+class UnixRPCProxy:
+    """Proxy a Unix-domain RPC socket to another Unix-domain RPC socket."""
+
+    def __init__(
+        self,
+        listen_path: Path,
+        upstream_path: Path,
+        request_handler: (
+            Callable[
+                [dict[str, Any], Callable[[dict[str, Any]], None]],
+                dict[str, Any] | DeferredResponse | None,
+            ]
+            | None
+        ) = None,
+    ) -> None:
+        self.listen_path = listen_path
+        self.upstream_path = upstream_path
+        self.request_handler = request_handler
+        self._listener: socket.socket | None = None
+        self._thread: threading.Thread | None = None
+        self._stopping = threading.Event()
+        self._clients: set[socket.socket] = set()
+        self._clients_lock = threading.Lock()
+
+    def start(self) -> None:
+        if self._listener is not None:
+            raise RuntimeError("RPC proxy is already running")
+
+        self._remove_stale_socket()
+
+        listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            listener.bind(str(self.listen_path))
+            listener.listen()
+            listener.settimeout(0.5)
+        except Exception:
+            listener.close()
+            raise
+
+        os.chmod(self.listen_path, stat.S_IRUSR | stat.S_IWUSR)
+
+        self._listener = listener
+        self._stopping.clear()
+        self._thread = threading.Thread(
+            target=self._accept_loop,
+            name="jm-peerswap-rpc-proxy",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stopping.set()
+
+        listener = self._listener
+        self._listener = None
+        if listener is not None:
+            try:
+                listener.close()
+            except OSError:
+                pass
+
+        with self._clients_lock:
+            clients = list(self._clients)
+            self._clients.clear()
+
+        for client in clients:
+            try:
+                client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                client.close()
+            except OSError:
+                pass
+
+        thread = self._thread
+        self._thread = None
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=2)
+
+        self._remove_socket()
+
+    def _remove_stale_socket(self) -> None:
+        try:
+            mode = os.lstat(self.listen_path).st_mode
+        except FileNotFoundError:
+            return
+
+        if not stat.S_ISSOCK(mode):
+            raise RuntimeError(
+                f"RPC proxy path exists and is not a socket: {self.listen_path}"
+            )
+
+        os.unlink(self.listen_path)
+
+    def _remove_socket(self) -> None:
+        try:
+            mode = os.lstat(self.listen_path).st_mode
+        except FileNotFoundError:
+            return
+
+        if stat.S_ISSOCK(mode):
+            os.unlink(self.listen_path)
+
+    def _accept_loop(self) -> None:
+        listener = self._listener
+        if listener is None:
+            return
+
+        while not self._stopping.is_set():
+            try:
+                client, _ = listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                if self._stopping.is_set():
+                    return
+                raise
+
+            with self._clients_lock:
+                self._clients.add(client)
+
+            threading.Thread(
+                target=self._proxy_client,
+                args=(client,),
+                name="jm-peerswap-rpc-client",
+                daemon=True,
+            ).start()
+
+    def _proxy_client(self, client: socket.socket) -> None:
+        upstream: socket.socket | None = None
+        try:
+            upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            upstream.connect(str(self.upstream_path))
+
+            client_to_upstream = threading.Thread(
+                target=self._relay_client,
+                args=(client, upstream),
+                daemon=True,
+            )
+            upstream_to_client = threading.Thread(
+                target=self._relay,
+                args=(upstream, client),
+                daemon=True,
+            )
+
+            client_to_upstream.start()
+            upstream_to_client.start()
+
+            client_to_upstream.join()
+            upstream_to_client.join()
+        except OSError:
+            if not self._stopping.is_set():
+                return
+        finally:
+            if upstream is not None:
+                try:
+                    upstream.close()
+                except OSError:
+                    pass
+
+            try:
+                client.close()
+            except OSError:
+                pass
+
+            with self._clients_lock:
+                self._clients.discard(client)
+
+    def _relay_client(self, client: socket.socket, upstream: socket.socket) -> None:
+        reader = client.makefile("rb")
+        write_lock = threading.Lock()
+
+        def respond(response: dict[str, Any]) -> None:
+            payload = json.dumps(response).encode() + b"\n\n"
+            with write_lock:
+                client.sendall(payload)
+
+        try:
+            while True:
+                data = reader.readline()
+                if not data:
+                    try:
+                        upstream.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    return
+
+                response = self._handle_request(data, respond)
+                if response is DEFERRED_RESPONSE:
+                    continue
+                if response is None:
+                    upstream.sendall(data)
+                elif isinstance(response, dict):
+                    respond(response)
+                else:
+                    raise TypeError(
+                        "RPC request handler returned an unsupported response type"
+                    )
+        except OSError:
+            return
+        finally:
+            reader.close()
+
+    def _handle_request(
+        self,
+        data: bytes,
+        respond: Callable[[dict[str, Any]], None],
+    ) -> dict[str, Any] | DeferredResponse | None:
+        if self.request_handler is None:
+            return None
+
+        try:
+            request = json.loads(data)
+        except json.JSONDecodeError:
+            return None
+
+        if not isinstance(request, dict):
+            return None
+
+        return self.request_handler(request, respond)
+
+    @staticmethod
+    def _relay(source: socket.socket, destination: socket.socket) -> None:
+        try:
+            while True:
+                data = source.recv(64 * 1024)
+                if not data:
+                    try:
+                        destination.shutdown(socket.SHUT_WR)
+                    except OSError:
+                        pass
+                    return
+                destination.sendall(data)
+        except OSError:
+            return

@@ -10,6 +10,7 @@ import typer
 from typer.testing import CliRunner
 
 import jmlightning.cli as cli
+import jmlightning.config as config
 from jmlightning.operations.open_channel import confirm_open_channel
 from jmlightning.operations.splice import confirm_splice_in
 
@@ -117,12 +118,12 @@ def test_build_cln_config_resolves_backend_and_maps_settings(
     backend = _backend()
 
     monkeypatch.setattr(
-        cli,
+        config,
         "resolve_backend_settings",
         lambda *args, **kwargs: backend,
     )
 
-    result = cli.build_cln_config(
+    result = config.build_cln_config(
         settings=settings,
         resolved_mnemonic=resolved,
         amount=250_000,
@@ -167,17 +168,17 @@ def test_build_cln_config_defaults_bitcoin_network_to_none(
     captured: dict[str, Any] = {}
 
     monkeypatch.setattr(
-        cli,
+        config,
         "resolve_backend_settings",
         lambda *args, **kwargs: backend,
     )
     monkeypatch.setattr(
-        cli,
+        config,
         "CLNConfig",
         lambda **kwargs: captured.update(kwargs) or kwargs,
     )
 
-    cli.build_cln_config(
+    config.build_cln_config(
         settings=settings,
         resolved_mnemonic=_resolved_mnemonic(),
         amount=0,
@@ -539,6 +540,78 @@ def test_splice_in_skips_confirmation_with_yes(
     )
 
     assert confirms == [None]
+
+
+def test_peerswap_swap_in_calls_matching_cln_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_peerswap_config",
+        lambda **kwargs: captured.setdefault("config", object()),
+    )
+
+    def fake_run(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "_run_peerswap_rpc", fake_run)
+
+    cli.peerswap_swap_in(
+        short_channel_id="1x2x3",
+        amt_sat=250_000,
+        asset="btc",
+        premium_limit_ppm=25,
+        force=True,
+        cln_socket=Path("/tmp/lightning-rpc"),
+    )
+
+    assert captured["method"] == "peerswap-swap-in"
+    assert captured["params"] == {
+        "short_channel_id": "1x2x3",
+        "amt_sat": 250_000,
+        "asset": "btc",
+        "premium_limit_ppm": 25,
+        "force": True,
+    }
+    assert captured["cln_socket"] == Path("/tmp/lightning-rpc")
+
+
+def test_peerswap_swap_out_calls_matching_cln_rpc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    monkeypatch.setattr(
+        cli,
+        "_peerswap_config",
+        lambda **kwargs: captured.setdefault("config", object()),
+    )
+
+    def fake_run(**kwargs: Any) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(cli, "_run_peerswap_rpc", fake_run)
+
+    cli.peerswap_swap_out(
+        short_channel_id="1x2x3",
+        amt_sat=250_000,
+        asset="btc",
+        premium_rate_limit_ppm=25,
+        force=False,
+        cln_socket=Path("/tmp/lightning-rpc"),
+    )
+
+    assert captured["method"] == "peerswap-swap-out"
+    assert captured["params"] == {
+        "short_channel_id": "1x2x3",
+        "amt_sat": 250_000,
+        "asset": "btc",
+        "premium_rate_limit_ppm": 25,
+        "force": False,
+    }
+    assert captured["cln_socket"] == Path("/tmp/lightning-rpc")
 
 
 def _close_awaitable(awaitable: Any) -> None:

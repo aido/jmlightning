@@ -872,3 +872,38 @@ def test_get_fee_rate_rejects_non_positive_fee_rate() -> None:
         match="invalid fee rate",
     ):
         backend.get_fee_rate()
+
+
+def test_get_fee_rate_uses_explicit_cln_feerate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.parsefeerate.return_value = {"perkw": 11_000}
+
+    assert backend.get_fee_rate(feerate="urgent") == 2.75
+    rpc.parsefeerate.assert_called_once_with("urgent")
+    rpc.estimatefees.assert_not_called()
+
+
+def test_get_fee_rate_uses_fee_estimates_without_explicit_feerate() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [
+            {"blocks": 6, "feerate": 2_000},
+        ],
+    }
+
+    assert backend.get_fee_rate() == 2.0
+    rpc.parsefeerate.assert_not_called()

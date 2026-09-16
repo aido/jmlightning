@@ -40,7 +40,7 @@ from jmwallet.wallet.signing import verify_p2wpkh_signature
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan
 
-# BIP370 PSBT v2 global fields. jmwallet 0.37.0 only supports the
+# BIP370 PSBT v2 global fields. jmwallet only supports the
 # BIP174/v0 global fields, so the v2 transaction-structure fields are
 # removed when converting a CLN splice PSBT to v0.
 PSBT_GLOBAL_TX_VERSION = 0x02
@@ -326,14 +326,14 @@ class TxBuilder:
 
     @staticmethod
     def _remove_empty_witness_scripts(psbt: bytes) -> bytes:
-        """Remove empty witness-script records emitted by jmcore 0.37.0.
+        """Remove empty witness-script records emitted by jmcore.
 
-        jmcore 0.37.0 unconditionally serialises ``PSBT_IN_WITNESS_SCRIPT``
+        jmcore unconditionally serialises ``PSBT_IN_WITNESS_SCRIPT``
         even when the witness script is empty. An empty value is not a valid
         witness script record for a P2WPKH input and Core Lightning rejects the
         resulting PSBT. Keep this compatibility workaround local to the PSBT
         boundary rather than changing the transaction model or inserting a
-        fabricated script. This is a workaround for a jmcore 0.37.0 bug.
+        fabricated script. This is a workaround for a jmcore bug.
 
         Remove this workaround when the minimum supported jmcore version no
         longer emits empty witness-script records.
@@ -1146,7 +1146,7 @@ class TxBuilder:
     ) -> bytes:
         """Build the restricted PSBT presented to jmwallet for signing.
 
-        jmwallet 0.37.0 validates every P2WSH input as a fidelity bond during
+        jmwallet validates every P2WSH input as a fidelity bond during
         PSBT review. A CLN splice necessarily contains the channel's P2WSH
         funding input, so that input must not be interpreted as a JoinMarket
         fidelity bond. Only the approved JoinMarket inputs are allowed to
@@ -1204,12 +1204,14 @@ class TxBuilder:
         )
         unsigned_psbt = self._remove_empty_witness_scripts(unsigned_psbt)
 
-        return self._sign_psbt(
+        signed_tx, txid, signed_psbt = self._sign_psbt(
             unsigned_psbt=unsigned_psbt,
             tx=tx,
             signing_inputs=signing_inputs,
             wallet=wallet,
+            finalise_transaction=True,
         )
+        return signed_tx, txid, signed_psbt
 
     def _sign_psbt(
         self,
@@ -1217,6 +1219,7 @@ class TxBuilder:
         tx: ParsedTransaction,
         signing_inputs: Mapping[int, ClassifiedUTXO],
         wallet: WalletService,
+        finalise_transaction: bool = False,
     ) -> tuple[ParsedTransaction, str, bytes]:
         """Sign selected inputs in an existing PSBT and validate the result."""
 
@@ -1361,18 +1364,29 @@ class TxBuilder:
                     f"for input {index}"
                 )
 
+            signature = signatures[0].value
             if not verify_p2wpkh_signature(
                 tx,
                 index,
                 create_p2wpkh_script_code(expected_pubkey),
                 coin.utxo.value,
-                signatures[0].value,
+                signature,
                 expected_pubkey,
             ):
                 raise RuntimeError(
                     "JoinMarket wallet returned an invalid P2WPKH signature "
                     f"for input {index}"
                 )
+
+            if finalise_transaction:
+                # The PSBT signer returns a partial signature. Build the
+                # corresponding P2WPKH witness only for callers that
+                # broadcast the returned transaction directly.
+                if len(tx.witnesses) < len(tx.inputs):
+                    tx.witnesses.extend(
+                        [[] for _ in range(len(tx.inputs) - len(tx.witnesses))]
+                    )
+                tx.witnesses[index] = [signature, expected_pubkey]
 
         txid = self._txid(tx)
 

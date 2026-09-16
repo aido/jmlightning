@@ -203,6 +203,26 @@ class JoinMarketAdapter:
         """Return the connected wallet service."""
         return self._require_wallet()
 
+    async def get_mempool_min_fee(self) -> float | None:
+        """Return the Bitcoin node mempool minimum fee in sat/vB, if available."""
+        wallet = self._require_wallet()
+        getter = getattr(wallet.backend, "get_mempool_min_fee", None)
+        if not callable(getter):
+            return None
+
+        fee_rate = await getter()
+        if fee_rate is None:
+            return None
+        if not isinstance(fee_rate, (int, float)) or isinstance(fee_rate, bool):
+            raise RuntimeError(
+                "JoinMarket backend returned an invalid mempool fee rate"
+            )
+        if fee_rate <= 0:
+            raise RuntimeError(
+                "JoinMarket backend returned a non-positive mempool fee rate"
+            )
+        return float(fee_rate)
+
     def get_utxos(
         self,
         mixdepth: int,

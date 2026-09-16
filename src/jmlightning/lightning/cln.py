@@ -360,10 +360,32 @@ class CLNBackend(LightningBackend):
     def get_fee_rate(
         self,
         priority: FeePriority = FeePriority.NORMAL,
+        feerate: str | int | None = None,
     ) -> float:
+        """Return a fee rate in sat/vbyte suitable for planner().
+
+        When ``feerate`` is supplied, it is interpreted using CLN's native
+        feerate syntax. Otherwise the configured fee priority is used.
         """
-        Returns a fee rate in sat/vbyte suitable for planner().
-        """
+        if feerate is not None:
+            try:
+                result = self.rpc.parsefeerate(str(feerate))
+            except Exception as exc:
+                raise RuntimeError(f"Failed to parse CLN feerate: {exc}") from exc
+
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN parsefeerate returned an invalid response")
+
+            perkw = result.get("perkw")
+            if not isinstance(perkw, int) or isinstance(perkw, bool) or perkw <= 0:
+                raise RuntimeError("CLN parsefeerate returned an invalid fee rate")
+
+            fee_rate = perkw / 4000.0
+            if not isfinite(fee_rate) or fee_rate <= 0:
+                raise RuntimeError("CLN parsefeerate returned an invalid fee rate")
+
+            return fee_rate
+
         estimates = self._estimate_fees()
 
         mapping = {

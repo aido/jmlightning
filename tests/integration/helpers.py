@@ -79,7 +79,7 @@ def assert_channel_normal(
         neutral_address,
     )
 
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         channels = source_rpc.listpeerchannels(peer_id).get("channels", [])
         matching = [

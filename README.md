@@ -756,7 +756,7 @@ Use appropriate secret-management mechanisms for production deployments.
 │           ├── open_channel.py
 │           ├── multi_open_channel.py
 │           ├── splice.py
-│           └── swap.py
+│           └── peerswap.py
 │
 └── tests/
     ├── conftest.py
@@ -819,7 +819,7 @@ Implements multi-channel funding with one shared Bitcoin transaction.
 
 The operation uses the same policy boundary as `OpenChannelOperation`; adding multiple destinations does not expand the set of UTXOs permitted for channel funding.
 
-#### `operations/swap.py`
+#### `operations/peerswap.py`
 
 Placeholder for future swap functionality. No swap protocol is currently implemented.
 
@@ -915,7 +915,7 @@ The policy and planning layers should not need to know which Lightning implement
 
 ### Future Operations
 
-Submarine swaps is a planned extension. The current `operations/swap.py` file is a placeholders; it does not implement that operation yet.
+Submarine swaps is a planned extension. The current `operations/peerswap.py` file is a placeholders; it does not implement that operation yet.
 
 When implemented, additional operations must use the same capability-based policy boundary as channel funding. Provider- or protocol-specific details should remain inside the relevant operation unless a separate abstraction is justified by actual requirements.
 
