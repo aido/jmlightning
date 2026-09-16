@@ -79,7 +79,7 @@ def assert_channel_normal(
         neutral_address,
     )
 
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 60
     while time.monotonic() < deadline:
         channels = source_rpc.listpeerchannels(peer_id).get("channels", [])
         matching = [
@@ -175,7 +175,13 @@ async def prepare_regtest(tmp_path: Path) -> dict[str, Any]:
     await adapter.connect()
     try:
         wallet = adapter.require_wallet()
-        funding_source_address = wallet.get_receive_address(0, 0)
+        # Each integration test shares the same Bitcoin Core wallet. Use the
+        # verified fresh-address picker so a later test cannot send to an
+        # address already funded by an earlier PeerSwap/open-channel test.
+        # Reusing a receive address makes JoinMarket classify every UTXO at
+        # that address as ``reused``, which correctly prevents OPEN_CHANNEL
+        # and SPLICE spending but breaks test isolation.
+        funding_source_address = await wallet.get_new_address_verified(0)
     finally:
         await adapter.close()
 

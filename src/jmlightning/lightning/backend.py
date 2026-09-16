@@ -106,6 +106,7 @@ class LightningBackend(ABC):
     def get_fee_rate(
         self,
         priority: FeePriority = FeePriority.NORMAL,
+        feerate: str | int | None = None,
     ) -> float:
         """
         Returns a fee rate in sat/vbyte suitable for planner().

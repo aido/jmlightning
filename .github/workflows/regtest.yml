@@ -19,6 +19,8 @@ env:
   JMNG_VERSION: "0.37.0"
   BITCOIN_VERSION: "30.2"
   CLN_VERSION: "26.06.6"
+  PEERSWAP_VERSION: "7.0.0"
+  GO_VERSION: "1.23.4"
 
 jobs:
   regtest:
@@ -100,6 +102,26 @@ jobs:
 
           bitcoind --version | grep -F "${BITCOIN_VERSION}"
 
+      - name: Set up Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Build PeerSwap
+        run: |
+          set -euo pipefail
+
+          git clone --depth 1 --branch "v${PEERSWAP_VERSION}" \
+            https://github.com/ElementsProject/peerswap.git \
+            "$RUNNER_TEMP/peerswap"
+
+          cd "$RUNNER_TEMP/peerswap"
+          make cln-release
+
+          test -x peerswap
+          sudo install -m 0755 peerswap /usr/local/bin/peerswap
+          command -v peerswap
+
       - name: Install Core Lightning
         env:
           CLN_PLATFORM: "Ubuntu-24.04-amd64"
@@ -163,6 +185,23 @@ jobs:
           print("jmwallet:", jmwallet.__file__)
           print("jmlightning:", jmlightning.__file__)
           PY
+
+      - name: Verify jm-lightning and jm-peerswap entry points
+        run: |
+          set -euo pipefail
+
+          JM_LIGHTNING="$(command -v jm-lightning)"
+          JM_PEERSWAP="$(command -v jm-peerswap)"
+
+          test -x "$JM_LIGHTNING"
+          test -x "$JM_PEERSWAP"
+
+          "$JM_LIGHTNING" --help >/dev/null
+
+          printf '%s\n' \
+            '{"jsonrpc":"2.0","id":1,"method":"getmanifest","params":{}}' \
+            '' \
+            | timeout 10s "$JM_PEERSWAP" >/dev/null
 
       - name: Start Bitcoin Core
         env:
@@ -295,6 +334,7 @@ jobs:
             --network=regtest \
             --lightning-dir="$CLN_PEER1_DATADIR" \
             --rpc-file="$CLN_PEER1_RPC_SOCKET" \
+            --plugin="$(command -v jm-peerswap)" \
             --bitcoin-rpcconnect=127.0.0.1 \
             --bitcoin-rpcport=18443 \
             --bitcoin-rpcuser=test \
@@ -353,10 +393,13 @@ jobs:
 
             exit 1
           fi
-
-          lightning-cli \
+          PEER1_ID=$(lightning-cli \
             --rpc-file="$CLN_PEER1_RPC_SOCKET" \
-            getinfo
+            getinfo | jq -r '.id')
+          test -n "$PEER1_ID"
+          test "$PEER1_ID" != "null"
+          echo "CLN_PEER1_ID=$PEER1_ID" >> "$GITHUB_ENV"
+          echo "First CLN peer ready: $PEER1_ID"
 
       - name: Start Second Core Lightning peer
         env:
@@ -377,6 +420,7 @@ jobs:
             --network=regtest \
             --lightning-dir="$CLN_PEER2_DATADIR" \
             --rpc-file="$CLN_PEER2_RPC_SOCKET" \
+            --plugin="$(command -v jm-peerswap)" \
             --addr=127.0.0.1:19735 \
             --grpc-host=127.0.0.1 \
             --grpc-port=19736 \
@@ -447,6 +491,7 @@ jobs:
             --network=regtest \
             --lightning-dir="$CLN_PEER3_DATADIR" \
             --rpc-file="$CLN_PEER3_RPC_SOCKET" \
+            --plugin="$(command -v jm-peerswap)" \
             --addr=127.0.0.1:19737 \
             --grpc-host=127.0.0.1 \
             --grpc-port=19738 \
@@ -513,6 +558,46 @@ jobs:
               sleep 1
             done
             test "$connected" -eq 1
+          done
+
+      - name: Verify jm-peerswap RPC registration
+        run: |
+          set -euo pipefail
+
+          # PeerSwap waits for both Bitcoin and lightningd to report synced
+          # before it creates policy.conf and completes its init RPC. Wait for
+          # that file first rather than repeatedly issuing RPC calls that can
+          # remain outstanding while PeerSwap is still initialising.
+          for socket in \
+            "$CLN_PEER1_RPC_SOCKET" \
+            "$CLN_PEER2_RPC_SOCKET" \
+            "$CLN_PEER3_RPC_SOCKET"; do
+            policy_file="$(dirname "$socket")/peerswap/policy.conf"
+            ready=0
+            for _ in $(seq 1 150); do
+              if [ -f "$policy_file" ]; then
+                ready=1
+                break
+              fi
+              sleep 1
+            done
+
+            if [ "$ready" -ne 1 ]; then
+              echo "PeerSwap policy was not created for $socket"
+              echo
+              echo "=== CLN getinfo ==="
+              lightning-cli --rpc-file="$socket" getinfo || true
+              echo
+              echo "=== PeerSwap panic log ==="
+              panic_log="$(dirname "$socket")/peerswap/peerswap-panic-log"
+              cat "$panic_log" 2>/dev/null || true
+              echo
+              echo "=== CLN log ==="
+              cat "$(dirname "$(dirname "$socket")")/lightningd.log" 2>/dev/null || true
+              exit 1
+            fi
+
+            lightning-cli --rpc-file="$socket" peerswap-listswaps >/dev/null
           done
 
       - name: Run integration tests
@@ -584,6 +669,10 @@ jobs:
           find "$RUNNER_TEMP/cln-peer-1" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
 
           echo
+          echo "=== Primary PeerSwap panic log ==="
+          find "$RUNNER_TEMP/cln-peer-1" -name 'peerswap-panic-log' -print -exec cat {} \; 2>/dev/null || true
+
+          echo
           echo "=== Second Core Lightning peer files ==="
           find "$RUNNER_TEMP/cln-peer-2" -maxdepth 4 -type f -print 2>/dev/null || true
 
@@ -592,9 +681,17 @@ jobs:
           find "$RUNNER_TEMP/cln-peer-2" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
 
           echo
+          echo "=== Second PeerSwap panic log ==="
+          find "$RUNNER_TEMP/cln-peer-2" -name 'peerswap-panic-log' -print -exec cat {} \; 2>/dev/null || true
+
+          echo
           echo "=== Third Core Lightning peer files ==="
           find "$RUNNER_TEMP/cln-peer-3" -maxdepth 4 -type f -print 2>/dev/null || true
 
           echo
           echo "=== Third Core Lightning peer log ==="
           find "$RUNNER_TEMP/cln-peer-3" -name 'lightningd.log' -print -exec tail -200 {} \; 2>/dev/null || true
+
+          echo
+          echo "=== Third PeerSwap panic log ==="
+          find "$RUNNER_TEMP/cln-peer-3" -name 'peerswap-panic-log' -print -exec cat {} \; 2>/dev/null || true
