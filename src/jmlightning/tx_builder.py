@@ -752,7 +752,7 @@ class TxBuilder:
 
         The transaction supplied by Core Lightning remains authoritative.
         This method applies the already-approved JoinMarket execution plan:
-        it appends the planned input, adds the planned change output, and
+        it appends the planned input, adds the planned change output and
         updates the BIP174 unsigned-transaction record. Existing PSBT map
         records are retained unchanged.
 

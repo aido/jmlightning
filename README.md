@@ -1,6 +1,6 @@
 # ⚡ jmlightning
 
-**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels from JoinMarket-NG wallet UTXOs, including channel splice-in operations. Submarine swaps remain a planned extension.
+**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels, channel splice-in operations and PeerSwap transactions from JoinMarket-NG wallet UTXOs.
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -32,7 +32,7 @@ The relationship can be thought of as:
 - `jmlightning` plans and constructs the resulting Bitcoin transaction.
 - JoinMarket-NG is used to sign transactions with the wallet.
 - The Lightning node performs the Lightning-side channel operation.
-- Future operations, such as submarine swaps, remain subject to the same UTXO policy.
+- PeerSwap and future operations remain subject to the same UTXO policy.
 
 The project separates three concerns:
 
@@ -40,7 +40,7 @@ The project separates three concerns:
 2. **The policy engine** determines what each classified UTXO is permitted to be used for.
 3. **Operations and execution components** perform the requested action only after the policy layer has approved it.
 
-The initial focus is Lightning channel funding. The architecture is designed to support additional operations, including submarine swaps, without allowing execution code to bypass JoinMarket's UTXO policy.
+The project supports Lightning channel funding, channel splice-in operations and PeerSwap through operation-specific paths that cannot bypass JoinMarket's UTXO policy.
 
 ### The Privacy Problem
 
@@ -309,6 +309,75 @@ for the options supported by the installed version.
 
 ---
 
+### PeerSwap
+
+PeerSwap enables Lightning Network nodes to balance their channels by facilitating atomic swaps with direct peers. PeerSwap enhances decentralisation of the Lightning Network by enabling all nodes to be their own swap provider. No centralised coordinator, no 3rd party rent collector and lowest cost channel balancing means small nodes can better compete with large nodes.
+Futher information may be found at: https://github.com/ElementsProject/peerswap
+
+PeerSwap integration exposes the PeerSwap swap-in and swap-out RPCs through `jm-lightning`, while the JoinMarket side handles the PeerSwap transaction lifecycle through `txprepare`, `txsend` and `txdiscard`.
+
+The PeerSwap transaction path requests the `SWAP` capability. This is intentionally separate from `OPEN_CHANNEL` and `SPLICE`, so swap funding follows the policy assigned to CoinJoin change and other swap-eligible UTXOs.
+
+The PeerSwap CLN plugin is installed as the `jm-peerswap` entry point. It proxies the upstream PeerSwap plugin while intercepting the transaction RPCs that must be funded by JoinMarket-NG.
+
+#### PeerSwap Swap-In
+
+For example:
+
+```bash
+jm-lightning peerswap-swap-in \
+  <short-channel-id> \
+  1000000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The command initiates PeerSwap's `peerswap-swap-in` RPC. The application will:
+
+1. Dispatch the command to `PeerSwapRuntime`.
+2. Start the PeerSwap rendezvous workers.
+3. Call the PeerSwap RPC through CLN.
+4. Receive the PeerSwap `txprepare`, `txsend` or `txdiscard` request through the rendezvous path when PeerSwap needs JoinMarket-funded transaction handling.
+5. Filter JoinMarket UTXOs for the `SWAP` capability and the requested confirmation depth.
+6. Select, lock and sign the JoinMarket inputs into the PeerSwap transaction.
+7. Return the CLN-compatible prepared transaction, transaction ID and PSBT to PeerSwap.
+8. Broadcast on `txsend` or release the prepared transaction and its JoinMarket locks on `txdiscard`.
+
+#### PeerSwap Swap-Out
+
+Swap-out uses the same JoinMarket transaction boundary but invokes PeerSwap's `peerswap-swap-out` RPC:
+
+```bash
+jm-lightning peerswap-swap-out \
+  <short-channel-id> \
+  1000000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The `premium_rate_limit_ppm` argument is passed to PeerSwap unchanged. The `--force` option is also forwarded to PeerSwap rather than being interpreted by the JoinMarket transaction policy.
+
+PeerSwap transaction preparation is implemented in:
+
+```text
+src/jmlightning/operations/peerswap.py
+```
+
+The CLN-side bridge and rendezvous implementation lives in:
+
+```text
+src/jmpeerswap/
+```
+
+Run:
+
+```bash
+jm-lightning peerswap-swap-in --help
+jm-lightning peerswap-swap-out --help
+```
+
+for the options supported by the installed version.
+
 ### Sweep Mode
 
 A channel funding request with:
@@ -337,7 +406,7 @@ Only UTXOs permitted for `OPEN_CHANNEL` are included.
 
 ## 🏗 Architecture
 
-The project is deliberately divided into a small number of layers. The CLI dispatches to an operation; the operation coordinates policy, planning, transaction construction and CLN; the JoinMarket adapter isolates `jmwallet` details.
+The project is deliberately divided into a small number of layers. The CLI dispatches to an operation; the operation coordinates policy, planning, transaction construction and CLN; the JoinMarket adapter isolates `jmwallet` details. PeerSwap adds a CLN plugin/rendezvous boundary that routes transaction preparation back into the same policy and transaction layers.
 
 ```mermaid
 graph TD
@@ -355,6 +424,12 @@ graph TD
     PLANNER --> TX
     TX --> JM
     CLN -. implements .-> LB["LightningBackend"]
+
+    PS["jm-peerswap"] --> PROXY["PeerSwap CLN bridge"]
+    PROXY --> RS["PeerSwap rendezvous"]
+    RS --> PSOP["PeerSwapPrepareTxOperation"]
+    PSOP --> POLICY
+    PSOP --> TX
 ```
 
 ### Design Principles
@@ -521,6 +596,62 @@ The important property is that **CLN remains the transaction authority for the s
 
 As with channel funding, an ambiguous RPC outcome deliberately leaves the JoinMarket input locked for recovery rather than assuming the splice was abandoned.
 
+## 🤝 PeerSwap Flow
+
+PeerSwap uses a rendezvous layer between the CLN-side PeerSwap plugin and the JoinMarket operation. The transaction RPCs are deliberately intercepted so PeerSwap cannot select arbitrary wallet inputs outside the JoinMarket policy boundary.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant PS as PeerSwap
+    participant BR as jm-peerswap
+    participant CLN as Core Lightning
+    participant RV as PeerSwapRendezvous
+    participant OP as PeerSwapPrepareTxOperation
+    participant JM as JoinMarket-NG
+    participant P as PolicyEngine
+    participant TX as TxBuilder
+
+    PS->>BR: txprepare / txsend / txdiscard
+    BR->>RV: Intercept PeerSwap transaction RPC
+    RV-->>CLN: jmpeerswap-request
+    CLN-->>RV: Matched request
+    RV->>OP: Dispatch transaction method
+    OP->>JM: Discover classified UTXOs
+    JM-->>OP: Classified UTXOs
+    OP->>P: Filter for SWAP
+    P-->>OP: Policy-approved UTXOs
+    OP->>OP: Select and lock inputs
+    OP->>TX: Build and sign transaction
+    TX->>JM: Sign with JoinMarket wallet
+    JM-->>TX: Signed transaction
+    TX-->>OP: Prepared transaction + PSBT
+    OP-->>RV: CLN-compatible result
+    RV->>BR: jmpeerswap-response
+    BR-->>PS: PeerSwap RPC result
+    PS->>BR: txsend
+    BR->>RV: Forward txsend
+    RV->>OP: Broadcast prepared transaction
+    OP->>JM: Broadcast transaction
+    JM-->>OP: txid
+    OP->>JM: Release JoinMarket locks
+    OP-->>RV: txsend result
+    RV-->>BR: jmpeerswap-response
+    BR-->>PS: Broadcast result
+```
+
+### PeerSwap transaction lifecycle
+
+```text
+txprepare
+    │
+    ├── success ──► prepared state ──► txsend ──► broadcast + unlock
+    │
+    └── failure/cancel ──► txdiscard ──► release JoinMarket locks
+```
+
+The prepared transaction is retained between `txprepare` and `txsend`. A failed preparation releases the inputs; a successful broadcast is terminal and releases the JoinMarket locks. Ambiguous broadcast failures retain the prepared state so the transaction can be retried rather than silently assuming that the funds were not spent.
+
 ## 🔒 Policy Engine & Capabilities
 
 UTXOs are represented internally as classified coins with a set of capabilities.
@@ -622,6 +753,8 @@ Run the complete test suite with:
 pytest
 ```
 
+PeerSwap has dedicated unit and integration coverage for the transaction lifecycle and the CLN rendezvous boundary, including `txprepare`, `txsend`, `txdiscard`, PeerSwap RPC forwarding and regtest swap flows.
+
 ### Type Checking
 
 The project uses mypy for static type checking.
@@ -695,6 +828,10 @@ A CoinJoin change output can carry transaction-history information that makes it
 
 For this reason, the policy engine intentionally distinguishes `cj-out` from `cj-change` rather than treating both as generic "CoinJoin coins".
 
+### PeerSwap RPC Boundary
+
+PeerSwap transaction requests are restricted to `txprepare`, `txsend` and `txdiscard` at the JoinMarket rendezvous boundary. The JoinMarket operation validates request parameters before wallet state is touched and applies the `SWAP` capability before selecting any UTXO.
+
 ### Lightning RPC Security
 
 CLN's JSON-RPC socket grants significant control over the Lightning node.
@@ -733,44 +870,55 @@ Use appropriate secret-management mechanisms for production deployments.
 ├── LICENCE
 ├── README.md
 ├── src/
-│   └── jmlightning/
+│   ├── jmlightning/
+│   │   ├── __init__.py
+│   │   ├── cli.py
+│   │   ├── config.py
+│   │   ├── models.py
+│   │   ├── policy.py
+│   │   ├── planner.py
+│   │   ├── tx_builder.py
+│   │   │
+│   │   ├── adapters/
+│   │   │   ├── __init__.py
+│   │   │   └── joinmarket.py
+│   │   │
+│   │   ├── lightning/
+│   │   │   ├── __init__.py
+│   │   │   ├── backend.py
+│   │   │   └── cln.py
+│   │   │
+│   │   └── operations/
+│   │       ├── __init__.py
+│   │       ├── open_channel.py
+│   │       ├── multi_open_channel.py
+│   │       ├── splice.py
+│   │       └── peerswap.py
+│   │
+│   └── jmpeerswap/
 │       ├── __init__.py
-│       ├── cli.py
-│       ├── config.py
-│       ├── models.py
-│       ├── policy.py
-│       ├── planner.py
-│       ├── tx_builder.py
-│       │
-│       ├── adapters/
-│       │   ├── __init__.py
-│       │   └── joinmarket.py
-│       │
-│       ├── lightning/
-│       │   ├── __init__.py
-│       │   ├── backend.py
-│       │   └── cln.py
-│       │
-│       └── operations/
-│           ├── __init__.py
-│           ├── open_channel.py
-│           ├── multi_open_channel.py
-│           ├── splice.py
-│           └── peerswap.py
+│       ├── plugin.py
+│       ├── proxy.py
+│       └── rendezvous.py
 │
 └── tests/
     ├── conftest.py
     │
     ├── integration/
-    │   ├── helpers.py
-    │   ├── test_multi_open_channel_regtest.py
-    │   ├── test_open_channel_regtest.py
-    │   └── test_splice_regtest.py
+    │   ├── helpers.py
+    │   ├── test_multi_open_channel_regtest.py
+    │   ├── test_open_channel_regtest.py
+    │   ├── test_peerswap_rpc_regtest.py
+    │   ├── test_peerswap_rendezvous_flow.py
+    │   └── test_splice_regtest.py
     │
     └── unit/
         ├── test_cln.py
         ├── test_joinmarket_adapter.py
+        ├── test_jmpeerswap_plugin.py
         ├── test_open_channel.py
+        ├── test_peerswap_operation.py
+        ├── test_peerswap_rendezvous.py
         ├── test_planner.py
         ├── test_policy.py
         ├── test_splice.py
@@ -821,7 +969,7 @@ The operation uses the same policy boundary as `OpenChannelOperation`; adding mu
 
 #### `operations/peerswap.py`
 
-Placeholder for future swap functionality. No swap protocol is currently implemented.
+Implements the JoinMarket side of PeerSwap transaction preparation and the CLN rendezvous lifecycle. `PeerSwapPrepareTxOperation` handles `txprepare`, `txsend` and `txdiscard` while enforcing the `SWAP` capability, locking selected UTXOs and retaining prepared state until the transaction is broadcast or discarded. `PeerSwapOperationDispatcher` runs the asynchronous wallet operation on a persistent event loop so wallet resources remain tied to a single loop across the PeerSwap transaction lifecycle.
 
 #### `operations/splice.py`
 
@@ -836,6 +984,10 @@ Implements channel splice-in using a JoinMarket UTXO. `SpliceOperation` coordina
 - CLN splice completion and recovery-safe cleanup
 
 CLN remains responsible for the existing channel and the negotiated splice transaction; the operation signs only the JoinMarket input.
+
+#### `jmpeerswap/`
+
+Provides the standalone CLN plugin bridge for PeerSwap. The bridge proxies the upstream PeerSwap plugin, forwards normal PeerSwap RPCs and custom messages and intercepts `txprepare`, `txsend` and `txdiscard` through a bounded rendezvous queue so JoinMarket can perform the wallet-side transaction work.
 
 #### `models.py`
 
@@ -915,7 +1067,7 @@ The policy and planning layers should not need to know which Lightning implement
 
 ### Future Operations
 
-Submarine swaps is a planned extension. The current `operations/peerswap.py` file is a placeholders; it does not implement that operation yet.
+PeerSwap is implemented as the current swap integration. Future swap protocols or additional Lightning operations must use the same capability-based policy boundary as channel funding and PeerSwap.
 
 When implemented, additional operations must use the same capability-based policy boundary as channel funding. Provider- or protocol-specific details should remain inside the relevant operation unless a separate abstraction is justified by actual requirements.
 
@@ -941,13 +1093,13 @@ The project is being developed incrementally.
 - Multi-channel funding with shared transactions
 - Transaction construction and signing
 - Operation-oriented CLI architecture
+- PeerSwap integration through CLN
 - Strong typing and automated tests
 
 ### Future Work
 
 Potential future development includes:
 
-- **Submarine swaps**, potentially including PeerSwap via CLN
 - **Additional Lightning backends**
 
 - **More sophisticated policy-constrained coin selection**
