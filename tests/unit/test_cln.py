@@ -2,7 +2,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
-from jmlightning.lightning.backend import ChannelFundingStatus
+from jmlightning.lightning.backend import ChannelFundingStatus, FeePriority
 from jmlightning.lightning.cln import CLNBackend
 
 
@@ -736,6 +736,80 @@ def test_get_channel_funding_status_raises_if_state_cannot_be_read() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "peer_channels",
+    [
+        [],
+        {"channels": "invalid"},
+        {"channels": ["invalid"]},
+        {"channels": [{"inflight": "invalid"}]},
+        {"channels": [{"inflight": ["invalid"]}]},
+    ],
+)
+def test_get_channel_funding_status_rejects_malformed_peer_channel_data(
+    peer_channels: object,
+) -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.listpeerchannels.return_value = peer_channels
+
+    if peer_channels == []:
+        # An empty list is not a valid CLN response object.
+        expected = "CLN listpeerchannels returned an invalid response"
+    elif isinstance(peer_channels, dict) and peer_channels.get("channels") == "invalid":
+        expected = "CLN listpeerchannels returned invalid channels data"
+    elif isinstance(peer_channels, dict) and peer_channels.get("channels") == [
+        "invalid"
+    ]:
+        expected = "CLN listpeerchannels returned an invalid channel entry"
+    elif isinstance(peer_channels, dict) and peer_channels.get("channels") == [
+        {"inflight": "invalid"}
+    ]:
+        expected = "CLN listpeerchannels returned invalid inflight data"
+    else:
+        expected = "CLN listpeerchannels returned an invalid inflight channel entry"
+
+    with pytest.raises(RuntimeError, match=expected):
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid="11" * 32,
+        )
+
+
+@pytest.mark.parametrize("transactions", ["invalid", ["invalid"]])
+def test_get_channel_funding_status_rejects_malformed_transaction_data(
+    transactions: object,
+) -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.listpeerchannels.return_value = {"channels": []}
+    rpc.listtransactions.return_value = {"transactions": transactions}
+
+    expected = (
+        "CLN listtransactions returned invalid transactions data"
+        if transactions == "invalid"
+        else "CLN listtransactions returned an invalid transaction entry"
+    )
+
+    with pytest.raises(RuntimeError, match=expected):
+        backend.get_channel_funding_status(
+            peer_id="02" + "11" * 32,
+            txid="11" * 32,
+        )
+
+
 def test_get_splice_feerate_per_kw_returns_splice_rate() -> None:
     rpc = Mock()
     backend = CLNBackend("/tmp/lightning-rpc")
@@ -907,3 +981,56 @@ def test_get_fee_rate_uses_fee_estimates_without_explicit_feerate() -> None:
 
     assert backend.get_fee_rate() == 2.0
     rpc.parsefeerate.assert_not_called()
+
+
+def test_estimate_fees_validates_and_returns_entries() -> None:
+    rpc = Mock()
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.return_value = {
+        "feerates": [
+            {"blocks": 2, "feerate": 5_000},
+            {"blocks": 6, "feerate": 2_000},
+        ]
+    }
+
+    estimates = backend._estimate_fees()
+    assert [(item.blocks, item.sat_per_kvb) for item in estimates] == [
+        (2, 5_000),
+        (6, 2_000),
+    ]
+
+
+def test_estimate_fees_rejects_rpc_failure() -> None:
+    rpc = Mock()
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.estimatefees.side_effect = RuntimeError("rpc failed")
+
+    with pytest.raises(RuntimeError, match="Failed to retrieve fee estimates"):
+        backend._estimate_fees()
+
+
+def test_get_fee_rate_rejects_invalid_explicit_cln_rate() -> None:
+    rpc = Mock()
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.parsefeerate.return_value = {"perkw": 0}
+
+    with pytest.raises(RuntimeError, match="invalid fee rate"):
+        backend.get_fee_rate(
+            priority=FeePriority.NORMAL,
+            feerate="urgent",
+        )

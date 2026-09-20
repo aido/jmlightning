@@ -7,6 +7,48 @@ from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.models import ClassifiedUTXO
 
 
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_returns_none_when_backend_has_no_getter() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend = SimpleNamespace()
+
+    assert await adapter.get_mempool_min_fee() is None
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("value", [True, 0, -0.1, "0.1"])
+async def test_get_mempool_min_fee_rejects_invalid_backend_values(
+    value: object,
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_mempool_min_fee = AsyncMock(return_value=value)
+
+    with pytest.raises(RuntimeError, match="mempool fee rate"):
+        await adapter.get_mempool_min_fee()
+
+
+def test_unlock_retains_metadata_owner_when_release_fails(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    coin = classified_utxos[0]
+    adapter.lock(coin)
+    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
+    adapter.wallet.metadata_store.release_outpoints.side_effect = RuntimeError(
+        "metadata unavailable"
+    )
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        adapter.unlock(coin)
+
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    assert adapter._lock_owners[outpoint] == owner
+    assert outpoint in adapter._locked_utxos
+
+
 def test_get_utxos_returns_confirmed_classified_coins(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
@@ -598,3 +640,164 @@ async def test_get_raw_transaction_rejects_missing_transaction() -> None:
 
     with pytest.raises(RuntimeError, match="Unable to retrieve previous transaction"):
         await adapter.get_raw_transaction("11" * 32)
+
+
+@pytest.mark.anyio
+async def test_get_raw_transaction_rejects_invalid_hex() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_transaction = AsyncMock(
+        return_value=SimpleNamespace(raw="not-hex")
+    )
+
+    with pytest.raises(RuntimeError, match="invalid raw transaction"):
+        await adapter.get_raw_transaction("11" * 32)
+
+
+def test_get_utxos_excludes_unconfirmed_fidelity_and_locked_coins(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+
+    confirmed = classified_utxos[0].utxo
+    unconfirmed = SimpleNamespace(
+        txid="55" * 32,
+        vout=0,
+        confirmations=0,
+        frozen=False,
+        is_fidelity_bond=False,
+    )
+    fidelity = SimpleNamespace(
+        txid="66" * 32,
+        vout=0,
+        confirmations=6,
+        frozen=False,
+        is_fidelity_bond=True,
+    )
+    locked = classified_utxos[1].utxo
+    adapter._locked_utxos.add((locked.txid, locked.vout))
+
+    info = SimpleNamespace(
+        status="cj-out",
+        utxos=[confirmed, unconfirmed, fidelity, locked],
+    )
+
+    with patch.object(
+        adapter,
+        "_address_infos",
+        side_effect=[
+            [info],
+            [],
+        ],
+    ):
+        result = adapter.get_utxos(mixdepth=0)
+
+    assert [coin.utxo for coin in result] == [confirmed]
+
+
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_returns_none_when_backend_has_no_capability() -> (
+    None
+):
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend = Mock(spec=[])
+
+    assert await adapter.get_mempool_min_fee() is None
+
+
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_rejects_non_positive_value() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_mempool_min_fee = AsyncMock(return_value=0)
+
+    with pytest.raises(RuntimeError, match="non-positive mempool fee rate"):
+        await adapter.get_mempool_min_fee()
+
+
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_rejects_boolean_value() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_mempool_min_fee = AsyncMock(return_value=True)
+
+    with pytest.raises(RuntimeError, match="invalid mempool fee rate"):
+        await adapter.get_mempool_min_fee()
+
+
+def test_unlock_restores_owner_when_metadata_store_is_missing(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
+
+    coin = classified_utxos[0]
+    adapter.lock(coin)
+    adapter.wallet.metadata_store = None
+
+    with pytest.raises(RuntimeError, match="without a data directory"):
+        adapter.unlock(coin)
+
+    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
+
+
+def test_unlock_restores_owner_when_metadata_release_fails(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    coin = classified_utxos[0]
+    adapter.lock(coin)
+    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
+    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
+    adapter.wallet.metadata_store.release_outpoints.side_effect = RuntimeError(
+        "release failed"
+    )
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        adapter.unlock(coin)
+
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    assert adapter._lock_owners[outpoint] == owner
+    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
+    assert outpoint in adapter._locked_utxos
+
+
+def test_unlock_rejects_missing_metadata_store(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    coin = classified_utxos[0]
+    adapter.lock(coin)
+    adapter.wallet.metadata_store = None
+
+    with pytest.raises(RuntimeError, match="without a data directory"):
+        adapter.unlock(coin)
+
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    assert outpoint in adapter._lock_owners
+    assert outpoint in adapter._locked_utxos
+
+
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_rejects_invalid_backend_value() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_mempool_min_fee = AsyncMock(return_value="0.1")
+
+    with pytest.raises(RuntimeError, match="invalid mempool fee rate"):
+        await adapter.get_mempool_min_fee()
+
+
+@pytest.mark.anyio
+async def test_get_mempool_min_fee_rejects_non_positive_backend_value() -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.backend.get_mempool_min_fee = AsyncMock(return_value=0)
+
+    with pytest.raises(RuntimeError, match="non-positive mempool fee rate"):
+        await adapter.get_mempool_min_fee()

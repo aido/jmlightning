@@ -3,5 +3,6 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 mypy-html/
+.coverage
 mypy-junit.xml
 ruff-junit.xml

@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import replace
 from types import SimpleNamespace
 from typing import cast
@@ -20,7 +21,7 @@ from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, parse_psbt
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.models import ClassifiedUTXO
-from jmlightning.planner import ExecutionPlan, Planner
+from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
 from jmlightning.tx_builder import TxBuilder
 
 
@@ -206,6 +207,142 @@ def _build_splice_plan(
     )
 
 
+def test_cln_input_weight_rejects_unsupported_script() -> None:
+    builder = TxBuilder()
+    tx_input = TxInput.from_hex(
+        txid="11" * 32,
+        vout=0,
+        sequence=0xFFFFFFFF,
+        value=100_000,
+        scriptpubkey="76a914" + "11" * 20 + "88ac",
+    )
+    psbt = create_psbt(
+        version=2,
+        inputs=[tx_input],
+        outputs=[],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=100_000,
+                witness_utxo_script=tx_input.scriptpubkey,
+                witness_script=b"",
+                sighash_type=1,
+            )
+        ],
+    )
+    parsed = parse_psbt(psbt)
+
+    with pytest.raises(ValueError, match="Unsupported splice input script type"):
+        builder._cln_input_weight(parsed, 0)
+
+
+def test_cln_input_weight_uses_non_witness_utxo() -> None:
+    builder = TxBuilder()
+    previous_output = TxOutput.from_address(
+        "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        100_000,
+    )
+    previous_input = TxInput.from_hex(
+        txid="aa" * 32,
+        vout=0,
+        sequence=0xFFFFFFFF,
+        value=100_000,
+        scriptpubkey=previous_output.script.hex(),
+    )
+    previous_tx = ParsedTransaction(
+        version=2,
+        inputs=[previous_input],
+        outputs=[previous_output],
+        witnesses=[],
+        locktime=0,
+        has_witness=False,
+    )
+    tx_input = TxInput.from_hex(
+        txid=builder._txid(previous_tx),
+        vout=0,
+        sequence=0xFFFFFFFF,
+        value=100_000,
+        scriptpubkey=previous_output.script.hex(),
+    )
+    psbt = create_psbt(
+        version=2,
+        inputs=[tx_input],
+        outputs=[],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=100_000,
+                witness_utxo_script=previous_output.script,
+                witness_script=b"",
+            )
+        ],
+    )
+    parsed = parse_psbt(psbt)
+    parsed.input_maps[0].records = [
+        record for record in parsed.input_maps[0].records if record.key != b"\x01"
+    ]
+    parsed.input_maps[0].append(
+        b"\x00",
+        serialize_transaction(
+            previous_tx.version,
+            previous_tx.inputs,
+            previous_tx.outputs,
+            previous_tx.locktime,
+        ),
+    )
+
+    assert builder._cln_input_weight(parsed, 0) == 271
+
+
+def test_cln_input_weight_rejects_non_witness_utxo_with_missing_output() -> None:
+    builder = TxBuilder()
+    previous_tx = ParsedTransaction(
+        version=2,
+        inputs=[],
+        outputs=[],
+        witnesses=[],
+        locktime=0,
+        has_witness=False,
+    )
+    tx_input = TxInput.from_hex(
+        txid=builder._txid(previous_tx),
+        vout=0,
+        sequence=0xFFFFFFFF,
+        value=100_000,
+        scriptpubkey="0014" + "11" * 20,
+    )
+    psbt = create_psbt(
+        version=2,
+        inputs=[tx_input],
+        outputs=[],
+        locktime=0,
+        psbt_inputs=[
+            PSBTInput(
+                witness_utxo_value=100_000,
+                witness_utxo_script=tx_input.scriptpubkey,
+                witness_script=b"",
+            )
+        ],
+    )
+    parsed = parse_psbt(psbt)
+    parsed.input_maps[0].records = [
+        record for record in parsed.input_maps[0].records if record.key != b"\x01"
+    ]
+    parsed.input_maps[0].append(
+        b"\x00",
+        serialize_transaction(
+            previous_tx.version,
+            previous_tx.inputs,
+            previous_tx.outputs,
+            previous_tx.locktime,
+            previous_tx.witnesses,
+        ),
+    )
+
+    with pytest.raises(ValueError, match="Invalid non-witness UTXO record"):
+        builder._cln_input_weight(parsed, 0)
+
+
 def test_normalise_cln_psbt_v2_to_v0_preserves_metadata() -> None:
     builder = TxBuilder()
 
@@ -290,6 +427,106 @@ def test_add_splice_in_input_accepts_cln_psbt_v2_and_preserves_metadata(
         record.key == b"\xfccln-output" and record.value == b"output metadata"
         for record in parsed.output_maps[0].records
     )
+
+
+def test_build_and_sign_multifunding_tx_builds_all_outputs_and_change(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    plan = ExecutionPlan(
+        inputs=classified_utxos[:2],
+        amount=150_000,
+        fee=1_000,
+        vsize=1_000,
+        change=49_000,
+        warnings=[],
+        rationale="test multifunding plan",
+        funding_outputs=[
+            FundingOutput(amount=75_000, output_type="p2wsh"),
+            FundingOutput(amount=75_000, output_type="p2wsh"),
+        ],
+    )
+
+    tx, txid, psbt = builder.build_and_sign_multifunding_tx(
+        plan=plan,
+        funding_addresses=[
+            "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+        ],
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+    )
+
+    assert len(tx.inputs) == 2
+    assert [output.value for output in tx.outputs] == [75_000, 75_000, 49_000]
+    assert txid
+    assert psbt
+    wallet.prepare_psbt_signing.assert_called_once()
+    wallet.sign_psbt.assert_called_once()
+
+
+def test_build_and_sign_multifunding_tx_rejects_address_count_mismatch(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    plan = ExecutionPlan(
+        inputs=classified_utxos[:2],
+        amount=150_000,
+        fee=1_000,
+        vsize=1_000,
+        change=49_000,
+        warnings=[],
+        rationale="test multifunding plan",
+        funding_outputs=[FundingOutput(amount=150_000, output_type="p2wsh")],
+    )
+
+    with pytest.raises(ValueError, match="output and address counts"):
+        builder.build_and_sign_multifunding_tx(
+            plan=plan,
+            funding_addresses=[],
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
+
+
+def test_build_and_sign_multifunding_tx_rejects_wallet_key_script_mismatch(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    wallet = _mock_wallet()
+    wallet.get_key_for_address.return_value.get_public_key_bytes.return_value = (
+        b"\x02" * 33
+    )
+    plan = ExecutionPlan(
+        inputs=classified_utxos[:2],
+        amount=150_000,
+        fee=1_000,
+        vsize=1_000,
+        change=49_000,
+        warnings=[],
+        rationale="test multifunding plan",
+        funding_outputs=[
+            FundingOutput(amount=75_000, output_type="p2wsh"),
+            FundingOutput(amount=75_000, output_type="p2wsh"),
+        ],
+    )
+
+    with pytest.raises(RuntimeError, match="does not match funding input script"):
+        builder.build_and_sign_multifunding_tx(
+            plan=plan,
+            funding_addresses=[
+                "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+                "bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
+            ],
+            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+            wallet=wallet,
+        )
+
+    wallet.prepare_psbt_signing.assert_not_called()
 
 
 def test_build_and_sign_funding_tx_creates_funding_output(
@@ -1579,3 +1816,56 @@ def test_sign_splice_psbt_rejects_invalid_signing_index(
             signing_inputs={1: classified_utxos[2]},
             wallet=_mock_wallet(),
         )
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda plan: replace(plan, inputs=[]), "at least one input"),
+        (lambda plan: replace(plan, amount=-1), "amount must be positive"),
+        (lambda plan: replace(plan, fee=-1), "fee cannot be negative"),
+        (lambda plan: replace(plan, change=-1), "change cannot be negative"),
+    ],
+)
+def test_validate_plan_rejects_invalid_financial_invariants(
+    classified_utxos: list[ClassifiedUTXO],
+    mutate: Callable[[ExecutionPlan], ExecutionPlan],
+    message: str,
+) -> None:
+    builder = TxBuilder()
+    plan = _build_funding_plan(classified_utxos)
+    invalid = mutate(plan)
+
+    with pytest.raises(ValueError, match=message):
+        builder._validate_plan(invalid)
+
+
+def test_validate_plan_rejects_duplicate_inputs(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_funding_plan(classified_utxos)
+    duplicate = replace(plan, inputs=[plan.inputs[0], plan.inputs[0]])
+
+    with pytest.raises(ValueError, match="duplicate inputs"):
+        builder._validate_plan(duplicate)
+
+
+def test_validate_plan_rejects_inconsistent_amounts(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    builder = TxBuilder()
+    plan = _build_funding_plan(classified_utxos)
+    inconsistent = replace(plan, change=plan.change + 1)
+
+    with pytest.raises(ValueError, match="inconsistent amounts"):
+        builder._validate_plan(inconsistent)
+
+
+def test_new_cln_serial_id_is_even_and_unique() -> None:
+    builder = TxBuilder()
+
+    serial_id = builder._new_cln_serial_id({2, 4, 6})
+
+    assert serial_id % 2 == 0
+    assert serial_id not in {2, 4, 6}

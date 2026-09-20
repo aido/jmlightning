@@ -43,6 +43,7 @@ jobs:
       - name: Unit tests
         run: |
           pytest tests/unit/ \
+            --cov-branch \
             --cov=jmlightning \
             --cov-report=term-missing \
             --cov-report=xml \

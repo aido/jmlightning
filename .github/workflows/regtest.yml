@@ -614,6 +614,7 @@ jobs:
           set -euo pipefail
 
           pytest tests/integration \
+            --cov-branch \
             --cov=jmlightning \
             --cov-report=term-missing \
             --cov-report=xml \

@@ -165,3 +165,76 @@ def test_dispatcher_close_closes_operation_before_event_loop() -> None:
     dispatcher.close()
 
     operation.close.assert_awaited_once()
+
+
+def test_rendezvous_client_rejects_invalid_pool_size() -> None:
+    with pytest.raises(ValueError, match="pool_size must be positive"):
+        PeerSwapRendezvousClient(Path("/tmp/lightning-rpc"), Mock(), pool_size=0)
+
+
+def test_rendezvous_client_rejects_unsupported_method() -> None:
+    calls: list[tuple[str, Any]] = []
+    rpc = FakeRpc(calls)
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"), Mock(), rpc_factory=lambda _: rpc
+    )
+
+    client._handle_request(
+        rpc,
+        {"request_id": "req-1", "method": "unknown", "params": {}},
+    )
+
+    assert calls[-1] == (
+        "jmpeerswap-response",
+        {
+            "request_id": "req-1",
+            "error": {"code": -32601, "message": "Unsupported PeerSwap request"},
+        },
+    )
+
+
+def test_rendezvous_client_converts_unexpected_handler_error_to_rpc_error() -> None:
+    calls: list[tuple[str, Any]] = []
+    rpc = FakeRpc(calls)
+
+    def handler(method: str, params: Any) -> Any:
+        del method, params
+        raise RuntimeError("backend failed")
+
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"), handler, rpc_factory=lambda _: rpc
+    )
+    client._handle_request(
+        rpc,
+        {"request_id": "req-2", "method": "txsend", "params": {}},
+    )
+
+    assert calls[-1] == (
+        "jmpeerswap-response",
+        {
+            "request_id": "req-2",
+            "error": {"code": -32603, "message": "backend failed"},
+        },
+    )
+
+
+def test_dispatcher_rejects_unsupported_method() -> None:
+    operation = Mock()
+    operation.close = AsyncMock()
+    dispatcher = PeerSwapOperationDispatcher(cast(Any, operation))
+
+    with pytest.raises(ValueError, match="Unsupported PeerSwap request"):
+        dispatcher("unknown", {})
+
+    dispatcher.close()
+
+
+def test_dispatcher_rejects_invalid_transaction_id() -> None:
+    operation = Mock()
+    operation.close = AsyncMock()
+    dispatcher = PeerSwapOperationDispatcher(cast(Any, operation))
+
+    with pytest.raises(ValueError, match="64-character hexadecimal"):
+        dispatcher("txsend", {"txid": "not-a-txid"})
+
+    dispatcher.close()

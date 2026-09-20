@@ -438,6 +438,101 @@ async def test_discard_rejects_non_prepared_phase() -> None:
     assert operation._prepared[prepared.txid] is prepared
 
 
+@pytest.mark.parametrize("feerate", [True, False, 1.5, []])
+def test_txprepare_rejects_invalid_feerate_types(feerate: object) -> None:
+    with pytest.raises(ValueError, match="txprepare feerate"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {
+                "outputs": [{PEERSWAP_OUTPUT_ADDRESS: 100_000}],
+                "feerate": feerate,
+            }
+        )
+
+
+@pytest.mark.parametrize("minconf", [True, False, 1.5, "1"])
+def test_txprepare_rejects_invalid_minconf_types(minconf: object) -> None:
+    with pytest.raises(ValueError, match="txprepare minconf must be a uint32"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {
+                "outputs": [{PEERSWAP_OUTPUT_ADDRESS: 100_000}],
+                "minconf": minconf,
+            }
+        )
+
+
+def test_txprepare_rejects_invalid_sat_amount() -> None:
+    with pytest.raises(ValueError, match="Invalid txprepare output amount"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {
+                "outputs": [{PEERSWAP_OUTPUT_ADDRESS: "not-a-number-sat"}],
+            }
+        )
+
+
+@pytest.mark.anyio
+async def test_send_rejects_unexpected_broadcast_txid() -> None:
+    coin = _coin()
+    adapter = Mock()
+    adapter.broadcast = AsyncMock(return_value="33" * 32)
+    adapter.close = AsyncMock()
+
+    operation = PeerSwapPrepareTxOperation(
+        config=Mock(mixdepth=0),
+        cln_socket=Path("/tmp/lightning-rpc"),
+    )
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"",
+        phase=PeerSwapPhase.PREPARED,
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with pytest.raises(RuntimeError, match="unexpected transaction id"):
+        await operation.send(prepared.txid)
+
+    adapter.unlock.assert_not_called()
+    adapter.close.assert_not_awaited()
+    assert operation._prepared[prepared.txid] is prepared
+
+
+@pytest.mark.anyio
+async def test_send_completes_broadcast_even_when_cleanup_fails() -> None:
+    coin = _coin()
+    adapter = Mock()
+    adapter.broadcast = AsyncMock(return_value="22" * 32)
+    adapter.unlock.side_effect = RuntimeError("unlock failed")
+    adapter.close = AsyncMock(side_effect=RuntimeError("close failed"))
+
+    operation = PeerSwapPrepareTxOperation(
+        config=Mock(mixdepth=0),
+        cln_socket=Path("/tmp/lightning-rpc"),
+    )
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"",
+        phase=PeerSwapPhase.PREPARED,
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with patch(
+        "jmlightning.operations.peerswap.serialize_transaction",
+        return_value=b"signed-tx",
+    ):
+        result = await operation.send(prepared.txid)
+
+    assert result["txid"] == "22" * 32
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    assert operation._prepared == {}
+    adapter.unlock.assert_called_once_with(coin)
+    adapter.close.assert_awaited_once()
+
+
 def test_txprepare_rejects_invalid_output_address() -> None:
     with pytest.raises(ValueError, match="Invalid txprepare output address 0"):
         PeerSwapPrepareTxRequest.from_rpc(
@@ -786,3 +881,132 @@ async def test_txprepare_rejects_invalid_transaction_id_from_builder() -> None:
     adapter.unlock.assert_called_once_with(coin)
     adapter.close.assert_awaited_once()
     assert operation._prepared == {}
+
+
+def test_txprepare_rejects_boolean_feerate() -> None:
+    with pytest.raises(ValueError, match="feerate must be a string or integer"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {"outputs": [{PEERSWAP_OUTPUT_ADDRESS: 1000}], "feerate": True}
+        )
+
+
+def test_txprepare_rejects_boolean_amount() -> None:
+    with pytest.raises(ValueError, match="Invalid txprepare output amount"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {"outputs": [{PEERSWAP_OUTPUT_ADDRESS: True}]}
+        )
+
+
+def test_txprepare_rejects_boolean_minconf() -> None:
+    with pytest.raises(ValueError, match="minconf must be a uint32"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {"outputs": [{PEERSWAP_OUTPUT_ADDRESS: 1000}], "minconf": True}
+        )
+
+
+@pytest.mark.anyio
+async def test_send_rejects_broadcast_transaction_id_mismatch() -> None:
+    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+    adapter = Mock()
+    adapter.broadcast = AsyncMock(return_value="33" * 32)
+    adapter.close = AsyncMock()
+    coin = _coin()
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"psbt",
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with pytest.raises(RuntimeError, match="unexpected transaction id"):
+        await operation.send(prepared.txid)
+
+    assert operation._prepared[prepared.txid] is prepared
+    assert prepared.phase is PeerSwapPhase.PREPARED
+    adapter.close.assert_not_awaited()
+    adapter.unlock.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_send_releases_locks_when_unlock_fails() -> None:
+    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+    adapter = Mock()
+    adapter.broadcast = AsyncMock(return_value="22" * 32)
+    adapter.close = AsyncMock()
+    adapter.unlock.side_effect = RuntimeError("unlock failed")
+    coin = _coin()
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"psbt",
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with patch(
+        "jmlightning.operations.peerswap.serialize_transaction",
+        return_value=b"signed-tx",
+    ):
+        result = await operation.send(prepared.txid)
+
+    assert result["txid"] == prepared.txid
+    assert prepared.txid not in operation._prepared
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.unlock.assert_called_once_with(coin)
+    adapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_send_reports_close_failure_after_broadcast_cleanup() -> None:
+    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+    adapter = Mock()
+    adapter.broadcast = AsyncMock(return_value="22" * 32)
+    adapter.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    coin = _coin()
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"psbt",
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with patch(
+        "jmlightning.operations.peerswap.serialize_transaction",
+        return_value=b"signed-tx",
+    ):
+        result = await operation.send(prepared.txid)
+
+    assert result["txid"] == prepared.txid
+    assert prepared.txid not in operation._prepared
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.unlock.assert_called_once_with(coin)
+    adapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_discard_reports_close_failure_after_releasing_locks() -> None:
+    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+    adapter = Mock()
+    adapter.close = AsyncMock(side_effect=RuntimeError("close failed"))
+    coin = _coin()
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"psbt",
+    )
+    operation._prepared[prepared.txid] = prepared
+
+    with pytest.raises(RuntimeError, match="Failed to fully clean up"):
+        await operation.discard(prepared.txid)
+
+    assert prepared.txid not in operation._prepared
+    assert prepared.phase is PeerSwapPhase.DISCARDED
+    adapter.unlock.assert_called_once_with(coin)
+    adapter.close.assert_awaited_once()
