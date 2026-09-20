@@ -84,11 +84,12 @@ are enforced by the policy layer rather than relying on the CLI user to make the
 ### Requirements
 
 - Python **3.11 or newer**
-- JoinMarket-NG
-  - `jmcore`
-  - `jmwallet`
+- JoinMarket-NG (`jmcore` and `jmwallet`) for the `jmlightning` host
 - Core Lightning for channel funding
+- The upstream PeerSwap plugin if PeerSwap is enabled
 - A CLN JSON-RPC Unix socket accessible by the process running `jmlightning`
+
+For a normal channel-funding deployment only `jmlightning` is required. PeerSwap adds the separate `jmpeerswap` CLN plugin on the Lightning node.
 
 The exact dependency versions are defined by `pyproject.toml`.
 
@@ -99,11 +100,48 @@ git clone https://github.com/aido/jmlightning.git
 cd jmlightning
 ```
 
-### Install
+The repository contains two independently installable Python projects:
+
+- `jmlightning/` - the JoinMarket-NG bridge library and `jm-lightning` CLI.
+- `jmpeerswap/` - the standalone Core Lightning plugin bridge used when PeerSwap is enabled.
+
+They have deliberately separate `pyproject.toml` files and can be installed on different hosts.
+
+### Install jmlightning
+
+Install `jmlightning` on the host that has access to the JoinMarket-NG wallet and will run the `jm-lightning` commands:
 
 ```bash
-pip install -e .
+cd jmlightning
+pip install -e ./jmlightning
 ```
+
+This installs the `jmlightning` package and the `jm-lightning` CLI.
+
+### Install jmpeerswap
+
+If PeerSwap is to be used, install the `jmpeerswap` plugin on the **Core Lightning node**. It is a separate package from `jmlightning` and does not need the JoinMarket wallet on the Lightning host:
+
+```bash
+cd jmlightning
+pip install -e ./jmpeerswap
+```
+
+This installs the `jm-peerswap` CLN plugin entry point. The plugin runs on the Lightning node and proxies the upstream PeerSwap plugin while providing the rendezvous boundary used by `jmlightning`.
+
+The upstream PeerSwap plugin is still required. Configure `jm-peerswap` to proxy the upstream PeerSwap executable if it is not available as `peerswap` on the Lightning node.
+
+The two installations are independent: `jmlightning` belongs on the JoinMarket host, while `jmpeerswap` belongs on the Lightning node. They communicate through the Core Lightning RPC/rendezvous interface; `jmpeerswap` does not import or require the `jmlightning` Python package. The hosts therefore do not need to share a filesystem or Python environment.
+
+On the Lightning node, enable the bridge plugin in the CLN configuration (or with the equivalent `lightningd` option):
+
+```text
+plugin=/path/to/venv/bin/jm-peerswap
+```
+
+`jm-peerswap` defaults to launching an upstream PeerSwap executable named `peerswap`. If the upstream executable is installed elsewhere, configure the bridge's `peerswap-plugin` option to point to it.
+
+The JoinMarket host does not need to install `jmpeerswap` just to run `jm-lightning`. Conversely, the Lightning node does not need the `jmlightning` package or JoinMarket wallet dependencies merely to run `jm-peerswap`.
 
 ---
 
@@ -312,13 +350,18 @@ for the options supported by the installed version.
 ### PeerSwap
 
 PeerSwap enables Lightning Network nodes to balance their channels by facilitating atomic swaps with direct peers. PeerSwap enhances decentralisation of the Lightning Network by enabling all nodes to be their own swap provider. No centralised coordinator, no 3rd party rent collector and lowest cost channel balancing means small nodes can better compete with large nodes.
-Futher information may be found at: https://github.com/ElementsProject/peerswap
+Further information may be found at: https://github.com/ElementsProject/peerswap
 
-PeerSwap integration exposes the PeerSwap swap-in and swap-out RPCs through `jm-lightning`, while the JoinMarket side handles the PeerSwap transaction lifecycle through `txprepare`, `txsend` and `txdiscard`.
+PeerSwap integration has two separate components:
+
+- `jmlightning` runs on the JoinMarket host and exposes the `peerswap-swap-in` and `peerswap-swap-out` commands. It owns the JoinMarket wallet access, UTXO policy and transaction preparation.
+- `jmpeerswap` runs as a Core Lightning plugin on the Lightning node. It proxies the upstream PeerSwap plugin and intercepts `txprepare`, `txsend` and `txdiscard` so the JoinMarket side can perform the wallet-specific transaction work.
+
+The two components do not need to run on the same host. The Lightning node only needs `jmpeerswap` and the upstream PeerSwap plugin; the JoinMarket host needs `jmlightning` and access to the relevant CLN RPC socket.
 
 The PeerSwap transaction path requests the `SWAP` capability. This is intentionally separate from `OPEN_CHANNEL` and `SPLICE`, so swap funding follows the policy assigned to CoinJoin change and other swap-eligible UTXOs.
 
-The PeerSwap CLN plugin is installed as the `jm-peerswap` entry point. It proxies the upstream PeerSwap plugin while intercepting the transaction RPCs that must be funded by JoinMarket-NG.
+The PeerSwap CLN plugin is installed as the `jm-peerswap` entry point. It proxies the upstream PeerSwap plugin while intercepting the transaction RPCs that must be funded by JoinMarket-NG. The plugin is intentionally a standalone package so it can be installed directly on the Lightning node without installing the JoinMarket wallet integration there.
 
 #### PeerSwap Swap-In
 
@@ -604,19 +647,21 @@ PeerSwap uses a rendezvous layer between the CLN-side PeerSwap plugin and the Jo
 sequenceDiagram
     autonumber
     participant PS as PeerSwap
-    participant BR as jm-peerswap
+    participant BR as jm-peerswap<br/>Lightning node
     participant CLN as Core Lightning
-    participant RV as PeerSwapRendezvous
+    participant RV as PeerSwap rendezvous
+    participant JMHOST as jmlightning<br/>JoinMarket host
     participant OP as PeerSwapPrepareTxOperation
     participant JM as JoinMarket-NG
     participant P as PolicyEngine
     participant TX as TxBuilder
 
     PS->>BR: txprepare / txsend / txdiscard
-    BR->>RV: Intercept PeerSwap transaction RPC
-    RV-->>CLN: jmpeerswap-request
-    CLN-->>RV: Matched request
-    RV->>OP: Dispatch transaction method
+    BR->>CLN: Intercept PeerSwap transaction RPC
+    CLN->>RV: jmpeerswap-request
+    JMHOST->>CLN: jmpeerswap-request
+    CLN-->>JMHOST: Matched request
+    JMHOST->>OP: Dispatch transaction method
     OP->>JM: Discover classified UTXOs
     JM-->>OP: Classified UTXOs
     OP->>P: Filter for SWAP
@@ -626,17 +671,20 @@ sequenceDiagram
     TX->>JM: Sign with JoinMarket wallet
     JM-->>TX: Signed transaction
     TX-->>OP: Prepared transaction + PSBT
-    OP-->>RV: CLN-compatible result
-    RV->>BR: jmpeerswap-response
+    OP-->>JMHOST: CLN-compatible result
+    JMHOST->>CLN: jmpeerswap-response
+    CLN-->>BR: PeerSwap RPC result
     BR-->>PS: PeerSwap RPC result
     PS->>BR: txsend
-    BR->>RV: Forward txsend
-    RV->>OP: Broadcast prepared transaction
+    BR->>CLN: Intercept txsend
+    CLN->>JMHOST: Matched rendezvous request
+    JMHOST->>OP: Broadcast prepared transaction
     OP->>JM: Broadcast transaction
     JM-->>OP: txid
     OP->>JM: Release JoinMarket locks
-    OP-->>RV: txsend result
-    RV-->>BR: jmpeerswap-response
+    OP-->>JMHOST: txsend result
+    JMHOST->>CLN: jmpeerswap-response
+    CLN-->>BR: Broadcast result
     BR-->>PS: Broadcast result
 ```
 
@@ -737,7 +785,7 @@ The important architectural point is that the planner receives **already policy-
 
 ## 🧪 Testing
 
-The project currently has a test suite covering:
+The repository test suite covers both independently installable packages and their integration:
 
 - Core Lightning backend behaviour
 - JoinMarket wallet adaptation
@@ -746,6 +794,7 @@ The project currently has a test suite covering:
 - Bitcoin transaction construction
 - channel opening and splice-in operations
 - CLN/JoinMarket regtest workflows for channel funding and splice-in
+- PeerSwap plugin, rendezvous and JoinMarket transaction lifecycle tests
 
 Run the complete test suite with:
 
@@ -866,40 +915,45 @@ Use appropriate secret-management mechanisms for production deployments.
 
 ```text
 .
-├── pyproject.toml
+├── pyproject.toml                 # repository/test/tooling configuration
 ├── LICENCE
 ├── README.md
-├── src/
-│   ├── jmlightning/
-│   │   ├── __init__.py
-│   │   ├── cli.py
-│   │   ├── config.py
-│   │   ├── models.py
-│   │   ├── policy.py
-│   │   ├── planner.py
-│   │   ├── tx_builder.py
-│   │   │
-│   │   ├── adapters/
-│   │   │   ├── __init__.py
-│   │   │   └── joinmarket.py
-│   │   │
-│   │   ├── lightning/
-│   │   │   ├── __init__.py
-│   │   │   ├── backend.py
-│   │   │   └── cln.py
-│   │   │
-│   │   └── operations/
-│   │       ├── __init__.py
-│   │       ├── open_channel.py
-│   │       ├── multi_open_channel.py
-│   │       ├── splice.py
-│   │       └── peerswap.py
-│   │
-│   └── jmpeerswap/
-│       ├── __init__.py
-│       ├── plugin.py
-│       ├── proxy.py
-│       └── rendezvous.py
+├── jmlightning/
+│   ├── pyproject.toml
+│   └── src/
+│       └── jmlightning/
+│           ├── __init__.py
+│           ├── cli.py
+│           ├── config.py
+│           ├── models.py
+│           ├── policy.py
+│           ├── planner.py
+│           ├── tx_builder.py
+│           │
+│           ├── adapters/
+│           │   ├── __init__.py
+│           │   └── joinmarket.py
+│           │
+│           ├── lightning/
+│           │   ├── __init__.py
+│           │   ├── backend.py
+│           │   └── cln.py
+│           │
+│           └── operations/
+│               ├── __init__.py
+│               ├── open_channel.py
+│               ├── multi_open_channel.py
+│               ├── splice.py
+│               └── peerswap.py
+│
+├── jmpeerswap/
+│   ├── pyproject.toml
+│   └── src/
+│       └── jmpeerswap/
+│           ├── __init__.py
+│           ├── plugin.py
+│           ├── proxy.py
+│           └── rendezvous.py
 │
 └── tests/
     ├── conftest.py
@@ -987,7 +1041,7 @@ CLN remains responsible for the existing channel and the negotiated splice trans
 
 #### `jmpeerswap/`
 
-Provides the standalone CLN plugin bridge for PeerSwap. The bridge proxies the upstream PeerSwap plugin, forwards normal PeerSwap RPCs and custom messages and intercepts `txprepare`, `txsend` and `txdiscard` through a bounded rendezvous queue so JoinMarket can perform the wallet-side transaction work.
+Provides the independently installable CLN plugin bridge for PeerSwap. It runs on the Lightning node, proxies the upstream PeerSwap plugin, forwards normal PeerSwap RPCs and custom messages and intercepts `txprepare`, `txsend` and `txdiscard` through a bounded rendezvous queue. It does not import or require `jmlightning`; the JoinMarket-side transaction work is performed by the separately installed `jmlightning` package.
 
 #### `models.py`
 
