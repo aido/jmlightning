@@ -1,4 +1,5 @@
-from typing import Any, cast
+from collections.abc import MutableSet
+from typing import cast
 
 import pytest
 
@@ -23,7 +24,7 @@ def test_policy_is_immutable() -> None:
     policy = Policy({Capability.OPEN_CHANNEL})
 
     with pytest.raises(AttributeError):
-        cast(Any, policy.capabilities).add(Capability.SWAP)
+        cast(MutableSet[Capability], policy.capabilities).add(Capability.SWAP)
 
 
 def test_cj_out_can_open_channel() -> None:

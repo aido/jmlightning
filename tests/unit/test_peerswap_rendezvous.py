@@ -10,16 +10,17 @@ from pyln.client import LightningRpc
 
 from jmlightning.operations.peerswap import (
     PeerSwapOperationDispatcher,
+    PeerSwapPrepareTxOperation,
     PeerSwapRendezvousClient,
     PeerSwapRuntime,
 )
 
 
 class FakeRpc:
-    def __init__(self, calls: list[tuple[str, Any]]) -> None:
+    def __init__(self, calls: list[tuple[str, object]]) -> None:
         self.calls = calls
 
-    def call(self, method: str, params: Any = None) -> Any:
+    def call(self, method: str, params: object = None) -> Any:
         self.calls.append((method, params))
         if method == "jmpeerswap-request":
             return {
@@ -31,14 +32,14 @@ class FakeRpc:
 
 
 def test_rendezvous_client_dispatches_and_responds() -> None:
-    calls: list[tuple[str, Any]] = []
-    handled: list[tuple[str, Any]] = []
+    calls: list[tuple[str, object]] = []
+    handled: list[tuple[str, object]] = []
 
     def rpc_factory(socket_path: str) -> FakeRpc:
         assert socket_path == "/tmp/lightning-rpc"
         return FakeRpc(calls)
 
-    def handler(method: str, params: Any) -> dict[str, bool]:
+    def handler(method: str, params: object) -> dict[str, bool]:
         handled.append((method, params))
         return {"ok": True}
 
@@ -60,14 +61,14 @@ def test_rendezvous_client_dispatches_and_responds() -> None:
 
 
 def test_rendezvous_client_propagates_handler_error() -> None:
-    calls: list[tuple[str, Any]] = []
+    calls: list[tuple[str, object]] = []
 
     class ErrorRpc(FakeRpc):
         pass
 
     rpc = ErrorRpc(calls)
 
-    def handler(method: str, params: Any) -> Any:
+    def handler(method: str, params: object) -> object:
         del method, params
         raise ValueError("invalid PeerSwap request")
 
@@ -111,15 +112,15 @@ def test_dispatcher_close_closes_operation_before_stopping_loop() -> None:
 def test_runtime_uses_dispatcher_as_rendezvous_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    calls: dict[str, Any] = {}
+    calls: dict[str, object] = {}
 
     class FakeDispatcher:
-        def __init__(self, operation: Any) -> None:
+        def __init__(self, operation: object) -> None:
             calls["dispatcher"] = self
             calls["operation"] = operation
 
     class FakeRendezvous:
-        def __init__(self, **kwargs: Any) -> None:
+        def __init__(self, **kwargs: object) -> None:
             calls["rendezvous"] = kwargs
 
         def start(self) -> None:
@@ -129,7 +130,7 @@ def test_runtime_uses_dispatcher_as_rendezvous_handler(
             calls["stop"] = True
 
     class FakeRpc:
-        def call(self, method: str, params: Any) -> dict[str, Any]:
+        def call(self, method: str, params: object) -> dict[str, object]:
             calls["rpc"] = (method, params)
             return {"ok": True}
 
@@ -144,13 +145,14 @@ def test_runtime_uses_dispatcher_as_rendezvous_handler(
 
     operation = object()
     runtime = PeerSwapRuntime(
-        operation=cast(Any, operation),
+        operation=cast(PeerSwapPrepareTxOperation, operation),
         cln_socket=Path("/tmp/lightning-rpc"),
-        rpc_factory=lambda _: cast(Any, FakeRpc()),
+        rpc_factory=lambda _: cast(LightningRpc, FakeRpc()),
     )
 
-    assert calls["rendezvous"]["handler"] is calls["dispatcher"]
-    assert calls["rendezvous"]["pool_size"] == 4
+    rendezvous = cast(dict[str, object], calls["rendezvous"])
+    assert rendezvous["handler"] is calls["dispatcher"]
+    assert rendezvous["pool_size"] == 4
     assert runtime.call("peerswap-swap-in", {"amt_sat": 1000}) == {"ok": True}
     assert calls["start"] is True
     assert calls["stop"] is True
@@ -159,7 +161,9 @@ def test_runtime_uses_dispatcher_as_rendezvous_handler(
 
 def test_dispatcher_close_closes_operation_before_event_loop() -> None:
     operation = type("Operation", (), {"close": AsyncMock()})()
-    dispatcher = PeerSwapOperationDispatcher(cast(Any, operation))
+    dispatcher = PeerSwapOperationDispatcher(
+        cast(PeerSwapPrepareTxOperation, operation)
+    )
 
     dispatcher.close()
     dispatcher.close()
@@ -173,7 +177,7 @@ def test_rendezvous_client_rejects_invalid_pool_size() -> None:
 
 
 def test_rendezvous_client_rejects_unsupported_method() -> None:
-    calls: list[tuple[str, Any]] = []
+    calls: list[tuple[str, object]] = []
     rpc = FakeRpc(calls)
     client = PeerSwapRendezvousClient(
         Path("/tmp/lightning-rpc"), Mock(), rpc_factory=lambda _: rpc
@@ -194,10 +198,10 @@ def test_rendezvous_client_rejects_unsupported_method() -> None:
 
 
 def test_rendezvous_client_converts_unexpected_handler_error_to_rpc_error() -> None:
-    calls: list[tuple[str, Any]] = []
+    calls: list[tuple[str, object]] = []
     rpc = FakeRpc(calls)
 
-    def handler(method: str, params: Any) -> Any:
+    def handler(method: str, params: object) -> object:
         del method, params
         raise RuntimeError("backend failed")
 
@@ -221,7 +225,9 @@ def test_rendezvous_client_converts_unexpected_handler_error_to_rpc_error() -> N
 def test_dispatcher_rejects_unsupported_method() -> None:
     operation = Mock()
     operation.close = AsyncMock()
-    dispatcher = PeerSwapOperationDispatcher(cast(Any, operation))
+    dispatcher = PeerSwapOperationDispatcher(
+        cast(PeerSwapPrepareTxOperation, operation)
+    )
 
     with pytest.raises(ValueError, match="Unsupported PeerSwap request"):
         dispatcher("unknown", {})
@@ -232,7 +238,9 @@ def test_dispatcher_rejects_unsupported_method() -> None:
 def test_dispatcher_rejects_invalid_transaction_id() -> None:
     operation = Mock()
     operation.close = AsyncMock()
-    dispatcher = PeerSwapOperationDispatcher(cast(Any, operation))
+    dispatcher = PeerSwapOperationDispatcher(
+        cast(PeerSwapPrepareTxOperation, operation)
+    )
 
     with pytest.raises(ValueError, match="64-character hexadecimal"):
         dispatcher("txsend", {"txid": "not-a-txid"})

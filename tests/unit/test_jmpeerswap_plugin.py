@@ -6,6 +6,7 @@ import os
 import socket
 import subprocess
 import threading
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -431,7 +432,7 @@ def test_peer_swap_process_starts_and_requests_manifest(
 
     fake_process = FakeProcess()
 
-    def fake_popen(*args: Any, **kwargs: Any) -> FakeProcess:
+    def fake_popen(*args: object, **kwargs: object) -> FakeProcess:
         assert args == (["peerswap"],)
         assert kwargs["text"] is True
         assert kwargs["bufsize"] == 1
@@ -636,7 +637,7 @@ def test_wire_parent_callbacks_forwards_rpc_and_notifications() -> None:
     cln_plugin = Plugin()
 
     class FakeRPC:
-        def call(self, method: str, params: Any) -> Any:
+        def call(self, method: str, params: object) -> object:
             return {"method": method, "params": params}
 
     logs: list[tuple[str, str]] = []
@@ -647,13 +648,19 @@ def test_wire_parent_callbacks_forwards_rpc_and_notifications() -> None:
 
     class FakeProcess:
         def __init__(self) -> None:
-            self.rpc_callback: Any = None
-            self.notification_callback: Any = None
+            self.rpc_callback: Callable[[str, object], object] = (  # fmt: skip
+                lambda method, params: None
+            )
+            self.notification_callback: Callable[[str, object], None] = (
+                lambda method, params: None
+            )
 
-        def set_parent_rpc(self, callback: Any) -> None:
+        def set_parent_rpc(self, callback: Callable[[str, object], object]) -> None:
             self.rpc_callback = callback
 
-        def set_parent_notification(self, callback: Any) -> None:
+        def set_parent_notification(
+            self, callback: Callable[[str, object], None]
+        ) -> None:
             self.notification_callback = callback
 
     process = FakeProcess()

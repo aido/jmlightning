@@ -3,10 +3,12 @@ from __future__ import annotations
 import asyncio
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Protocol, cast
 
 import pytest
 import typer
+from jmcore.cli_common import ResolvedMnemonic
+from jmcore.settings import JoinMarketSettings
 from typer.testing import CliRunner
 
 import jmlightning.cli as cli
@@ -17,28 +19,69 @@ from jmlightning.operations.splice import confirm_splice_in
 runner = CliRunner()
 
 
-def _settings() -> Any:
-    return SimpleNamespace(
-        wallet=SimpleNamespace(
-            mixdepth_count=5,
-            gap_limit=6,
-            scan_range=100,
-            max_sats_freeze_reuse=100_000,
-            reconstruct_history=False,
-        ),
-        network_config=SimpleNamespace(
-            network="regtest",
-            bitcoin_network="regtest",
-        ),
-        data_dir=Path("/tmp/joinmarket"),
-        bitcoin=SimpleNamespace(
-            rpc_cookie_file=Path("/tmp/.cookie"),
-            neutrino_include_mempool=True,
+class _WalletSettings(Protocol):
+    mixdepth_count: int
+    gap_limit: int
+    scan_range: int
+
+
+class _BitcoinSettings(Protocol):
+    rpc_cookie_file: Path
+    neutrino_include_mempool: bool
+
+
+class _Settings(Protocol):
+    wallet: _WalletSettings
+    bitcoin: _BitcoinSettings
+
+
+class _Backend(Protocol):
+    network: str
+    bitcoin_network: str | None
+    data_dir: Path
+    rpc_url: str
+    rpc_user: str
+    rpc_password: str
+    neutrino_url: str | None
+    scan_start_height: int | None
+    neutrino_add_peers: bool
+    neutrino_tls_cert: Path | None
+    neutrino_auth_token: str | None
+    fee_estimate_url: str | None
+    fee_estimate_proxy: str | None
+
+
+class _ResolvedMnemonic(Protocol):
+    mnemonic: str
+    bip39_passphrase: str
+    creation_height: int
+
+
+def _settings() -> JoinMarketSettings:
+    return cast(
+        JoinMarketSettings,
+        SimpleNamespace(
+            wallet=SimpleNamespace(
+                mixdepth_count=5,
+                gap_limit=6,
+                scan_range=100,
+                max_sats_freeze_reuse=100_000,
+                reconstruct_history=False,
+            ),
+            network_config=SimpleNamespace(
+                network="regtest",
+                bitcoin_network="regtest",
+            ),
+            data_dir=Path("/tmp/joinmarket"),
+            bitcoin=SimpleNamespace(
+                rpc_cookie_file=Path("/tmp/.cookie"),
+                neutrino_include_mempool=True,
+            ),
         ),
     )
 
 
-def _backend() -> Any:
+def _backend() -> _Backend:
     return SimpleNamespace(
         network="regtest",
         bitcoin_network="regtest",
@@ -57,14 +100,17 @@ def _backend() -> Any:
     )
 
 
-def _resolved_mnemonic() -> Any:
-    return SimpleNamespace(
-        mnemonic=(
-            "abandon abandon abandon abandon abandon abandon "
-            "abandon abandon abandon abandon abandon about"
+def _resolved_mnemonic() -> ResolvedMnemonic:
+    return cast(
+        ResolvedMnemonic,
+        SimpleNamespace(
+            mnemonic=(
+                "abandon abandon abandon abandon abandon abandon "
+                "abandon abandon abandon abandon abandon about"
+            ),
+            bip39_passphrase="",
+            creation_height=100,
         ),
-        bip39_passphrase="",
-        creation_height=100,
     )
 
 
@@ -74,7 +120,7 @@ def test_config_init_passes_data_dir_and_config_file(
     data_dir = Path("/tmp/test-jm")
     config_file = Path("/tmp/test-config.toml")
     config_path = data_dir / "config.toml"
-    calls: dict[str, Any] = {}
+    calls: dict[str, object] = {}
 
     def fake_ensure_config_file(
         passed_data_dir: Path,
@@ -165,7 +211,7 @@ def test_build_cln_config_defaults_bitcoin_network_to_none(
     settings = _settings()
     backend = _backend()
     backend.bitcoin_network = None
-    captured: dict[str, Any] = {}
+    captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         config,
@@ -220,7 +266,7 @@ def test_open_channel_runs_operation_without_confirmation(
     settings = _settings()
     resolved = _resolved_mnemonic()
     config = object()
-    operation_calls: dict[str, Any] = {}
+    operation_calls: dict[str, object] = {}
 
     monkeypatch.setattr(
         cli,
@@ -242,7 +288,7 @@ def test_open_channel_runs_operation_without_confirmation(
         def __init__(
             self,
             *,
-            config: Any,
+            config: object,
             cln_socket: Path,
         ) -> None:
             operation_calls["config"] = config
@@ -252,7 +298,7 @@ def test_open_channel_runs_operation_without_confirmation(
             self,
             *,
             peer_id: str,
-            confirm: Any,
+            confirm: object,
         ) -> None:
             operation_calls["peer_id"] = peer_id
             operation_calls["confirm"] = confirm
@@ -289,7 +335,7 @@ def test_open_channel_passes_confirmation_callback_by_default(
 ) -> None:
     settings = _settings()
     resolved = _resolved_mnemonic()
-    confirms: list[Any] = []
+    confirms: list[object] = []
 
     monkeypatch.setattr(
         cli,
@@ -308,14 +354,14 @@ def test_open_channel_passes_confirmation_callback_by_default(
     )
 
     class FakeOperation:
-        def __init__(self, **kwargs: Any) -> None:
+        def __init__(self, **kwargs: object) -> None:
             pass
 
         def execute(
             self,
             *,
             peer_id: str,
-            confirm: Any,
+            confirm: object,
         ) -> None:
             confirms.append(confirm)
 
@@ -344,7 +390,7 @@ def test_splice_in_runs_operation_without_confirmation(
     settings = _settings()
     resolved = _resolved_mnemonic()
     config = object()
-    operation_calls: dict[str, Any] = {}
+    operation_calls: dict[str, object] = {}
 
     monkeypatch.setattr(
         cli,
@@ -366,7 +412,7 @@ def test_splice_in_runs_operation_without_confirmation(
         def __init__(
             self,
             *,
-            config: Any,
+            config: object,
             cln_socket: Path,
         ) -> None:
             operation_calls["config"] = config
@@ -376,7 +422,7 @@ def test_splice_in_runs_operation_without_confirmation(
             self,
             *,
             channel_id: str,
-            confirm: Any,
+            confirm: object,
         ) -> None:
             operation_calls["channel_id"] = channel_id
             operation_calls["confirm"] = confirm
@@ -438,7 +484,7 @@ def test_splice_in_passes_confirmation_callback_by_default(
 ) -> None:
     settings = _settings()
     resolved = _resolved_mnemonic()
-    confirms: list[Any] = []
+    confirms: list[object] = []
 
     monkeypatch.setattr(
         cli,
@@ -457,14 +503,14 @@ def test_splice_in_passes_confirmation_callback_by_default(
     )
 
     class FakeOperation:
-        def __init__(self, **kwargs: Any) -> None:
+        def __init__(self, **kwargs: object) -> None:
             pass
 
         def execute(
             self,
             *,
             channel_id: str,
-            confirm: Any,
+            confirm: object,
         ) -> None:
             confirms.append(confirm)
 
@@ -492,7 +538,7 @@ def test_splice_in_skips_confirmation_with_yes(
 ) -> None:
     settings = _settings()
     resolved = _resolved_mnemonic()
-    confirms: list[Any] = []
+    confirms: list[object] = []
 
     monkeypatch.setattr(
         cli,
@@ -511,14 +557,14 @@ def test_splice_in_skips_confirmation_with_yes(
     )
 
     class FakeOperation:
-        def __init__(self, **kwargs: Any) -> None:
+        def __init__(self, **kwargs: object) -> None:
             pass
 
         def execute(
             self,
             *,
             channel_id: str,
-            confirm: Any,
+            confirm: object,
         ) -> None:
             confirms.append(confirm)
 
@@ -545,7 +591,7 @@ def test_splice_in_skips_confirmation_with_yes(
 def test_peerswap_swap_in_calls_matching_cln_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, Any] = {}
+    captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         cli,
@@ -553,7 +599,7 @@ def test_peerswap_swap_in_calls_matching_cln_rpc(
         lambda **kwargs: captured.setdefault("config", object()),
     )
 
-    def fake_run(**kwargs: Any) -> None:
+    def fake_run(**kwargs: object) -> None:
         captured.update(kwargs)
 
     monkeypatch.setattr(cli, "_run_peerswap_rpc", fake_run)
@@ -581,7 +627,7 @@ def test_peerswap_swap_in_calls_matching_cln_rpc(
 def test_peerswap_swap_out_calls_matching_cln_rpc(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured: dict[str, Any] = {}
+    captured: dict[str, object] = {}
 
     monkeypatch.setattr(
         cli,
@@ -589,7 +635,7 @@ def test_peerswap_swap_out_calls_matching_cln_rpc(
         lambda **kwargs: captured.setdefault("config", object()),
     )
 
-    def fake_run(**kwargs: Any) -> None:
+    def fake_run(**kwargs: object) -> None:
         captured.update(kwargs)
 
     monkeypatch.setattr(cli, "_run_peerswap_rpc", fake_run)
@@ -614,7 +660,7 @@ def test_peerswap_swap_out_calls_matching_cln_rpc(
     assert captured["cln_socket"] == Path("/tmp/lightning-rpc")
 
 
-def _close_awaitable(awaitable: Any) -> None:
+def _close_awaitable(awaitable: object) -> None:
     if asyncio.iscoroutine(awaitable):
         awaitable.close()
 

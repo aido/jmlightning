@@ -7,7 +7,6 @@ import stat
 import threading
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
 
 
 class DeferredResponse:
@@ -26,8 +25,8 @@ class UnixRPCProxy:
         upstream_path: Path,
         request_handler: (
             Callable[
-                [dict[str, Any], Callable[[dict[str, Any]], None]],
-                dict[str, Any] | DeferredResponse | None,
+                [dict[str, object], Callable[[dict[str, object]], None]],
+                dict[str, object] | DeferredResponse | None,
             ]
             | None
         ) = None,
@@ -190,7 +189,7 @@ class UnixRPCProxy:
         reader = client.makefile("rb")
         write_lock = threading.Lock()
 
-        def respond(response: dict[str, Any]) -> None:
+        def respond(response: dict[str, object]) -> None:
             payload = json.dumps(response).encode() + b"\n\n"
             with write_lock:
                 client.sendall(payload)
@@ -224,8 +223,8 @@ class UnixRPCProxy:
     def _handle_request(
         self,
         data: bytes,
-        respond: Callable[[dict[str, Any]], None],
-    ) -> dict[str, Any] | DeferredResponse | None:
+        respond: Callable[[dict[str, object]], None],
+    ) -> dict[str, object] | DeferredResponse | None:
         if self.request_handler is None:
             return None
 

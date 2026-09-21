@@ -1,6 +1,6 @@
+from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
-from typing import Any
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
@@ -217,7 +217,7 @@ def _patch_open_channel_doubles(
     cln: Mock,
     tx_builder: Mock,
     plan: Mock,
-) -> tuple[Any, Any, Any, Any]:
+) -> tuple[AbstractContextManager[Mock], ...]:
     return (
         patch(
             "jmlightning.operations.open_channel.JoinMarketAdapter",

@@ -5,7 +5,6 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
 
 from loguru import logger
 from pyln.client.plugin import Request
@@ -14,10 +13,10 @@ from pyln.client.plugin import Request
 @dataclass(slots=True)
 class _PeerSwapRequest:
     request_id: str
-    peer_swap_id: Any
+    peer_swap_id: object
     method: str
-    params: Any
-    respond: Callable[[dict[str, Any]], None]
+    params: object
+    respond: Callable[[dict[str, object]], None]
     timeout: threading.Timer | None = None
 
 
@@ -39,7 +38,7 @@ class PeerSwapRendezvous:
 
     def wait(self, request: Request) -> None:
         """Hold a ``jmpeerswap-request`` call until work is available."""
-        assignments: list[tuple[Request, dict[str, Any]]] = []
+        assignments: list[tuple[Request, dict[str, object]]] = []
         error: Exception | None = None
         with self._lock:
             if self._stopped:
@@ -58,13 +57,13 @@ class PeerSwapRendezvous:
     def submit(
         self,
         method: str,
-        params: Any,
-        peer_swap_id: Any,
-        respond: Callable[[dict[str, Any]], None],
+        params: object,
+        peer_swap_id: object,
+        respond: Callable[[dict[str, object]], None],
     ) -> None:
         """Queue an intercepted PeerSwap request for JoinMarket."""
-        assignments: list[tuple[Request, dict[str, Any]]] = []
-        error_response: dict[str, Any] | None = None
+        assignments: list[tuple[Request, dict[str, object]]] = []
+        error_response: dict[str, object] | None = None
         with self._lock:
             if self._stopped:
                 error_response = self._error_response(
@@ -100,25 +99,27 @@ class PeerSwapRendezvous:
 
     def respond(
         self,
-        params: Any = None,
+        params: object = None,
         *,
         request_id: str | None = None,
-        result: Any = None,
-        error: Any = None,
+        result: object = None,
+        error: str | None = None,
     ) -> None:
         if request_id is not None:
-            params = {"request_id": request_id}
+            response_params: dict[str, object] = {"request_id": request_id}
             if error is not None:
-                params["error"] = error
+                response_params["error"] = error
             else:
-                params["result"] = result
+                response_params["result"] = result
+            params = response_params
 
         if not isinstance(params, dict):
             raise ValueError("jmpeerswap-response params must be an object")
 
-        request_id = params.get("request_id")
-        if not isinstance(request_id, str) or not request_id:
+        request_id_value = params.get("request_id")
+        if not isinstance(request_id_value, str) or not request_id_value:
             raise ValueError("jmpeerswap-response requires request_id")
+        request_id = request_id_value
 
         has_result = "result" in params
         has_error = "error" in params
@@ -135,7 +136,7 @@ class PeerSwapRendezvous:
         if pending is None:
             raise ValueError(f"Unknown PeerSwap rendezvous request: {request_id}")
 
-        response: dict[str, Any] = {
+        response: dict[str, object] = {
             "jsonrpc": "2.0",
             "id": pending.peer_swap_id,
         }
@@ -180,8 +181,8 @@ class PeerSwapRendezvous:
                 ),
             )
 
-    def _match_locked(self) -> list[tuple[Request, dict[str, Any]]]:
-        assignments: list[tuple[Request, dict[str, Any]]] = []
+    def _match_locked(self) -> list[tuple[Request, dict[str, object]]]:
+        assignments: list[tuple[Request, dict[str, object]]] = []
         while self._waiters and self._unassigned:
             waiter = self._waiters.popleft()
             request_id = self._unassigned.popleft()
@@ -202,7 +203,7 @@ class PeerSwapRendezvous:
 
     def _complete_assignments(
         self,
-        assignments: list[tuple[Request, dict[str, Any]]],
+        assignments: list[tuple[Request, dict[str, object]]],
     ) -> None:
         for waiter, result in assignments:
             logger.info(
@@ -238,8 +239,8 @@ class PeerSwapRendezvous:
 
     @staticmethod
     def _safe_respond(
-        respond: Callable[[dict[str, Any]], None],
-        response: dict[str, Any],
+        respond: Callable[[dict[str, object]], None],
+        response: dict[str, object],
     ) -> None:
         try:
             respond(response)
@@ -252,10 +253,10 @@ class PeerSwapRendezvous:
 
     @staticmethod
     def _error_response(
-        request_id: Any,
+        request_id: object,
         code: int,
         message: str,
-    ) -> dict[str, Any]:
+    ) -> dict[str, object]:
         return {
             "jsonrpc": "2.0",
             "id": request_id,

@@ -7,7 +7,6 @@ from dataclasses import dataclass
 from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
-from typing import Any
 
 from jmcore.bitcoin import (
     ParsedTransaction,
@@ -55,7 +54,7 @@ class PeerSwapPrepareTxRequest:
     utxos: tuple[str, ...]
 
     @classmethod
-    def from_rpc(cls, params: Any) -> PeerSwapPrepareTxRequest:
+    def from_rpc(cls, params: object) -> PeerSwapPrepareTxRequest:
         if not isinstance(params, dict):
             raise ValueError("txprepare params must be an object")
 
@@ -657,7 +656,7 @@ class PeerSwapRendezvousClient:
     def __init__(
         self,
         cln_socket: Path,
-        handler: Callable[[str, Any], Any],
+        handler: Callable[[str, object], object],
         pool_size: int = 4,
         rpc_factory: Callable[[str], LightningRpc] = LightningRpc,
     ) -> None:
@@ -720,7 +719,7 @@ class PeerSwapRendezvousClient:
                     return
                 continue
 
-    def _handle_request(self, rpc: LightningRpc, request: Any) -> None:
+    def _handle_request(self, rpc: LightningRpc, request: object) -> None:
         if not isinstance(request, dict):
             return
 
@@ -799,7 +798,7 @@ class PeerSwapRuntime:
         )
         self.rpc = rpc_factory(str(cln_socket))
 
-    def call(self, method: str, params: dict[str, Any]) -> Any:
+    def call(self, method: str, params: dict[str, object]) -> object:
         """Call PeerSwap through CLN while the rendezvous pool is running."""
         self.rendezvous.start()
         try:
@@ -820,7 +819,7 @@ class PeerSwapOperationDispatcher:
         self._close_lock = threading.Lock()
         self._closed = False
 
-    def __call__(self, method: str, params: Any) -> Any:
+    def __call__(self, method: str, params: object) -> object:
         if method not in {"txprepare", "txsend", "txdiscard"}:
             raise ValueError(f"Unsupported PeerSwap request: {method}")
         with self._lock:
@@ -888,7 +887,7 @@ class PeerSwapOperationDispatcher:
             loop.run_until_complete(loop.shutdown_asyncgens())
             loop.close()
 
-    async def _dispatch(self, method: str, params: Any) -> Any:
+    async def _dispatch(self, method: str, params: object) -> object:
         if method == "txprepare":
             request = PeerSwapPrepareTxRequest.from_rpc(params)
             prepared = await self.operation.execute(request)

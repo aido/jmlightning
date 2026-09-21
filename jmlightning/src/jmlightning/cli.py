@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated
 
 import typer
 from jmcore.cli_common import (
@@ -26,7 +26,7 @@ from jmcore.process_hardening import harden_current_process
 from jmcore.settings import ensure_config_file
 from loguru import logger
 
-from jmlightning.config import build_cln_config
+from jmlightning.config import CLNConfig, build_cln_config
 from jmlightning.operations.multi_open_channel import (
     MultiOpenChannelOperation,
     confirm_multi_open_channel,
@@ -408,7 +408,7 @@ def _peerswap_config(
     mnemonic_file: Path | None,
     amount: int,
     mixdepth: int | None,
-) -> Any:
+) -> CLNConfig:
     settings = setup_cli(
         data_dir=data_dir,
         config_file=config_file,
@@ -431,8 +431,8 @@ def _peerswap_config(
 def _run_peerswap_rpc(
     *,
     method: str,
-    params: dict[str, Any],
-    config: Any,
+    params: dict[str, object],
+    config: CLNConfig,
     cln_socket: Path,
 ) -> None:
     result = PeerSwapRuntime(
