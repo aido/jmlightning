@@ -12,7 +12,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  JMNG_VERSION: "0.37.0"
+  JMNG_VERSION: "0.39.2"
 
 jobs:
   quality:

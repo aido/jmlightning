@@ -1,5 +1,5 @@
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     TxInput,
     TxOutput,
@@ -20,9 +20,7 @@ def policy_engine() -> PolicyEngine:
 
 @pytest.fixture
 def classified_utxos() -> list[ClassifiedUTXO]:
-    scriptpubkey = pubkey_to_p2wpkh_script(
-        PrivateKey(b"\x01" * 32).public_key.format(compressed=True)
-    ).hex()
+    scriptpubkey = pubkey_to_p2wpkh_script(CKey(b"\x01" * 32).pub).hex()
 
     def make_utxo(
         txid: str,
@@ -71,9 +69,7 @@ def classified_utxos() -> list[ClassifiedUTXO]:
 
 @pytest.fixture
 def splice_prev_tx() -> bytes:
-    scriptpubkey = pubkey_to_p2wpkh_script(
-        PrivateKey(b"\x01" * 32).public_key.format(compressed=True)
-    )
+    scriptpubkey = pubkey_to_p2wpkh_script(CKey(b"\x01" * 32).pub)
     previous_input = TxInput.from_hex(
         txid="aa" * 32,
         vout=0,

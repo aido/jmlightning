@@ -324,85 +324,6 @@ class TxBuilder:
 
         return bytes(result)
 
-    @staticmethod
-    def _remove_empty_witness_scripts(psbt: bytes) -> bytes:
-        """Remove empty witness-script records emitted by jmcore.
-
-        jmcore unconditionally serialises ``PSBT_IN_WITNESS_SCRIPT``
-        even when the witness script is empty. An empty value is not a valid
-        witness script record for a P2WPKH input and Core Lightning rejects the
-        resulting PSBT. Keep this compatibility workaround local to the PSBT
-        boundary rather than changing the transaction model or inserting a
-        fabricated script. This is a workaround for a jmcore bug.
-
-        Remove this workaround when the minimum supported jmcore version no
-        longer emits empty witness-script records.
-        """
-        magic = b"psbt\xff"
-        if not psbt.startswith(magic):
-            raise ValueError("invalid PSBT magic")
-
-        def _read_compact_size(data: bytes, offset: int) -> tuple[int, int]:
-            if offset >= len(data):
-                raise ValueError("truncated PSBT compact size")
-            first = data[offset]
-            offset += 1
-            if first < 0xFD:
-                return first, offset
-            if first == 0xFD:
-                size = 2
-            elif first == 0xFE:
-                size = 4
-            else:
-                size = 8
-            end = offset + size
-            if end > len(data):
-                raise ValueError("truncated PSBT compact size")
-            return int.from_bytes(data[offset:end], "little"), end
-
-        def _write_compact_size(value: int) -> bytes:
-            if value < 0:
-                raise ValueError("negative PSBT compact size")
-            if value < 0xFD:
-                return bytes([value])
-            if value <= 0xFFFF:
-                return b"\xfd" + value.to_bytes(2, "little")
-            if value <= 0xFFFFFFFF:
-                return b"\xfe" + value.to_bytes(4, "little")
-            return b"\xff" + value.to_bytes(8, "little")
-
-        offset = len(magic)
-        output = bytearray(magic)
-
-        while offset < len(psbt):
-            key_len, offset = _read_compact_size(psbt, offset)
-            if key_len == 0:
-                output.append(0)
-                continue
-
-            key_end = offset + key_len
-            if key_end > len(psbt):
-                raise ValueError("truncated PSBT key")
-            key = psbt[offset:key_end]
-            offset = key_end
-
-            value_len, offset = _read_compact_size(psbt, offset)
-            value_end = offset + value_len
-            if value_end > len(psbt):
-                raise ValueError("truncated PSBT value")
-            value = psbt[offset:value_end]
-            offset = value_end
-
-            if key == b"\x05" and not value:
-                continue
-
-            output.extend(_write_compact_size(len(key)))
-            output.extend(key)
-            output.extend(_write_compact_size(len(value)))
-            output.extend(value)
-
-        return bytes(output)
-
     def build_and_sign_funding_tx(
         self,
         plan: ExecutionPlan,
@@ -1202,8 +1123,6 @@ class TxBuilder:
             locktime=tx.locktime,
             psbt_inputs=psbt_inputs,
         )
-        unsigned_psbt = self._remove_empty_witness_scripts(unsigned_psbt)
-
         signed_tx, txid, signed_psbt = self._sign_psbt(
             unsigned_psbt=unsigned_psbt,
             tx=tx,

@@ -5,7 +5,7 @@ from typing import cast
 from unittest.mock import Mock
 
 import pytest
-from coincurve import PrivateKey
+from bitcointx.core.key import CKey
 from jmcore.bitcoin import (
     BIP32Derivation,
     ParsedTransaction,
@@ -28,11 +28,9 @@ from jmlightning.tx_builder import TxBuilder
 def _mock_wallet() -> Mock:
     wallet = Mock()
 
-    private_key = PrivateKey(b"\x01" * 32)
+    private_key = CKey.from_secret_bytes(b"\x01" * 32)
     key = Mock()
-    key.get_public_key_bytes.return_value = private_key.public_key.format(
-        compressed=True,
-    )
+    key.get_public_key_bytes.return_value = bytes(private_key.pub)
 
     wallet.get_key_for_address.return_value = key
 
@@ -575,41 +573,6 @@ def test_build_and_sign_funding_tx_uses_psbt_signing(
     wallet.sign_psbt.assert_called_once_with(signing_plan)
 
 
-def test_build_and_sign_funding_tx_removes_empty_witness_script_records(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    builder = TxBuilder()
-    plan = _build_funding_plan(classified_utxos)
-    wallet = _mock_wallet()
-
-    builder.build_and_sign_funding_tx(
-        plan=plan,
-        funding_address=(
-            "bc1qrp33g0q5c5txsp9arysrx4k6zdkfs4nce4xj0gdcccefvpysxf3qccfmv3"
-        ),
-        change_address="bc1qw508d6qejxtdg4y5r3zarvary0c5xw7kv8f3t4",
-        wallet=wallet,
-    )
-
-    signing_plan = wallet.prepare_psbt_signing.return_value
-    # The compact-size encoding of an empty PSBT_IN_WITNESS_SCRIPT record is
-    # 01 05 00. Check the exact record encoding rather than importing
-    # jmwallet's parser, because this regression must remain independent of
-    # jmwallet's internal PSBT representation.
-    assert b"\x01\x05\x00" not in signing_plan.source_psbt
-
-
-def test_remove_empty_witness_scripts_rejects_invalid_psbt() -> None:
-    with pytest.raises(ValueError, match="invalid PSBT magic"):
-        TxBuilder._remove_empty_witness_scripts(b"not-a-psbt")
-
-
-def test_remove_empty_witness_scripts_preserves_nonempty_witness_script() -> None:
-    psbt = b"psbt\xff\x01\x05\x03abc\x00"
-
-    assert TxBuilder._remove_empty_witness_scripts(psbt) == psbt
-
-
 def test_build_and_sign_funding_tx_does_not_double_sign_inputs(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
@@ -745,7 +708,7 @@ def test_build_and_sign_funding_tx_rejects_missing_partial_signature(
             0,
             create_p2wpkh_script_code(pubkey),
             100_000,
-            PrivateKey(b"\x01" * 32),
+            CKey.from_secret_bytes(b"\x01" * 32),
         )
         parsed.append_input_key_value(
             0,
@@ -785,7 +748,7 @@ def test_build_and_sign_funding_tx_rejects_invalid_partial_signature(
         pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
             compressed=True,
         )
-        private_key = PrivateKey(b"\x01" * 32)
+        private_key = CKey.from_secret_bytes(b"\x01" * 32)
         for index in range(len(parsed.input_maps)):
             signature = bytearray(
                 sign_p2wpkh_input(
@@ -1588,7 +1551,7 @@ def test_sign_splice_psbt_signs_only_jm_input(
     )
     wallet.sign_psbt.return_value = signed_result
 
-    private_key = PrivateKey(b"\x01" * 32)
+    private_key = CKey.from_secret_bytes(b"\x01" * 32)
     parsed = parse_psbt(splice_psbt)
     pubkey = wallet.get_key_for_address(
         classified_utxos[2].utxo.address,
