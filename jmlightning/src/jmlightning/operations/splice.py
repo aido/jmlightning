@@ -265,6 +265,10 @@ class SpliceOperation:
 
             phase = SplicePhase.LOCKED
 
+            # Keep the JoinMarket reservations alive while this operation
+            # waits on CLN or operator input.
+            jmadapter.start_lock_renewal()
+
             logger.info(
                 "Locked {} UTXO for splice.",
                 len(locked),
@@ -273,6 +277,8 @@ class SpliceOperation:
             # --------------------------------------------------------
             # Start the CLN splice
             # --------------------------------------------------------
+
+            jmadapter.renew_locks(locked)
 
             try:
                 result = cln.splice_init(
@@ -376,6 +382,8 @@ class SpliceOperation:
             # Add the JoinMarket input
             # --------------------------------------------------------
 
+            jmadapter.renew_locks(locked)
+
             change_address = jmadapter.get_change_address(
                 self.config.mixdepth,
             )
@@ -398,6 +406,7 @@ class SpliceOperation:
             commitments_secured = False
 
             while not commitments_secured:
+                jmadapter.renew_locks(locked)
                 try:
                     update_result = cln.splice_update(
                         channel_id=channel_id,
@@ -495,6 +504,8 @@ class SpliceOperation:
             # Sign the JoinMarket input(s)
             # --------------------------------------------------------
 
+            jmadapter.renew_locks(locked)
+
             # Locate the approved JoinMarket input in the final negotiated
             # PSBT rather than relying on input ordering. The peer may add
             # inputs during interactive negotiation.
@@ -524,6 +535,8 @@ class SpliceOperation:
             # --------------------------------------------------------
             # Submit the final signed splice to CLN
             # --------------------------------------------------------
+
+            jmadapter.renew_locks(locked)
 
             try:
                 signed_result = cln.splice_signed(

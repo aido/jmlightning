@@ -539,7 +539,7 @@ class TxBuilder:
         """Calculate CLN's splice weight for one input.
 
         This mirrors ``psbt_input_get_weight(..., PSBT_GUESS_2OF2)`` in
-        Core Lightning 26.06.6 for standard SegWit inputs.
+        Core Lightning for standard SegWit inputs.
         """
         input_map = parsed_psbt.input_maps[index]
         witness_records = [

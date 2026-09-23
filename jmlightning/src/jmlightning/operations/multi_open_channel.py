@@ -206,9 +206,15 @@ class MultiOpenChannelOperation:
                 locked.append(coin)
             phase = MultiOpenChannelPhase.LOCKED
 
+            # Keep the JoinMarket reservations alive while this operation
+            # waits on CLN or operator input.
+            jmadapter.start_lock_renewal()
+
             # --------------------------------------------------------
             # Start CLN funding for every channel
             # --------------------------------------------------------
+
+            jmadapter.renew_locks(locked)
 
             # Start every channel before constructing the shared transaction.
             # If any start fails, cancel every successful start before releasing
@@ -286,6 +292,8 @@ class MultiOpenChannelOperation:
             # Complete every channel against the shared transaction
             # --------------------------------------------------------
 
+            jmadapter.renew_locks(locked)
+
             # Complete each channel against the same signed transaction. CLN
             # records each channel as withheld until the shared PSBT is sent.
             for peer_id in started:
@@ -322,6 +330,8 @@ class MultiOpenChannelOperation:
             # --------------------------------------------------------
             # Broadcast the shared funding transaction through CLN
             # --------------------------------------------------------
+
+            jmadapter.renew_locks(locked)
 
             try:
                 broadcast_result = cln.send_psbt(signed_psbt)

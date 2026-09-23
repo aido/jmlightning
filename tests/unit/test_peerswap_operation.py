@@ -275,6 +275,39 @@ async def test_prepared_result_matches_cln_txprepare_response() -> None:
     }
 
 
+def test_prepared_transaction_retains_explicit_reservation_state() -> None:
+    coin = _coin()
+    adapter = Mock()
+
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=adapter,
+        psbt=b"",
+        reservations=(coin,),
+    )
+
+    prepared.renew_reservations()
+
+    assert prepared.reservations == (coin,)
+    adapter.renew_locks.assert_called_once_with([coin])
+
+
+@pytest.mark.anyio
+async def test_prepared_transaction_legacy_construction_derives_reservations() -> None:
+    coin = _coin()
+    prepared = PreparedPeerSwapTransaction(
+        tx=Mock(),
+        txid="22" * 32,
+        locked=[coin],
+        adapter=Mock(),
+        psbt=b"",
+    )
+
+    assert prepared.reservations == (coin,)
+
+
 @pytest.mark.anyio
 async def test_send_broadcasts_prepared_transaction_and_releases_locks() -> None:
     request = _request()

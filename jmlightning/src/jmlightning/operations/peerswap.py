@@ -166,7 +166,23 @@ class PreparedPeerSwapTransaction:
     locked: list[ClassifiedUTXO]
     adapter: JoinMarketAdapter
     psbt: bytes
+    # Explicitly retain the reservation set as part of the prepared operation
+    # state. ``locked`` remains as a compatibility alias for callers/tests
+    # which construct this value directly. The reservation set is what the
+    # long-lived lifecycle methods renew and release.
+    reservations: tuple[ClassifiedUTXO, ...] = ()
     phase: PeerSwapPhase = PeerSwapPhase.PREPARED
+
+    def __post_init__(self) -> None:
+        if not self.reservations:
+            self.reservations = tuple(self.locked)
+        elif not self.locked:
+            self.locked = list(self.reservations)
+
+    def renew_reservations(self) -> None:
+        """Renew the reservations explicitly owned by this operation."""
+        self.require_phase(PeerSwapPhase.PREPARED)
+        self.adapter.renew_locks(list(self.reservations))
 
     def require_phase(self, expected: PeerSwapPhase) -> None:
         """Require this prepared transaction to be in ``expected`` state."""
@@ -291,6 +307,11 @@ class PeerSwapPrepareTxOperation:
                     jmadapter.lock(coin)
                     locked.append(coin)
 
+                # Prepared PeerSwap transactions may remain idle for an
+                # arbitrary period. Keep their JoinMarket reservations alive
+                # for as long as the prepared transaction is retained.
+                jmadapter.start_lock_renewal()
+
                 change_address = jmadapter.get_change_address(self.config.mixdepth)
                 tx, txid, psbt = tx_builder.build_and_sign_multifunding_tx(
                     plan=plan,
@@ -326,6 +347,7 @@ class PeerSwapPrepareTxOperation:
                 locked=locked,
                 adapter=jmadapter,
                 psbt=psbt,
+                reservations=tuple(locked),
             )
             self._prepared[txid] = prepared
             logger.info(
@@ -354,6 +376,10 @@ class PeerSwapPrepareTxOperation:
                 f"PeerSwap transaction {txid} is in {prepared.phase} state"
             )
 
+        # The prepared transaction owns its reservation set explicitly. Renew
+        # it at the operation boundary so a stale lease can never be used.
+        prepared.renew_reservations()
+
         return self._prepare_result(prepared)
 
     async def send(self, txid: str) -> dict[str, str]:
@@ -362,6 +388,11 @@ class PeerSwapPrepareTxOperation:
         if prepared is None:
             raise ValueError(f"PeerSwap transaction {txid} is not prepared")
         prepared.require_phase(PeerSwapPhase.PREPARED)
+
+        # Renew immediately before broadcast. If the prepared transaction was
+        # left idle beyond the lease lifetime, do not broadcast inputs that
+        # are no longer reserved by this operation.
+        prepared.renew_reservations()
 
         logger.info(
             "PeerSwap JM operation txsend start socket={} txid={}",
@@ -383,7 +414,7 @@ class PeerSwapPrepareTxOperation:
         prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST)
         self._prepared.pop(txid)
         cleanup_errors: list[Exception] = []
-        for coin in reversed(prepared.locked):
+        for coin in reversed(prepared.reservations):
             try:
                 prepared.adapter.unlock(coin)
             except Exception as exc:
@@ -498,7 +529,7 @@ class PeerSwapPrepareTxOperation:
         # First release every locked input so the transaction no longer owns
         # JoinMarket wallet state.
         cleanup_errors: list[Exception] = []
-        for coin in reversed(prepared.locked):
+        for coin in reversed(prepared.reservations):
             try:
                 prepared.adapter.unlock(coin)
             except Exception as exc:

@@ -274,6 +274,11 @@ class OpenChannelOperation:
 
             phase = FundingPhase.LOCKED
 
+            # Keep the JoinMarket reservations alive while this operation
+            # waits on CLN or operator input. Renewal runs independently of
+            # the asyncio event loop because this operation may block it.
+            jmadapter.start_lock_renewal()
+
             logger.info(
                 "Locked {} UTXOs for channel funding.",
                 len(locked),
@@ -282,6 +287,11 @@ class OpenChannelOperation:
             # --------------------------------------------------------
             # Start CLN funding
             # --------------------------------------------------------
+
+            # Renew immediately before handing the funding operation to CLN.
+            # A failed renewal means we no longer have a valid reservation
+            # for these inputs and must not continue with them.
+            jmadapter.renew_locks(locked)
 
             try:
                 funding_address = cln.open_channel_start(
@@ -376,6 +386,8 @@ class OpenChannelOperation:
             # Complete CLN funding
             # --------------------------------------------------------
 
+            jmadapter.renew_locks(locked)
+
             try:
                 cln.open_channel_complete(
                     peer_id=peer_id,
@@ -429,6 +441,8 @@ class OpenChannelOperation:
             # --------------------------------------------------------
             # Broadcast through CLN
             # --------------------------------------------------------
+
+            jmadapter.renew_locks(locked)
 
             try:
                 broadcast_result = cln.send_psbt(signed_psbt)

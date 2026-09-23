@@ -1,7 +1,11 @@
+import asyncio
+import time
 from types import SimpleNamespace
+from typing import cast
 from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
+from jmwallet.wallet.service import WalletService
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.models import ClassifiedUTXO
@@ -29,31 +33,12 @@ async def test_get_mempool_min_fee_rejects_invalid_backend_values(
         await adapter.get_mempool_min_fee()
 
 
-def test_unlock_retains_metadata_owner_when_release_fails(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    adapter = JoinMarketAdapter(config=Mock())
-    adapter.wallet = Mock()
-    coin = classified_utxos[0]
-    adapter.lock(coin)
-    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
-    adapter.wallet.metadata_store.release_outpoints.side_effect = RuntimeError(
-        "metadata unavailable"
-    )
-
-    with pytest.raises(RuntimeError, match="metadata unavailable"):
-        adapter.unlock(coin)
-
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
-    assert adapter._lock_owners[outpoint] == owner
-    assert outpoint in adapter._locked_utxos
-
-
 def test_get_utxos_returns_confirmed_classified_coins(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     confirmed = classified_utxos[0].utxo
     info = SimpleNamespace(
@@ -82,6 +67,7 @@ def test_get_utxos_passes_mixdepth_to_address_lookup(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     confirmed = classified_utxos[0].utxo
 
@@ -113,6 +99,7 @@ def test_get_utxos_passes_mixdepth_to_address_lookup(
 def test_get_utxos_returns_empty_list_when_no_addresses_have_utxos() -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     with patch.object(
         adapter,
@@ -129,6 +116,7 @@ def test_get_utxos_returns_all_utxos_from_address_info(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     first = classified_utxos[0].utxo
     second = classified_utxos[1].utxo
@@ -161,6 +149,7 @@ def test_get_utxos_preserves_address_status(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     confirmed = classified_utxos[0].utxo
 
@@ -185,49 +174,44 @@ def test_get_utxos_preserves_address_status(
     assert result[0].status == "cj-change"
 
 
-def test_lock_freezes_utxo_and_records_lock(
+def test_lock_reserves_utxo_without_persistent_freeze(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
 
     adapter.lock(coin)
 
-    adapter.wallet.freeze_utxo.assert_called_once_with(
-        f"{coin.utxo.txid}:{coin.utxo.vout}",
-    )
-
+    adapter.wallet.reserve_coinjoin_inputs.assert_called_once()
+    args = adapter.wallet.reserve_coinjoin_inputs.call_args.args
+    assert args[0] == {(coin.utxo.txid, coin.utxo.vout)}
+    assert adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["owner"]
     assert (coin.utxo.txid, coin.utxo.vout) in adapter._locked_utxos
+    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
+    adapter.wallet.freeze_utxo.assert_not_called()
 
 
-def test_lock_uses_atomic_metadata_reservation(
+def test_lock_uses_atomic_owned_metadata_reservation(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
-    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
 
     adapter.lock(coin)
 
-    outpoint = f"{coin.utxo.txid}:{coin.utxo.vout}"
-    adapter.wallet.metadata_store.try_lock_outpoints.assert_called_once()
-    assert adapter.wallet.metadata_store.try_lock_outpoints.call_args.args[0] == [
-        outpoint
-    ]
-    assert adapter.wallet.metadata_store.try_lock_outpoints.call_args.kwargs["owner"]
+    adapter.wallet.reserve_coinjoin_inputs.assert_called_once()
     assert (
-        adapter.wallet.metadata_store.try_lock_outpoints.call_args.kwargs["ttl"]
-        == 24 * 60 * 60
+        adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["ttl"] == 24 * 60 * 60
     )
-    adapter.wallet.metadata_store.release_outpoints.assert_not_called()
-    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
+    owner = adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["owner"]
     assert owner
-    assert (coin.utxo.txid, coin.utxo.vout) in adapter._locked_utxos
-    adapter.wallet.freeze_utxo.assert_called_once()
+    assert adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)] == owner
 
 
 def test_lock_rejects_utxo_already_reserved_by_another_process(
@@ -235,7 +219,7 @@ def test_lock_rejects_utxo_already_reserved_by_another_process(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
-    adapter.wallet.metadata_store.try_lock_outpoints.return_value = False
+    adapter.wallet.reserve_coinjoin_inputs.return_value = False
 
     coin = classified_utxos[0]
 
@@ -243,30 +227,9 @@ def test_lock_rejects_utxo_already_reserved_by_another_process(
         adapter.lock(coin)
 
     adapter.wallet.freeze_utxo.assert_not_called()
-    adapter.wallet.metadata_store.release_outpoints.assert_not_called()
+    adapter.wallet.release_coinjoin_inputs.assert_not_called()
     assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
-
-
-def test_lock_releases_atomic_reservation_when_freeze_fails(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    adapter = JoinMarketAdapter(config=Mock())
-    adapter.wallet = Mock()
-    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
-    adapter.wallet.freeze_utxo.side_effect = RuntimeError("freeze failed")
-
-    coin = classified_utxos[0]
-    outpoint = f"{coin.utxo.txid}:{coin.utxo.vout}"
-
-    with pytest.raises(RuntimeError, match="freeze failed"):
-        adapter.lock(coin)
-
-    owner = adapter.wallet.metadata_store.release_outpoints.call_args.kwargs["owner"]
-    assert owner
-    adapter.wallet.metadata_store.release_outpoints.assert_called_once_with(
-        [outpoint], owner=owner
-    )
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
+    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
 
 
 def test_lock_rejects_already_locked_utxo(
@@ -274,47 +237,168 @@ def test_lock_rejects_already_locked_utxo(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
 
     adapter.lock(coin)
 
-    with pytest.raises(
-        ValueError,
-        match="is already locked",
-    ):
+    with pytest.raises(ValueError, match="is already locked"):
         adapter.lock(coin)
 
-    adapter.wallet.freeze_utxo.assert_called_once_with(
-        f"{coin.utxo.txid}:{coin.utxo.vout}",
-    )
+    adapter.wallet.reserve_coinjoin_inputs.assert_called_once()
 
 
-def test_unlock_unfreezes_utxo_and_removes_lock(
+def test_renew_extends_owned_reservation(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+    adapter.wallet.renew_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
 
     adapter.lock(coin)
-    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
+    owner = adapter._lock_owners[outpoint]
+    adapter.renew(coin)
+
+    adapter.wallet.renew_coinjoin_inputs.assert_called_once_with(
+        {outpoint},
+        owner=owner,
+        ttl=24 * 60 * 60,
+    )
+
+
+def test_renew_rejects_missing_local_owner(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+
+    with pytest.raises(RuntimeError, match="no local.*owner"):
+        adapter.renew(classified_utxos[0])
+
+    adapter.wallet.renew_coinjoin_inputs.assert_not_called()
+
+
+def test_renew_detects_expired_or_replaced_reservation(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+    adapter.wallet.renew_coinjoin_inputs.return_value = False
+
+    coin = classified_utxos[0]
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+
+    adapter.lock(coin)
+    owner = adapter._lock_owners[outpoint]
+
+    with pytest.raises(RuntimeError, match="expired or is no longer owned"):
+        adapter.renew(coin)
+
+    # Keep the owner generation after failed renewal so cleanup remains
+    # compare-and-release safe and can be retried without losing ownership
+    # information.
+    assert adapter._lock_owners[outpoint] == owner
+    assert outpoint in adapter._locked_utxos
+
+
+def test_renew_locks_renews_each_owner_generation(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+    adapter.wallet.renew_coinjoin_inputs.return_value = True
+
+    coins = classified_utxos[:2]
+    adapter.lock(coins[0])
+    adapter.lock(coins[1])
+    adapter.renew_locks(coins)
+
+    assert adapter.wallet.renew_coinjoin_inputs.call_count == 2
+    for coin in coins:
+        outpoint = (coin.utxo.txid, coin.utxo.vout)
+        assert adapter._lock_owners[outpoint]
+
+
+def test_lock_renewal_runs_outside_event_loop(
+    classified_utxos: list[ClassifiedUTXO],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+    adapter.wallet.renew_coinjoin_inputs.return_value = True
+
+    monkeypatch.setattr(
+        "jmlightning.adapters.joinmarket.LOCK_RENEWAL_INTERVAL_SECONDS",
+        0.01,
+    )
+
+    adapter.lock(classified_utxos[0])
+    adapter.start_lock_renewal()
+
+    # Deliberately block the calling thread. An asyncio task would not get a
+    # chance to run here, but the renewal worker must still execute.
+    time.sleep(0.05)
+
+    asyncio.run(adapter.stop_lock_renewal())
+    assert adapter.wallet.renew_coinjoin_inputs.call_count >= 2
+
+
+def test_unlock_releases_owned_reservation_without_unfreezing(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+
+    coin = classified_utxos[0]
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+
+    adapter.lock(coin)
+    owner = adapter._lock_owners[outpoint]
     adapter.unlock(coin)
 
-    adapter.wallet.unfreeze_utxo.assert_called_once_with(
-        f"{coin.utxo.txid}:{coin.utxo.vout}",
-    )
-
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
-    adapter.wallet.metadata_store.release_outpoints.assert_called_once_with(
-        [f"{coin.utxo.txid}:{coin.utxo.vout}"],
+    adapter.wallet.release_coinjoin_inputs.assert_called_once_with(
+        {outpoint},
         owner=owner,
     )
+    adapter.wallet.unfreeze_utxo.assert_not_called()
+    assert outpoint not in adapter._locked_utxos
+    assert outpoint not in adapter._lock_owners
 
 
-def test_unlock_untracked_utxo_still_unfreezes(
+def test_unlock_retains_owner_when_release_fails(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.reserve_coinjoin_inputs.return_value = True
+
+    coin = classified_utxos[0]
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+
+    adapter.lock(coin)
+    owner = adapter._lock_owners[outpoint]
+    adapter.wallet.release_coinjoin_inputs.side_effect = RuntimeError(
+        "metadata unavailable"
+    )
+
+    with pytest.raises(RuntimeError, match="metadata unavailable"):
+        adapter.unlock(coin)
+
+    assert adapter._lock_owners[outpoint] == owner
+    assert outpoint in adapter._locked_utxos
+    adapter.wallet.unfreeze_utxo.assert_not_called()
+
+
+def test_unlock_untracked_utxo_does_not_unfreeze(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
@@ -324,36 +408,156 @@ def test_unlock_untracked_utxo_still_unfreezes(
 
     adapter.unlock(coin)
 
-    adapter.wallet.unfreeze_utxo.assert_called_once_with(
-        f"{coin.utxo.txid}:{coin.utxo.vout}",
-    )
-
+    adapter.wallet.unfreeze_utxo.assert_not_called()
+    adapter.wallet.release_coinjoin_inputs.assert_not_called()
     assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
     assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
 
 
-def test_lock_rejects_disconnected_adapter(
+def test_get_utxos_excludes_cross_process_joinmarket_locks(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
 
-    with pytest.raises(
-        RuntimeError,
-        match="JoinMarketAdapter is not connected",
+    locked = classified_utxos[0].utxo
+    available = classified_utxos[1].utxo
+    adapter.wallet.get_locked_input_outpoints.return_value = {
+        (locked.txid, locked.vout)
+    }
+
+    info = SimpleNamespace(
+        base_status="cj-out",
+        status="cj-out",
+        utxos=[locked, available],
+    )
+
+    with patch.object(
+        adapter,
+        "_address_infos",
+        side_effect=[[info], []],
     ):
-        adapter.lock(classified_utxos[0])
+        result = adapter.get_utxos(mixdepth=0)
+
+    assert [coin.utxo for coin in result] == [available]
+    adapter.wallet.get_locked_input_outpoints.assert_called_once_with()
 
 
-def test_unlock_rejects_disconnected_adapter(
+def test_get_utxos_excludes_local_and_cross_process_locks(
     classified_utxos: list[ClassifiedUTXO],
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
 
-    with pytest.raises(
-        RuntimeError,
-        match="JoinMarketAdapter is not connected",
+    local_locked = classified_utxos[0].utxo
+    remote_locked = classified_utxos[1].utxo
+    available = classified_utxos[2].utxo
+    adapter._locked_utxos.add((local_locked.txid, local_locked.vout))
+    adapter.wallet.get_locked_input_outpoints.return_value = {
+        (remote_locked.txid, remote_locked.vout)
+    }
+
+    info = SimpleNamespace(
+        base_status="cj-out",
+        status="cj-out",
+        utxos=[local_locked, remote_locked, available],
+    )
+
+    with patch.object(
+        adapter,
+        "_address_infos",
+        side_effect=[[info], []],
     ):
-        adapter.unlock(classified_utxos[0])
+        result = adapter.get_utxos(mixdepth=0)
+
+    assert [coin.utxo for coin in result] == [available]
+
+
+def test_select_utxos_excludes_cross_process_joinmarket_locks(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    adapter = JoinMarketAdapter(config=Mock())
+    adapter.wallet = Mock()
+    adapter.wallet.utxo_cache = {
+        0: [coin.utxo for coin in classified_utxos[:3]],
+    }
+    adapter.wallet.get_locked_input_outpoints.return_value = {
+        (classified_utxos[0].utxo.txid, classified_utxos[0].utxo.vout),
+    }
+    adapter.wallet.select_utxos.return_value = [classified_utxos[1].utxo]
+
+    result = adapter.select_utxos(
+        mixdepth=0,
+        target_amount=50_000,
+        allowed_outpoints={
+            (coin.utxo.txid, coin.utxo.vout) for coin in classified_utxos[:3]
+        },
+    )
+
+    assert result == [classified_utxos[1].utxo]
+    excluded = adapter.wallet.select_utxos.call_args.kwargs["exclude"]
+    assert (classified_utxos[0].utxo.txid, classified_utxos[0].utxo.vout) in excluded
+
+
+def test_unlock_after_lease_expiry_cannot_release_new_owner(
+    classified_utxos: list[ClassifiedUTXO],
+) -> None:
+    class ReservationWallet:
+        def __init__(self) -> None:
+            self.owners: dict[tuple[str, int], str] = {}
+
+        def reserve_coinjoin_inputs(
+            self,
+            outpoints: set[tuple[str, int]],
+            *,
+            ttl: float,
+            owner: str,
+        ) -> bool:
+            del ttl
+            if any(outpoint in self.owners for outpoint in outpoints):
+                return False
+            self.owners.update({outpoint: owner for outpoint in outpoints})
+            return True
+
+        def release_coinjoin_inputs(
+            self,
+            outpoints: set[tuple[str, int]],
+            *,
+            owner: str,
+        ) -> None:
+            for outpoint in outpoints:
+                if self.owners.get(outpoint) == owner:
+                    del self.owners[outpoint]
+
+        def expire(self, outpoint: tuple[str, int]) -> None:
+            self.owners.pop(outpoint, None)
+
+    wallet = ReservationWallet()
+    adapter_a = JoinMarketAdapter(config=Mock())
+    adapter_b = JoinMarketAdapter(config=Mock())
+    adapter_a.wallet = cast(WalletService, wallet)
+    adapter_b.wallet = cast(WalletService, wallet)
+
+    coin = classified_utxos[0]
+    outpoint = (coin.utxo.txid, coin.utxo.vout)
+
+    adapter_a.lock(coin)
+    owner_a = adapter_a._lock_owners[outpoint]
+    wallet.expire(outpoint)
+
+    adapter_b.lock(coin)
+    owner_b = adapter_b._lock_owners[outpoint]
+    assert owner_a != owner_b
+    assert wallet.owners[outpoint] == owner_b
+
+    # A stale cleanup must compare its owner token. It must not release B's
+    # newly acquired reservation after A's lease expired.
+    adapter_a.unlock(coin)
+
+    assert wallet.owners[outpoint] == owner_b
+    assert outpoint not in adapter_a._lock_owners
+    assert outpoint not in adapter_a._locked_utxos
+    assert adapter_b._lock_owners[outpoint] == owner_b
 
 
 def test_get_change_address_rejects_disconnected_adapter() -> None:
@@ -659,6 +863,7 @@ def test_get_utxos_excludes_unconfirmed_fidelity_and_locked_coins(
 ) -> None:
     adapter = JoinMarketAdapter(config=Mock())
     adapter.wallet = Mock()
+    adapter.wallet.get_locked_input_outpoints.return_value = set()
 
     confirmed = classified_utxos[0].utxo
     unconfirmed = SimpleNamespace(
@@ -725,62 +930,6 @@ async def test_get_mempool_min_fee_rejects_boolean_value() -> None:
 
     with pytest.raises(RuntimeError, match="invalid mempool fee rate"):
         await adapter.get_mempool_min_fee()
-
-
-def test_unlock_restores_owner_when_metadata_store_is_missing(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    adapter = JoinMarketAdapter(config=Mock())
-    adapter.wallet = Mock()
-    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
-
-    coin = classified_utxos[0]
-    adapter.lock(coin)
-    adapter.wallet.metadata_store = None
-
-    with pytest.raises(RuntimeError, match="without a data directory"):
-        adapter.unlock(coin)
-
-    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
-
-
-def test_unlock_restores_owner_when_metadata_release_fails(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    adapter = JoinMarketAdapter(config=Mock())
-    adapter.wallet = Mock()
-    coin = classified_utxos[0]
-    adapter.lock(coin)
-    owner = adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)]
-    adapter.wallet.metadata_store.try_lock_outpoints.return_value = True
-    adapter.wallet.metadata_store.release_outpoints.side_effect = RuntimeError(
-        "release failed"
-    )
-
-    with pytest.raises(RuntimeError, match="release failed"):
-        adapter.unlock(coin)
-
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
-    assert adapter._lock_owners[outpoint] == owner
-    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
-    assert outpoint in adapter._locked_utxos
-
-
-def test_unlock_rejects_missing_metadata_store(
-    classified_utxos: list[ClassifiedUTXO],
-) -> None:
-    adapter = JoinMarketAdapter(config=Mock())
-    adapter.wallet = Mock()
-    coin = classified_utxos[0]
-    adapter.lock(coin)
-    adapter.wallet.metadata_store = None
-
-    with pytest.raises(RuntimeError, match="without a data directory"):
-        adapter.unlock(coin)
-
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
-    assert outpoint in adapter._lock_owners
-    assert outpoint in adapter._locked_utxos
 
 
 @pytest.mark.anyio

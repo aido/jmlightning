@@ -2,7 +2,7 @@
 name = "jmlightning-meta"
 version = "0.1.0"
 description = "Meta-package for JoinMarket-NG bridge module and plugin for Lightning Network nodes (Core Lightning)"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 
 [build-system]
 requires = ["setuptools>=61.0"]

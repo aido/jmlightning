@@ -2,9 +2,9 @@
 name = "jmpeerswap"
 version = "0.1.0"
 description = "Standalone Core Lightning PeerSwap bridge plugin for JoinMarket-NG"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
-    "pyln-client>=26.0.0,<27.0.0",
+    "pyln-client>=26.6.8,<27.0.0",
 ]
 
 [project.scripts]
