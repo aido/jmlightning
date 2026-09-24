@@ -731,6 +731,8 @@ class PeerSwapRendezvousClient:
         self.pool_size = pool_size
         self.rpc_factory = rpc_factory
         self._stopping = threading.Event()
+        self._dispatch_condition = threading.Condition()
+        self._active_dispatches = 0
         self._threads: list[threading.Thread] = []
 
     def start(self) -> None:
@@ -751,6 +753,9 @@ class PeerSwapRendezvousClient:
 
     def stop(self) -> None:
         self._stopping.set()
+        with self._dispatch_condition:
+            while self._active_dispatches:
+                self._dispatch_condition.wait()
         threads = self._threads
         self._threads = []
         for thread in threads:
@@ -765,8 +770,10 @@ class PeerSwapRendezvousClient:
         while not self._stopping.is_set():
             try:
                 request = rpc.call("jmpeerswap-request", {})
-                if self._stopping.is_set():
-                    return
+                with self._dispatch_condition:
+                    if self._stopping.is_set():
+                        return
+                    self._active_dispatches += 1
                 logger.info(
                     "PeerSwap rendezvous client socket={} "
                     "received method={} request_id={}",
@@ -774,7 +781,13 @@ class PeerSwapRendezvousClient:
                     request.get("method") if isinstance(request, dict) else "?",
                     request.get("request_id") if isinstance(request, dict) else "?",
                 )
-                self._handle_request(rpc, request)
+                try:
+                    self._handle_request(rpc, request)
+                finally:
+                    with self._dispatch_condition:
+                        self._active_dispatches -= 1
+                        if self._active_dispatches == 0:
+                            self._dispatch_condition.notify_all()
             except Exception as exc:
                 logger.exception(
                     "PeerSwap rendezvous client socket={} failed: {}",

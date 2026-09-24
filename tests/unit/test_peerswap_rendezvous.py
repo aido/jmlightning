@@ -137,6 +137,55 @@ def test_rendezvous_worker_drops_request_returned_after_stop() -> None:
     assert handled == []
 
 
+def test_rendezvous_stop_waits_for_admitted_request_before_closing_handler() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    closed = threading.Event()
+
+    class BlockingRpc:
+        def call(self, method: str, params: object = None) -> Any:
+            del params
+            assert method == "jmpeerswap-request"
+            return {
+                "request_id": "active",
+                "method": "txsend",
+                "params": {},
+            }
+
+    class BlockingHandler:
+        def __call__(self, method: str, params: object) -> None:
+            del method, params
+            entered.set()
+            assert release.wait(timeout=2)
+
+        def close(self) -> None:
+            closed.set()
+
+    handler = BlockingHandler()
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"),
+        cast(Callable[[str, object], object], handler),
+        pool_size=1,
+        rpc_factory=lambda _: cast(LightningRpc, BlockingRpc()),
+    )
+
+    worker = threading.Thread(target=client._worker)
+    worker.start()
+    assert entered.wait(timeout=2)
+
+    stopper = threading.Thread(target=client.stop)
+    stopper.start()
+    assert not closed.wait(timeout=0.1)
+
+    release.set()
+    stopper.join(timeout=2)
+    worker.join(timeout=2)
+
+    assert not stopper.is_alive()
+    assert not worker.is_alive()
+    assert closed.is_set()
+
+
 def test_dispatcher_close_closes_operation_before_stopping_loop() -> None:
     operation = Mock()
     operation.close = AsyncMock()
