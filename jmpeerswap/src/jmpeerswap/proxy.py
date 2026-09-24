@@ -187,14 +187,15 @@ class UnixRPCProxy:
             upstream = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             upstream.connect(str(self.upstream_path))
 
+            relay_stopping = threading.Event()
             client_to_upstream = threading.Thread(
                 target=self._relay_client,
-                args=(client, upstream),
+                args=(client, upstream, relay_stopping),
                 daemon=True,
             )
             upstream_to_client = threading.Thread(
                 target=self._relay,
-                args=(upstream, client),
+                args=(upstream, client, relay_stopping),
                 daemon=True,
             )
 
@@ -221,7 +222,27 @@ class UnixRPCProxy:
             with self._clients_lock:
                 self._clients.discard(client)
 
-    def _relay_client(self, client: socket.socket, upstream: socket.socket) -> None:
+    @staticmethod
+    def _stop_relay(
+        stopping: threading.Event,
+        source: socket.socket,
+        destination: socket.socket,
+    ) -> None:
+        if stopping.is_set():
+            return
+        stopping.set()
+        for sock in (source, destination):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    def _relay_client(
+        self,
+        client: socket.socket,
+        upstream: socket.socket,
+        stopping: threading.Event,
+    ) -> None:
         reader = client.makefile("rb")
         write_lock = threading.Lock()
         deferred: set[_ProxyResponse] = set()
@@ -230,10 +251,6 @@ class UnixRPCProxy:
             while True:
                 data = reader.readline()
                 if not data:
-                    try:
-                        upstream.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
                     return
 
                 response_sink = _ProxyResponse(client, write_lock)
@@ -255,6 +272,7 @@ class UnixRPCProxy:
             reader.close()
             for response_sink in deferred:
                 response_sink.disconnect()
+            self._stop_relay(stopping, client, upstream)
 
     def _handle_request(
         self,
@@ -275,16 +293,18 @@ class UnixRPCProxy:
         return self.request_handler(request, respond)
 
     @staticmethod
-    def _relay(source: socket.socket, destination: socket.socket) -> None:
+    def _relay(
+        source: socket.socket,
+        destination: socket.socket,
+        stopping: threading.Event,
+    ) -> None:
         try:
             while True:
                 data = source.recv(64 * 1024)
                 if not data:
-                    try:
-                        destination.shutdown(socket.SHUT_WR)
-                    except OSError:
-                        pass
                     return
                 destination.sendall(data)
         except OSError:
             return
+        finally:
+            UnixRPCProxy._stop_relay(stopping, source, destination)
