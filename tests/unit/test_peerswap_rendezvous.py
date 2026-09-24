@@ -98,6 +98,45 @@ def test_rendezvous_client_propagates_handler_error() -> None:
     )
 
 
+def test_rendezvous_worker_drops_request_returned_after_stop() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    handled: list[tuple[str, object]] = []
+
+    class BlockingRpc:
+        def call(self, method: str, params: object = None) -> Any:
+            del params
+            assert method == "jmpeerswap-request"
+            entered.set()
+            assert release.wait(timeout=2)
+            return {
+                "request_id": "late",
+                "method": "txsend",
+                "params": {},
+            }
+
+    def handler(method: str, params: object) -> None:
+        handled.append((method, params))
+
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"),
+        handler,
+        pool_size=1,
+        rpc_factory=lambda _: cast(LightningRpc, BlockingRpc()),
+    )
+
+    worker = threading.Thread(target=client._worker)
+    worker.start()
+    assert entered.wait(timeout=2)
+
+    client._stopping.set()
+    release.set()
+    worker.join(timeout=2)
+
+    assert not worker.is_alive()
+    assert handled == []
+
+
 def test_dispatcher_close_closes_operation_before_stopping_loop() -> None:
     operation = Mock()
     operation.close = AsyncMock()

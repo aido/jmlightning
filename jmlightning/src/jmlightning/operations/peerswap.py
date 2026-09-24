@@ -764,6 +764,8 @@ class PeerSwapRendezvousClient:
         while not self._stopping.is_set():
             try:
                 request = rpc.call("jmpeerswap-request", {})
+                if self._stopping.is_set():
+                    return
                 logger.info(
                     "PeerSwap rendezvous client socket={} "
                     "received method={} request_id={}",
