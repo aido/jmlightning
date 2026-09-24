@@ -16,8 +16,7 @@ from pyln.client.plugin import Request
 
 import jmpeerswap.plugin as plugin
 from jmpeerswap.proxy import UnixRPCProxy
-
-PEERSWAP_OUTPUT_ADDRESS = "bcrt1qqqgjyv6y24n80zye42aueh0wluqpzg3n9tg8m2"
+from jmpeerswap.rendezvous import PeerSwapRendezvous
 
 # PeerSwap advertises these Bitcoin/CLN RPC methods. The three
 # peerswap-lbtc-* methods are deliberately excluded because jm-lightning is
@@ -122,7 +121,7 @@ def test_rendezvous_response_method_accepts_rpc_kwargs() -> None:
     responses: list[dict[str, Any]] = []
     rendezvous.submit(
         "txprepare",
-        {"outputs": [{PEERSWAP_OUTPUT_ADDRESS: "100000sat"}]},
+        {"outputs": [{"bcrt1qqqgjyv6y24n80zye42aueh0wluqpzg3n9tg8m2": "100000sat"}]},
         9,
         responses.append,
     )
@@ -201,6 +200,48 @@ def test_proxy_request_handler_rendezvous_intercepts_transaction_calls() -> None
     )
     assert waiter.result["method"] == "txprepare"
     assert responses == []
+
+
+def test_proxy_disconnect_uses_rendezvous_request_id() -> None:
+    rendezvous = PeerSwapRendezvous()
+    waiter = type(
+        "Waiter",
+        (),
+        {
+            "set_result": lambda self, result: setattr(self, "result", result),
+            "set_exception": lambda self, exc: setattr(self, "exception", exc),
+        },
+    )()
+    rendezvous.wait(cast(Request, waiter))
+
+    disconnect_handler: list[Callable[[], None]] = []
+
+    class ResponseSink:
+        def __call__(self, response: dict[str, object]) -> None:
+            pass
+
+        def set_disconnect_handler(self, callback: Callable[[], None]) -> None:
+            disconnect_handler.append(callback)
+
+    request = {
+        "jsonrpc": "2.0",
+        "id": 17,
+        "method": "txsend",
+        "params": {"txid": "11" * 32},
+    }
+
+    assert (
+        plugin._handle_proxy_request(request, ResponseSink(), rendezvous)
+        is plugin.DEFERRED_RESPONSE
+    )
+    rendezvous_request_id = waiter.result["request_id"]
+    assert rendezvous_request_id != "17"
+    assert disconnect_handler
+
+    disconnect_handler[0]()
+
+    assert rendezvous_request_id not in rendezvous._requests
+    assert rendezvous_request_id in rendezvous._terminal
 
 
 def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:

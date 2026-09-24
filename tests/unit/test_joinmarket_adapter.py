@@ -206,9 +206,7 @@ def test_lock_uses_atomic_owned_metadata_reservation(
     adapter.lock(coin)
 
     adapter.wallet.reserve_coinjoin_inputs.assert_called_once()
-    assert (
-        adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["ttl"] == 24 * 60 * 60
-    )
+    assert adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["ttl"] == 30 * 60
     owner = adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["owner"]
     assert owner
     assert adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)] == owner
@@ -267,7 +265,7 @@ def test_renew_extends_owned_reservation(
     adapter.wallet.renew_coinjoin_inputs.assert_called_once_with(
         {outpoint},
         owner=owner,
-        ttl=24 * 60 * 60,
+        ttl=30 * 60,
     )
 
 

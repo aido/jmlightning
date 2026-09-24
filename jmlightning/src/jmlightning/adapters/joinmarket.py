@@ -27,10 +27,10 @@ logger = logging.getLogger(__name__)
 # Keep the lease longer than the normal interactive funding flow. Operations
 # which can legitimately outlive this window should renew their reservations
 # before continuing.
-LOCK_TTL_SECONDS = 24 * 60 * 60
-# Renew well before expiry so scheduler or backend delays do not allow a
-# long-lived operation to lose its reservation between explicit checkpoints.
-LOCK_RENEWAL_INTERVAL_SECONDS = LOCK_TTL_SECONDS / 3
+LOCK_TTL_SECONDS = 30 * 60
+# Renew frequently enough that a transient scheduler/backend delay does not
+# allow a long-lived operation to lose its reservation between checkpoints.
+LOCK_RENEWAL_INTERVAL_SECONDS = 5 * 60
 
 
 class NetworkLike(Protocol):

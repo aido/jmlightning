@@ -3,7 +3,8 @@ from __future__ import annotations
 import asyncio
 import threading
 from collections.abc import Callable
-from dataclasses import dataclass
+from concurrent.futures import Future
+from dataclasses import dataclass, field
 from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
@@ -172,6 +173,7 @@ class PreparedPeerSwapTransaction:
     # long-lived lifecycle methods renew and release.
     reservations: tuple[ClassifiedUTXO, ...] = ()
     phase: PeerSwapPhase = PeerSwapPhase.PREPARED
+    released_reservations: set[tuple[str, int]] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.reservations:
@@ -328,6 +330,13 @@ class PeerSwapPrepareTxOperation:
                 # Keep transaction ids canonical internally so case-insensitive
                 # hex input cannot create duplicate prepared-state identities.
                 txid = txid.lower()
+            except asyncio.CancelledError:
+                for coin in reversed(locked):
+                    try:
+                        jmadapter.unlock(coin)
+                    except Exception:
+                        pass
+                raise
             except Exception:
                 for coin in reversed(locked):
                     try:
@@ -357,6 +366,13 @@ class PeerSwapPrepareTxOperation:
                 len(selected),
             )
             return prepared
+        except asyncio.CancelledError:
+            logger.info(
+                "PeerSwap JM operation txprepare cancelled socket={}",
+                self.cln_socket,
+            )
+            await jmadapter.close()
+            raise
         except Exception as exc:
             logger.exception(
                 "PeerSwap JM operation txprepare failed socket={}: {}",
@@ -399,7 +415,16 @@ class PeerSwapPrepareTxOperation:
             self.cln_socket,
             txid,
         )
-        broadcast_txid = await prepared.adapter.broadcast(prepared.tx)
+        # A broadcast is an externally visible side effect. If the rendezvous
+        # cancellation races with this await, cancelling the coroutine must not
+        # make us guess whether the transaction was broadcast. Let the backend
+        # call finish before the operation is allowed to clean up its prepared
+        # state.
+        broadcast_task = asyncio.create_task(prepared.adapter.broadcast(prepared.tx))
+        try:
+            broadcast_txid = await asyncio.shield(broadcast_task)
+        except asyncio.CancelledError:
+            broadcast_txid = await broadcast_task
         self._validate_txid(broadcast_txid, "JoinMarket broadcast transaction id")
         broadcast_txid = broadcast_txid.lower()
         if broadcast_txid != txid:
@@ -408,37 +433,22 @@ class PeerSwapPrepareTxOperation:
                 f"expected {txid}, got {broadcast_txid}"
             )
 
-        # Broadcasting is the terminal transaction state. Remove the state
-        # from the operation before cleanup so it cannot be sent twice even if
-        # releasing JoinMarket resources subsequently reports an error.
+        # Broadcasting is the terminal transaction state. Keep the state
+        # retained until JoinMarket cleanup succeeds so a failed unlock/close
+        # cannot strand an input until its lease expires. The BROADCAST phase
+        # also prevents a retry from broadcasting the transaction twice.
         prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST)
-        self._prepared.pop(txid)
-        cleanup_errors: list[Exception] = []
-        for coin in reversed(prepared.reservations):
-            try:
-                prepared.adapter.unlock(coin)
-            except Exception as exc:
-                cleanup_errors.append(exc)
-                logger.error(
-                    "Failed to unlock {}:{} after PeerSwap broadcast: {}",
-                    coin.utxo.txid,
-                    coin.utxo.vout,
-                    exc,
-                )
-
         try:
-            await prepared.adapter.close()
-        except Exception as exc:
-            cleanup_errors.append(exc)
-            logger.error("Failed to close PeerSwap JoinMarket adapter: {}", exc)
-
-        if cleanup_errors:
+            await self._cleanup_prepared(prepared)
+        except RuntimeError as exc:
             logger.warning(
-                "PeerSwap transaction {} was broadcast but cleanup encountered "
-                "{} error(s)",
+                "PeerSwap transaction {} was broadcast but cleanup failed; "
+                "retaining state for retry: {}",
                 txid,
-                len(cleanup_errors),
+                exc,
             )
+        else:
+            self._prepared.pop(txid, None)
 
         logger.info(
             "PeerSwap JM operation txsend complete socket={} txid={}",
@@ -497,17 +507,74 @@ class PeerSwapPrepareTxOperation:
             "psbt": psbt_to_base64(prepared.psbt),
         }
 
+    async def _cleanup_prepared(self, prepared: PreparedPeerSwapTransaction) -> None:
+        """Release a prepared transaction's JoinMarket resources.
+
+        The adapter remains open when an unlock fails because its owner token
+        and wallet handle are required for a safe retry. Likewise, state is
+        only removed by the caller after both unlocking and adapter close have
+        succeeded.
+        """
+        cleanup_errors: list[Exception] = []
+        for coin in reversed(prepared.reservations):
+            outpoint = (coin.utxo.txid, coin.utxo.vout)
+            if outpoint in prepared.released_reservations:
+                continue
+            try:
+                prepared.adapter.unlock(coin)
+            except Exception as exc:
+                cleanup_errors.append(exc)
+                logger.error(
+                    "Failed to unlock {}:{} while cleaning up PeerSwap "
+                    "transaction {}: {}",
+                    coin.utxo.txid,
+                    coin.utxo.vout,
+                    prepared.txid,
+                    exc,
+                )
+            else:
+                prepared.released_reservations.add(outpoint)
+
+        # Do not close the adapter while any release failed: closing the wallet
+        # would discard the local owner token needed for a later compare-and-
+        # release retry.
+        if cleanup_errors:
+            raise RuntimeError(
+                f"Failed to fully clean up PeerSwap transaction {prepared.txid} "
+                f"({len(cleanup_errors)} error(s))"
+            ) from cleanup_errors[0]
+
+        try:
+            await prepared.adapter.close()
+        except Exception as exc:
+            logger.error(
+                "Failed to close PeerSwap JoinMarket adapter while cleaning up "
+                "transaction {}: {}",
+                prepared.txid,
+                exc,
+            )
+            raise RuntimeError(
+                f"Failed to fully clean up PeerSwap transaction {prepared.txid} "
+                "(1 error(s))"
+            ) from exc
+
     async def close(self) -> None:
         """Release all prepared transactions and any pre-connected wallet."""
-        for txid in list(self._prepared):
+        for txid, prepared in list(self._prepared.items()):
+            if prepared.phase not in {PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST}:
+                continue
             try:
-                await self.discard(txid)
+                await self._cleanup_prepared(prepared)
             except Exception as exc:
                 logger.error(
-                    "Failed to discard prepared PeerSwap transaction {}: {}",
+                    "Failed to clean up PeerSwap transaction {}: {}",
                     txid,
                     exc,
                 )
+                continue
+            self._prepared.pop(txid, None)
+            if prepared.phase is PeerSwapPhase.PREPARED:
+                prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
 
         adapter = self._connected_adapter
         self._connected_adapter = None
@@ -519,50 +586,15 @@ class PeerSwapPrepareTxOperation:
         prepared = self._prepared.get(txid)
         if prepared is None:
             raise ValueError(f"PeerSwap transaction {txid} is not prepared")
+        prepared.require_phase(PeerSwapPhase.PREPARED)
+
+        # Keep PREPARED state until every cleanup step succeeds. If an unlock
+        # or close fails, the same adapter and owner token remain available for
+        # a subsequent txdiscard retry.
+        await self._cleanup_prepared(prepared)
         prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
-        self._prepared.pop(txid)
+        self._prepared.pop(txid, None)
 
-        # Discard is terminal. The transition above happens before cleanup so
-        # a partially failing cleanup cannot leave a transaction available for
-        # a second lifecycle action.
-
-        # First release every locked input so the transaction no longer owns
-        # JoinMarket wallet state.
-        cleanup_errors: list[Exception] = []
-        for coin in reversed(prepared.reservations):
-            try:
-                prepared.adapter.unlock(coin)
-            except Exception as exc:
-                cleanup_errors.append(exc)
-                logger.error(
-                    "Failed to unlock {}:{} while discarding PeerSwap transaction: {}",
-                    coin.utxo.txid,
-                    coin.utxo.vout,
-                    exc,
-                )
-
-        # Always close the adapter, even when an input could not be unlocked.
-        try:
-            await prepared.adapter.close()
-        except Exception as exc:
-            cleanup_errors.append(exc)
-            logger.error(
-                "Failed to close PeerSwap JoinMarket adapter while discarding "
-                "transaction {}: {}",
-                txid,
-                exc,
-            )
-
-        # The prepared state has already been removed, so report cleanup
-        # failures without leaving a transaction that cannot be retried safely.
-        if cleanup_errors:
-            raise RuntimeError(
-                f"Failed to fully clean up PeerSwap transaction {txid} "
-                f"({len(cleanup_errors)} error(s))"
-            ) from cleanup_errors[0]
-
-        # CLN txdiscard returns the same unsigned transaction identity that
-        # txprepare created, after releasing the reserved inputs.
         return {
             "unsigned_tx": self._unsigned_tx(prepared),
             "txid": prepared.txid,
@@ -768,6 +800,20 @@ class PeerSwapRendezvousClient:
             method,
             request_id,
         )
+
+        start_request = getattr(self.handler, "start_request", None)
+        cancel_request = getattr(self.handler, "cancel_request", None)
+        if callable(start_request) and callable(cancel_request):
+            self._handle_cancellable_request(
+                rpc,
+                request_id,
+                method,
+                request.get("params", {}),
+                start_request,
+                cancel_request,
+            )
+            return
+
         try:
             result = self.handler(method, request.get("params", {}))
         except ValueError as exc:
@@ -787,6 +833,115 @@ class PeerSwapRendezvousClient:
             "jmpeerswap-response",
             {"request_id": request_id, "result": result},
         )
+
+    def _handle_cancellable_request(
+        self,
+        rpc: LightningRpc,
+        request_id: str,
+        method: str,
+        params: object,
+        start_request: Callable[[str, str, object], Future[object]],
+        cancel_request: Callable[[str], None],
+    ) -> None:
+        cancelled = threading.Event()
+        future = start_request(request_id, method, params)
+        if not isinstance(future, Future):
+            raise TypeError("PeerSwap cancellable handler returned an invalid future")
+
+        def watch_cancel() -> None:
+            try:
+                cancel_rpc = self.rpc_factory(str(self.cln_socket))
+                result = cancel_rpc.call(
+                    "jmpeerswap-cancel",
+                    {"request_id": request_id},
+                )
+                if (
+                    isinstance(result, dict)
+                    and result.get("request_id") == request_id
+                    and result.get("state") in {"cancelled", "timed_out"}
+                ):
+                    cancelled.set()
+                    cancel_request(request_id)
+            except Exception as exc:
+                if not self._stopping.is_set():
+                    logger.exception(
+                        "PeerSwap cancellation watcher socket={} "
+                        "request_id={} failed: {}",
+                        self.cln_socket,
+                        request_id,
+                        exc,
+                    )
+
+        watcher = threading.Thread(
+            target=watch_cancel,
+            name=f"jm-lightning-peerswap-cancel-{request_id[:8]}",
+            daemon=True,
+        )
+        watcher.start()
+
+        try:
+            result = future.result()
+        except Exception as exc:
+            if cancelled.is_set():
+                logger.info(
+                    "PeerSwap rendezvous operation cancelled socket={} request_id={}",
+                    self.cln_socket,
+                    request_id,
+                )
+                finish_request = getattr(self.handler, "finish_request", None)
+                if callable(finish_request):
+                    finish_request(request_id)
+                return
+            if isinstance(exc, ValueError):
+                self._send_error(rpc, request_id, -32602, str(exc))
+            else:
+                self._send_error(rpc, request_id, -32603, str(exc))
+            finish_request = getattr(self.handler, "finish_request", None)
+            if callable(finish_request):
+                finish_request(request_id)
+            return
+
+        if cancelled.is_set():
+            logger.info(
+                "PeerSwap rendezvous operation completed after cancellation socket={} "
+                "request_id={}",
+                self.cln_socket,
+                request_id,
+            )
+            cancel_request(request_id)
+            finish_request = getattr(self.handler, "finish_request", None)
+            if callable(finish_request):
+                finish_request(request_id)
+            return
+
+        logger.info(
+            "PeerSwap rendezvous response socket={} method={} request_id={} ok",
+            self.cln_socket,
+            method,
+            request_id,
+        )
+        try:
+            rpc.call(
+                "jmpeerswap-response",
+                {"request_id": request_id, "result": result},
+            )
+        except Exception:
+            # The PeerSwap side may have disconnected between operation
+            # completion and response delivery. If this was txprepare, the
+            # completed result still owns a prepared JoinMarket transaction,
+            # so cancellation must discard it before the dispatcher releases
+            # the operation handle.
+            cancel_request(request_id)
+            logger.info(
+                "PeerSwap rendezvous response was no longer deliverable "
+                "socket={} request_id={}",
+                self.cln_socket,
+                request_id,
+            )
+        finally:
+            finish_request = getattr(self.handler, "finish_request", None)
+            if callable(finish_request):
+                finish_request(request_id)
 
     @staticmethod
     def _send_error(
@@ -848,9 +1003,19 @@ class PeerSwapOperationDispatcher:
         self._loop_thread: threading.Thread | None = None
         self._loop_ready = threading.Event()
         self._close_lock = threading.Lock()
+        self._active: dict[str, tuple[Future[object], str]] = {}
+        self._cancel_cleanup_requests: set[str] = set()
         self._closed = False
 
     def __call__(self, method: str, params: object) -> object:
+        if method not in {"txprepare", "txsend", "txdiscard"}:
+            raise ValueError(f"Unsupported PeerSwap request: {method}")
+        future = self.start_request(f"direct-{id(params)}", method, params)
+        return future.result()
+
+    def start_request(
+        self, request_id: str, method: str, params: object
+    ) -> Future[object]:
         if method not in {"txprepare", "txsend", "txdiscard"}:
             raise ValueError(f"Unsupported PeerSwap request: {method}")
         with self._lock:
@@ -859,7 +1024,81 @@ class PeerSwapOperationDispatcher:
                 self._dispatch(method, params),
                 loop,
             )
-            return future.result()
+            self._cancel_cleanup_requests.discard(request_id)
+            self._active[request_id] = (future, method)
+            return future
+
+    def cancel_request(self, request_id: str) -> None:
+        """Cancel an active request and clean up a completed txprepare.
+
+        ``Future.cancel()`` is the transition attempt. If it returns False,
+        completion may already have won the race, so a txprepare must be
+        inspected rather than assuming that cancellation prevented preparation.
+        """
+        with self._lock:
+            active = self._active.get(request_id)
+        if active is None:
+            return
+
+        future, method = active
+        cancelled = future.cancel()
+        if cancelled:
+            return
+
+        if method != "txprepare":
+            return
+
+        with self._lock:
+            if request_id in self._cancel_cleanup_requests:
+                return
+            self._cancel_cleanup_requests.add(request_id)
+
+        def cleanup_completed(done: Future[object]) -> None:
+            if done.cancelled():
+                return
+            try:
+                result = done.result()
+            except Exception:
+                return
+            if not isinstance(result, dict):
+                return
+            txid = result.get("txid")
+            if not isinstance(txid, str):
+                return
+
+            with self._lock:
+                loop = self._loop
+                loop_thread = self._loop_thread
+            if loop is None:
+                loop = self._ensure_loop()
+                with self._lock:
+                    loop_thread = self._loop_thread
+
+            coroutine = self.operation.discard(txid.lower())
+            if loop_thread is threading.current_thread():
+                loop.create_task(coroutine)
+                return
+
+            discard = asyncio.run_coroutine_threadsafe(coroutine, loop)
+            try:
+                discard.result()
+            except Exception as exc:
+                logger.error(
+                    "Failed to discard cancelled PeerSwap txprepare {}: {}",
+                    txid,
+                    exc,
+                )
+
+        if future.done():
+            cleanup_completed(future)
+        else:
+            future.add_done_callback(cleanup_completed)
+
+    def finish_request(self, request_id: str) -> None:
+        """Release the rendezvous operation handle after response delivery."""
+        with self._lock:
+            self._active.pop(request_id, None)
+            self._cancel_cleanup_requests.discard(request_id)
 
     def close(self) -> None:
         """Close prepared PeerSwap state and stop the event loop."""
@@ -872,6 +1111,14 @@ class PeerSwapOperationDispatcher:
                 loop = self._ensure_loop()
                 thread = self._loop_thread
 
+            active = [future for future, _ in self._active.values()]
+            for future in active:
+                future.cancel()
+            for future in active:
+                try:
+                    future.result()
+                except Exception:
+                    pass
             close_future = asyncio.run_coroutine_threadsafe(
                 self.operation.close(),
                 loop,

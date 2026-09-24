@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -246,3 +247,113 @@ def test_dispatcher_rejects_invalid_transaction_id() -> None:
         dispatcher("txsend", {"txid": "not-a-txid"})
 
     dispatcher.close()
+
+
+def test_dispatcher_cleans_up_txprepare_when_cancel_loses_race() -> None:
+    from concurrent.futures import Future
+
+    operation = Mock(spec=PeerSwapPrepareTxOperation)
+    operation.discard = AsyncMock(return_value={})
+    dispatcher = PeerSwapOperationDispatcher(operation)
+    future: Future[object] = Future()
+    future.set_result({"txid": "22" * 32})
+    with dispatcher._lock:
+        dispatcher._active["req-1"] = (future, "txprepare")
+
+    dispatcher.cancel_request("req-1")
+
+    operation.discard.assert_awaited_once_with("22" * 32)
+    dispatcher.close()
+
+
+def test_dispatcher_cleans_up_txprepare_that_completes_after_cancel() -> None:
+    from concurrent.futures import Future
+
+    class NonCancellingFuture(Future[object]):
+        def cancel(self) -> bool:
+            return False
+
+    operation = Mock(spec=PeerSwapPrepareTxOperation)
+    operation.discard = AsyncMock(return_value={})
+    dispatcher = PeerSwapOperationDispatcher(operation)
+    future = NonCancellingFuture()
+    with dispatcher._lock:
+        dispatcher._active["req-1"] = (future, "txprepare")
+
+    dispatcher.cancel_request("req-1")
+    future.set_result({"txid": "22" * 32})
+
+    operation.discard.assert_awaited_once_with("22" * 32)
+    dispatcher.cancel_request("req-1")
+    operation.discard.assert_awaited_once_with("22" * 32)
+    dispatcher.close()
+
+
+def test_dispatcher_inspects_completed_txprepare_when_cancel_fails() -> None:
+    from concurrent.futures import Future
+
+    class NonCancellingFuture(Future[object]):
+        def cancel(self) -> bool:
+            return False
+
+    operation = Mock(spec=PeerSwapPrepareTxOperation)
+    operation.discard = AsyncMock(return_value={})
+    dispatcher = PeerSwapOperationDispatcher(operation)
+    future = NonCancellingFuture()
+    future.set_result({"txid": "22" * 32})
+    with dispatcher._lock:
+        dispatcher._active["req-1"] = (future, "txprepare")
+
+    dispatcher.cancel_request("req-1")
+
+    operation.discard.assert_awaited_once_with("22" * 32)
+    dispatcher.close()
+
+
+def test_rendezvous_client_cancels_active_dispatch_on_peer_disconnect() -> None:
+    from concurrent.futures import Future
+
+    calls: list[tuple[str, object]] = []
+
+    class CancellableHandler:
+        def __init__(self) -> None:
+            self.future: Future[object] = Future()
+            self.cancelled = threading.Event()
+
+        def start_request(
+            self, request_id: str, method: str, params: object
+        ) -> Future[object]:
+            del request_id, method, params
+            return self.future
+
+        def cancel_request(self, request_id: str) -> None:
+            del request_id
+            self.cancelled.set()
+            self.future.cancel()
+
+    class CancelRpc(FakeRpc):
+        def call(self, method: str, params: object = None) -> Any:
+            calls.append((method, params))
+            if method == "jmpeerswap-cancel":
+                return {"request_id": "req-1", "state": "cancelled"}
+            if method == "jmpeerswap-request":
+                return {"request_id": "req-1", "method": "txsend", "params": {}}
+            return {"accepted": True}
+
+    handler = CancellableHandler()
+    rpc = CancelRpc(calls)
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"),
+        cast(Callable[[str, object], object], handler),
+        pool_size=1,
+        rpc_factory=lambda _: cast(LightningRpc, rpc),
+    )
+
+    client._handle_request(
+        rpc,
+        {"request_id": "req-1", "method": "txsend", "params": {}},
+    )
+
+    assert handler.cancelled.is_set()
+    assert ("jmpeerswap-cancel", {"request_id": "req-1"}) in calls
+    assert not any(method == "jmpeerswap-response" for method, _ in calls)

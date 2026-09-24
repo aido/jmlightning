@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import threading
+import time
 import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import StrEnum, auto
 
 from loguru import logger
 from pyln.client.plugin import Request
+
+
+class PeerSwapRendezvousState(StrEnum):
+    """Lifecycle state of an intercepted PeerSwap transaction request."""
+
+    QUEUED = auto()
+    ASSIGNED = auto()
+    COMPLETED = auto()
+    CANCELLED = auto()
+    TIMED_OUT = auto()
 
 
 @dataclass(slots=True)
@@ -17,7 +29,10 @@ class _PeerSwapRequest:
     method: str
     params: object
     respond: Callable[[dict[str, object]], None]
+    state: PeerSwapRendezvousState = PeerSwapRendezvousState.QUEUED
     timeout: threading.Timer | None = None
+    cancel_waiter: Request | None = None
+    terminal_expires_at: float | None = None
 
 
 class PeerSwapRendezvous:
@@ -32,15 +47,26 @@ class PeerSwapRendezvous:
         self._request_timeout = request_timeout
         self._waiters: deque[Request] = deque()
         self._requests: dict[str, _PeerSwapRequest] = {}
+        self._terminal: dict[str, _PeerSwapRequest] = {}
         self._unassigned: deque[str] = deque()
         self._lock = threading.Lock()
         self._stopped = False
+
+    def _purge_terminal_locked(self) -> None:
+        now = time.monotonic()
+        for request_id, pending in list(self._terminal.items()):
+            if (
+                pending.terminal_expires_at is not None
+                and pending.terminal_expires_at <= now
+            ):
+                self._terminal.pop(request_id, None)
 
     def wait(self, request: Request) -> None:
         """Hold a ``jmpeerswap-request`` call until work is available."""
         assignments: list[tuple[Request, dict[str, object]]] = []
         error: Exception | None = None
         with self._lock:
+            self._purge_terminal_locked()
             if self._stopped:
                 error = RuntimeError("PeerSwap rendezvous is stopped")
             elif len(self._waiters) >= self._max_pending:
@@ -60,11 +86,17 @@ class PeerSwapRendezvous:
         params: object,
         peer_swap_id: object,
         respond: Callable[[dict[str, object]], None],
-    ) -> None:
-        """Queue an intercepted PeerSwap request for JoinMarket."""
+    ) -> str | None:
+        """Queue an intercepted PeerSwap request for JoinMarket.
+
+        Return the bridge-generated rendezvous request ID when the request is
+        accepted. The ID is deliberately distinct from PeerSwap's JSON-RPC ID.
+        """
         assignments: list[tuple[Request, dict[str, object]]] = []
         error_response: dict[str, object] | None = None
+        request_id: str | None = None
         with self._lock:
+            self._purge_terminal_locked()
             if self._stopped:
                 error_response = self._error_response(
                     peer_swap_id, -32603, "PeerSwap rendezvous is stopped"
@@ -74,8 +106,9 @@ class PeerSwapRendezvous:
                     peer_swap_id, -32603, "PeerSwap request pool is full"
                 )
             else:
+                request_id = uuid.uuid4().hex
                 pending = _PeerSwapRequest(
-                    request_id=uuid.uuid4().hex,
+                    request_id=request_id,
                     peer_swap_id=peer_swap_id,
                     method=method,
                     params=params,
@@ -94,8 +127,77 @@ class PeerSwapRendezvous:
 
         if error_response is not None:
             self._safe_respond(respond, error_response)
-            return
+            return None
         self._complete_assignments(assignments)
+        return request_id
+
+    def wait_cancel(self, request: Request) -> None:
+        """Wait for the assigned operation to be cancelled or completed.
+
+        This is deliberately a separate long-poll from ``jmpeerswap-request``.
+        Once a request is assigned, cancellation ownership belongs to the
+        JoinMarket operation rather than to the rendezvous timeout. The
+        operation therefore watches this endpoint until the PeerSwap side
+        disconnects or the operation completes normally.
+        """
+        params = request.params
+        if not isinstance(params, dict):
+            request.set_exception(
+                ValueError("jmpeerswap-cancel params must be an object")
+            )
+            return
+        request_id = params.get("request_id")
+        if not isinstance(request_id, str) or not request_id:
+            request.set_exception(ValueError("jmpeerswap-cancel requires request_id"))
+            return
+
+        immediate: dict[str, object] | None = None
+        exception: Exception | None = None
+        with self._lock:
+            self._purge_terminal_locked()
+            pending = self._requests.get(request_id)
+            if pending is not None:
+                if pending.state is PeerSwapRendezvousState.ASSIGNED:
+                    if pending.cancel_waiter is not None:
+                        exception = RuntimeError(
+                            "PeerSwap cancellation watcher already exists for "
+                            f"{request_id}"
+                        )
+                    else:
+                        pending.cancel_waiter = request
+                        return
+                else:
+                    exception = RuntimeError(
+                        f"PeerSwap rendezvous request {request_id} is not assigned"
+                    )
+            else:
+                pending = self._terminal.pop(request_id, None)
+                if pending is None:
+                    exception = ValueError(
+                        f"Unknown PeerSwap rendezvous request: {request_id}"
+                    )
+                else:
+                    immediate = {
+                        "request_id": request_id,
+                        "state": pending.state.value,
+                    }
+
+        if exception is not None:
+            request.set_exception(exception)
+        elif immediate is not None:
+            try:
+                request.set_result(immediate)
+            except OSError:
+                return
+
+    @staticmethod
+    def _set_cancel_result(
+        request: Request, request_id: str, state: PeerSwapRendezvousState
+    ) -> None:
+        try:
+            request.set_result({"request_id": request_id, "state": state.value})
+        except OSError:
+            return
 
     def respond(
         self,
@@ -127,24 +229,35 @@ class PeerSwapRendezvous:
             raise ValueError(
                 "jmpeerswap-response requires exactly one of result or error"
             )
+        if has_error and not isinstance(params["error"], dict):
+            raise ValueError("jmpeerswap-response error must be an object")
 
+        cancel_waiter: Request | None = None
         with self._lock:
-            pending = self._requests.pop(request_id, None)
-            if pending is not None and pending.timeout is not None:
+            self._purge_terminal_locked()
+            pending = self._requests.get(request_id)
+            if pending is None:
+                raise ValueError(f"Unknown PeerSwap rendezvous request: {request_id}")
+            if pending.state is not PeerSwapRendezvousState.ASSIGNED:
+                raise ValueError(
+                    f"PeerSwap rendezvous request {request_id} is already "
+                    f"{pending.state.value}"
+                )
+            pending.state = PeerSwapRendezvousState.COMPLETED
+            self._requests.pop(request_id)
+            self._terminal[request_id] = pending
+            if pending.timeout is not None:
                 pending.timeout.cancel()
-
-        if pending is None:
-            raise ValueError(f"Unknown PeerSwap rendezvous request: {request_id}")
+            cancel_waiter = pending.cancel_waiter
+            pending.cancel_waiter = None
+            pending.terminal_expires_at = time.monotonic() + self._request_timeout
 
         response: dict[str, object] = {
             "jsonrpc": "2.0",
             "id": pending.peer_swap_id,
         }
         if has_error:
-            error = params["error"]
-            if not isinstance(error, dict):
-                raise ValueError("jmpeerswap-response error must be an object")
-            response["error"] = error
+            response["error"] = params["error"]
         else:
             response["result"] = params["result"]
 
@@ -154,11 +267,71 @@ class PeerSwapRendezvous:
             request_id,
             has_error,
         )
-        self._safe_respond(pending.respond, response)
+        delivered = self._safe_respond(pending.respond, response)
+        if not delivered:
+            pending.state = PeerSwapRendezvousState.CANCELLED
+        if cancel_waiter is not None:
+            self._set_cancel_result(
+                cancel_waiter,
+                request_id,
+                (
+                    PeerSwapRendezvousState.COMPLETED
+                    if delivered
+                    else PeerSwapRendezvousState.CANCELLED
+                ),
+            )
+            with self._lock:
+                self._terminal.pop(request_id, None)
+
+    def cancel(self, request_id: str) -> None:
+        """Cancel a request because the original PeerSwap connection closed."""
+        cancel_waiter: Request | None = None
+        pending: _PeerSwapRequest | None = None
+        with self._lock:
+            self._purge_terminal_locked()
+            pending = self._requests.get(request_id)
+            if pending is None:
+                return
+            if pending.state not in {
+                PeerSwapRendezvousState.QUEUED,
+                PeerSwapRendezvousState.ASSIGNED,
+            }:
+                return
+
+            was_assigned = pending.state is PeerSwapRendezvousState.ASSIGNED
+            pending.state = PeerSwapRendezvousState.CANCELLED
+            self._requests.pop(request_id)
+            try:
+                self._unassigned.remove(request_id)
+            except ValueError:
+                pass
+            if pending.timeout is not None:
+                pending.timeout.cancel()
+            cancel_waiter = pending.cancel_waiter
+            pending.cancel_waiter = None
+            if was_assigned:
+                pending.terminal_expires_at = time.monotonic() + self._request_timeout
+                self._terminal[request_id] = pending
+
+        logger.info(
+            "PeerSwap rendezvous cancelled peer_swap_id={} request_id={}",
+            pending.peer_swap_id,
+            request_id,
+        )
+        if cancel_waiter is not None:
+            cancel_waiter.set_result(
+                {
+                    "request_id": request_id,
+                    "state": PeerSwapRendezvousState.CANCELLED.value,
+                }
+            )
+            with self._lock:
+                self._terminal.pop(request_id, None)
 
     def stop(self) -> None:
         """Fail all outstanding rendezvous calls and stop accepting new ones."""
         with self._lock:
+            self._purge_terminal_locked()
             self._stopped = True
             waiters = list(self._waiters)
             self._waiters.clear()
@@ -168,9 +341,21 @@ class PeerSwapRendezvous:
             for pending in requests:
                 if pending.timeout is not None:
                     pending.timeout.cancel()
+                pending.state = PeerSwapRendezvousState.CANCELLED
+            cancel_waiters = [
+                (pending.request_id, pending.cancel_waiter)
+                for pending in requests
+                if pending.cancel_waiter is not None
+            ]
+            for pending in requests:
+                pending.cancel_waiter = None
 
         for request in waiters:
             request.set_exception(RuntimeError("PeerSwap rendezvous stopped"))
+        for request_id, request in cancel_waiters:
+            self._set_cancel_result(
+                request, request_id, PeerSwapRendezvousState.CANCELLED
+            )
         for pending in requests:
             self._safe_respond(
                 pending.respond,
@@ -187,8 +372,12 @@ class PeerSwapRendezvous:
             waiter = self._waiters.popleft()
             request_id = self._unassigned.popleft()
             pending = self._requests.get(request_id)
-            if pending is None:
+            if pending is None or pending.state is not PeerSwapRendezvousState.QUEUED:
                 continue
+            pending.state = PeerSwapRendezvousState.ASSIGNED
+            if pending.timeout is not None:
+                pending.timeout.cancel()
+                pending.timeout = None
             assignments.append(
                 (
                     waiter,
@@ -214,20 +403,38 @@ class PeerSwapRendezvous:
             waiter.set_result(result)
 
     def _expire_request(self, request_id: str) -> None:
+        cancel_waiter: Request | None = None
         with self._lock:
-            pending = self._requests.pop(request_id, None)
+            pending = self._requests.get(request_id)
             if pending is None or self._stopped:
                 return
-            try:
-                self._unassigned.remove(request_id)
-            except ValueError:
-                pass
+            if pending.state is PeerSwapRendezvousState.QUEUED:
+                pending.state = PeerSwapRendezvousState.TIMED_OUT
+                self._requests.pop(request_id)
+                try:
+                    self._unassigned.remove(request_id)
+                except ValueError:
+                    pass
+            else:
+                # Once assigned, the JoinMarket operation owns cancellation and
+                # lifetime. The rendezvous timeout only protects the queue
+                # before an operation has taken ownership.
+                return
 
         logger.error(
-            "PeerSwap rendezvous expired peer_swap_id={} request_id={}",
+            "PeerSwap rendezvous expired peer_swap_id={} request_id={} state={}",
             pending.peer_swap_id,
             request_id,
+            pending.state.value,
         )
+        if cancel_waiter is not None:
+            self._set_cancel_result(
+                cancel_waiter, request_id, PeerSwapRendezvousState.TIMED_OUT
+            )
+            with self._lock:
+                self._terminal.pop(request_id, None)
+            return
+
         self._safe_respond(
             pending.respond,
             self._error_response(
@@ -236,20 +443,23 @@ class PeerSwapRendezvous:
                 "PeerSwap rendezvous request timed out",
             ),
         )
+        with self._lock:
+            self._terminal.pop(request_id, None)
 
     @staticmethod
     def _safe_respond(
         respond: Callable[[dict[str, object]], None],
         response: dict[str, object],
-    ) -> None:
+    ) -> bool:
         try:
             respond(response)
         except OSError:
             # The PeerSwap RPC connection may have disappeared while the
-            # JoinMarket operation was outstanding. The request has already
-            # been removed from the rendezvous state, so there is nothing
-            # further to clean up.
-            return
+            # JoinMarket operation was outstanding. Let the cancellation
+            # watcher reclaim a completed txprepare instead of leaking its
+            # prepared JoinMarket transaction.
+            return False
+        return True
 
     @staticmethod
     def _error_response(

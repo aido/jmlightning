@@ -3,6 +3,7 @@ from __future__ import annotations
 import time
 from typing import Any, cast
 
+import pytest
 from pyln.client.plugin import Request
 
 from jmpeerswap.rendezvous import PeerSwapRendezvous
@@ -12,6 +13,7 @@ class FakeRequest:
     def __init__(self) -> None:
         self.results: list[Any] = []
         self.exceptions: list[Exception] = []
+        self.params: object = {}
 
     def set_result(self, result: Any) -> None:
         self.results.append(result)
@@ -132,12 +134,10 @@ def test_rendezvous_matches_simultaneous_requests_out_of_order() -> None:
     assert [response["id"] for response in responses] == [103, 101, 102]
 
 
-def test_rendezvous_times_out_intercepted_request() -> None:
+def test_rendezvous_times_out_unassigned_request() -> None:
     rendezvous = PeerSwapRendezvous(request_timeout=0.01)
-    waiter = FakeRequest()
     responses: list[dict[str, Any]] = []
 
-    rendezvous.wait(cast(Request, waiter))
     rendezvous.submit("txprepare", {}, 17, responses.append)
 
     deadline = time.monotonic() + 1
@@ -176,3 +176,48 @@ def test_rendezvous_drops_disconnected_response_without_leaking_state() -> None:
     rendezvous.respond({"request_id": request_id, "result": {"psbt": "abc"}})
 
     assert rendezvous._requests == {}
+
+
+def test_rendezvous_timeout_stops_after_assignment() -> None:
+    rendezvous = PeerSwapRendezvous(request_timeout=0.01)
+    waiter = FakeRequest()
+    cancel_waiter = FakeRequest()
+    responses: list[dict[str, Any]] = []
+
+    rendezvous.wait(cast(Request, waiter))
+    rendezvous.submit("txprepare", {}, 17, responses.append)
+    request_id = waiter.results[0]["request_id"]
+
+    cancel_waiter.params = {"request_id": request_id}
+    rendezvous.wait_cancel(cast(Request, cancel_waiter))
+
+    time.sleep(0.05)
+    assert cancel_waiter.results == []
+    assert responses == []
+    assert request_id in rendezvous._requests
+
+    rendezvous.cancel(request_id)
+    assert cancel_waiter.results == [{"request_id": request_id, "state": "cancelled"}]
+    assert rendezvous._requests == {}
+
+
+def test_rendezvous_disconnect_cancels_assigned_operation() -> None:
+    rendezvous = PeerSwapRendezvous()
+    waiter = FakeRequest()
+    cancel_waiter = FakeRequest()
+    responses: list[dict[str, Any]] = []
+
+    rendezvous.wait(cast(Request, waiter))
+    rendezvous.submit("txsend", {}, 17, responses.append)
+    request_id = waiter.results[0]["request_id"]
+
+    cancel_waiter.params = {"request_id": request_id}
+    rendezvous.wait_cancel(cast(Request, cancel_waiter))
+    rendezvous.cancel(request_id)
+
+    assert cancel_waiter.results == [{"request_id": request_id, "state": "cancelled"}]
+    assert responses == []
+    assert rendezvous._requests == {}
+
+    with pytest.raises(ValueError, match="Unknown PeerSwap rendezvous request"):
+        rendezvous.respond({"request_id": request_id, "result": {}})

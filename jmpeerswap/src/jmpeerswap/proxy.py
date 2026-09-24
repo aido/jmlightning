@@ -16,6 +16,42 @@ class DeferredResponse:
 DEFERRED_RESPONSE = DeferredResponse()
 
 
+class _ProxyResponse:
+    """Response sink which also owns deferred-request disconnect handling."""
+
+    def __init__(self, client: socket.socket, write_lock: threading.Lock) -> None:
+        self._client = client
+        self._write_lock = write_lock
+        self._disconnect_handler: Callable[[], None] | None = None
+        self._disconnected = False
+        self._lock = threading.Lock()
+
+    def __call__(self, response: dict[str, object]) -> None:
+        payload = json.dumps(response).encode() + b"\n\n"
+        with self._write_lock:
+            self._client.sendall(payload)
+
+    def set_disconnect_handler(self, callback: Callable[[], None]) -> None:
+        with self._lock:
+            if self._disconnected:
+                call_now = True
+            else:
+                self._disconnect_handler = callback
+                call_now = False
+        if call_now:
+            callback()
+
+    def disconnect(self) -> None:
+        with self._lock:
+            if self._disconnected:
+                return
+            self._disconnected = True
+            callback = self._disconnect_handler
+            self._disconnect_handler = None
+        if callback is not None:
+            callback()
+
+
 class UnixRPCProxy:
     """Proxy a Unix-domain RPC socket to another Unix-domain RPC socket."""
 
@@ -188,11 +224,7 @@ class UnixRPCProxy:
     def _relay_client(self, client: socket.socket, upstream: socket.socket) -> None:
         reader = client.makefile("rb")
         write_lock = threading.Lock()
-
-        def respond(response: dict[str, object]) -> None:
-            payload = json.dumps(response).encode() + b"\n\n"
-            with write_lock:
-                client.sendall(payload)
+        deferred: set[_ProxyResponse] = set()
 
         try:
             while True:
@@ -204,13 +236,15 @@ class UnixRPCProxy:
                         pass
                     return
 
-                response = self._handle_request(data, respond)
+                response_sink = _ProxyResponse(client, write_lock)
+                response = self._handle_request(data, response_sink)
                 if response is DEFERRED_RESPONSE:
+                    deferred.add(response_sink)
                     continue
                 if response is None:
                     upstream.sendall(data)
                 elif isinstance(response, dict):
-                    respond(response)
+                    response_sink(response)
                 else:
                     raise TypeError(
                         "RPC request handler returned an unsupported response type"
@@ -219,6 +253,8 @@ class UnixRPCProxy:
             return
         finally:
             reader.close()
+            for response_sink in deferred:
+                response_sink.disconnect()
 
     def _handle_request(
         self,

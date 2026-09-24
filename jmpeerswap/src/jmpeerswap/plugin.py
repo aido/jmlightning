@@ -422,7 +422,11 @@ def _handle_proxy_request(
             request_id,
         )
 
-    rendezvous.submit(method, params, request_id, respond)
+    rendezvous_request_id = rendezvous.submit(method, params, request_id, respond)
+    if rendezvous_request_id is not None:
+        set_disconnect_handler = getattr(respond, "set_disconnect_handler", None)
+        if callable(set_disconnect_handler):
+            set_disconnect_handler(lambda: rendezvous.cancel(rendezvous_request_id))
     return DEFERRED_RESPONSE
 
 
@@ -612,6 +616,11 @@ def _register_rendezvous_methods(
     plugin.add_method(
         "jmpeerswap-response",
         rendezvous.respond,
+    )
+    plugin.add_method(
+        "jmpeerswap-cancel",
+        rendezvous.wait_cancel,
+        background=True,
     )
 
 
