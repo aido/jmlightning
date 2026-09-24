@@ -587,13 +587,19 @@ class PeerSwapPrepareTxOperation:
         prepared = self._prepared.get(txid)
         if prepared is None:
             raise ValueError(f"PeerSwap transaction {txid} is not prepared")
-        prepared.require_phase(PeerSwapPhase.PREPARED)
+        if prepared.phase not in {PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST}:
+            raise ValueError(
+                f"PeerSwap transaction {txid} is in {prepared.phase} state"
+            )
 
-        # Keep PREPARED state until every cleanup step succeeds. If an unlock
-        # or close fails, the same adapter and owner token remain available for
-        # a subsequent txdiscard retry.
+        # Keep state until every cleanup step succeeds. A BROADCAST transaction
+        # may reach this path when txsend completed but resource cleanup failed;
+        # retrying txdiscard must only release resources and must never broadcast
+        # the transaction again.
+        phase = prepared.phase
         await self._cleanup_prepared(prepared)
-        prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
+        if phase is PeerSwapPhase.PREPARED:
+            prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
         self._prepared.pop(txid, None)
 
         return {

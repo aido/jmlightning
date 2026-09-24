@@ -18,15 +18,34 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_VERSION,
+    PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PROPRIETARY,
+    PSBT_IN_SIGHASH_TYPE,
+    PSBT_IN_WITNESS_UTXO,
+    PSBT_MAGIC,
     parse_psbt,
 )
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
-from jmlightning.tx_builder import TxBuilder
+from jmlightning.tx_builder import (
+    PSBT_GLOBAL_FALLBACK_LOCKTIME,
+    PSBT_GLOBAL_INPUT_COUNT,
+    PSBT_GLOBAL_OUTPUT_COUNT,
+    PSBT_GLOBAL_TX_MODIFIABLE,
+    PSBT_GLOBAL_TX_VERSION,
+    PSBT_IN_OUTPUT_INDEX,
+    PSBT_IN_PREVIOUS_TXID,
+    PSBT_IN_SEQUENCE,
+    PSBT_OUT_AMOUNT,
+    PSBT_OUT_SCRIPT,
+    TxBuilder,
+)
 
 
 def _mock_wallet() -> Mock:
@@ -74,7 +93,7 @@ def _mock_wallet() -> Mock:
                 if not any(
                     record.key[1:] == pubkey
                     for record in input_map.records
-                    if record.key[:1] == b"\x06"
+                    if record.key[:1] == bytes([PSBT_IN_BIP32_DERIVATION])
                 ):
                     continue
 
@@ -132,32 +151,35 @@ def _build_cln_splice_psbt_v2() -> bytes:
 
     global_map = psbt_map(
         [
-            (b"\x02", (2).to_bytes(4, "little")),
-            (b"\x03", (0).to_bytes(4, "little")),
-            (b"\x04", compact(1)),
-            (b"\x05", compact(1)),
-            (b"\x06", b"\x00"),
-            (b"\xfccln-global", b"splice metadata"),
-            (b"\xfb", (2).to_bytes(4, "little")),
+            (bytes([PSBT_GLOBAL_TX_VERSION]), (2).to_bytes(4, "little")),
+            (bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME]), (0).to_bytes(4, "little")),
+            (bytes([PSBT_GLOBAL_INPUT_COUNT]), compact(1)),
+            (bytes([PSBT_GLOBAL_OUTPUT_COUNT]), compact(1)),
+            (bytes([PSBT_GLOBAL_TX_MODIFIABLE]), b"\x00"),
+            (bytes([PSBT_IN_PROPRIETARY]) + b"cln-global", b"splice metadata"),
+            (bytes([PSBT_GLOBAL_VERSION]), (2).to_bytes(4, "little")),
         ]
     )
     input_map = psbt_map(
         [
-            (b"\x0e", bytes.fromhex("11" * 32)),
-            (b"\x0f", (1).to_bytes(4, "little")),
-            (b"\x10", (0xFFFFFFFE).to_bytes(4, "little")),
-            (b"\x01", (200_000).to_bytes(8, "little") + b"\x16\x00\x14" + b"\x22" * 20),
-            (b"\xfccln-input", b"input metadata"),
+            (bytes([PSBT_IN_PREVIOUS_TXID]), bytes.fromhex("11" * 32)),
+            (bytes([PSBT_IN_OUTPUT_INDEX]), (1).to_bytes(4, "little")),
+            (bytes([PSBT_IN_SEQUENCE]), (0xFFFFFFFE).to_bytes(4, "little")),
+            (
+                bytes([PSBT_IN_WITNESS_UTXO]),
+                (200_000).to_bytes(8, "little") + b"\x16\x00\x14" + b"\x22" * 20,
+            ),
+            (bytes([PSBT_IN_PROPRIETARY]) + b"cln-input", b"input metadata"),
         ]
     )
     output_map = psbt_map(
         [
-            (b"\x03", (199_847).to_bytes(8, "little")),
-            (b"\x04", b"\x00\x14" + b"\x33" * 20),
-            (b"\xfccln-output", b"output metadata"),
+            (bytes([PSBT_OUT_AMOUNT]), (199_847).to_bytes(8, "little")),
+            (bytes([PSBT_OUT_SCRIPT]), b"\x00\x14" + b"\x33" * 20),
+            (bytes([PSBT_IN_PROPRIETARY]) + b"cln-output", b"output metadata"),
         ]
     )
-    return b"psbt\xff" + global_map + input_map + output_map
+    return PSBT_MAGIC + global_map + input_map + output_map
 
 
 def _build_splice_psbt() -> bytes:
@@ -187,8 +209,12 @@ def _build_splice_psbt() -> bytes:
         ],
     )
     parsed = parse_psbt(psbt)
-    parsed.input_maps[0].append(b"\xfccln", b"input metadata")
-    parsed.output_maps[0].append(b"\xfccln", b"output metadata")
+    parsed.input_maps[0].append(
+        bytes([PSBT_IN_PROPRIETARY]) + b"cln", b"input metadata"
+    )
+    parsed.output_maps[0].append(
+        bytes([PSBT_IN_PROPRIETARY]) + b"cln", b"output metadata"
+    )
     return parsed.serialize()
 
 
@@ -281,7 +307,9 @@ def test_cln_input_weight_uses_non_witness_utxo() -> None:
     )
     parsed = parse_psbt(psbt)
     parsed.input_maps[0].records = [
-        record for record in parsed.input_maps[0].records if record.key != b"\x01"
+        record
+        for record in parsed.input_maps[0].records
+        if record.key != bytes([PSBT_IN_WITNESS_UTXO])
     ]
     parsed.input_maps[0].append(
         b"\x00",
@@ -328,7 +356,9 @@ def test_cln_input_weight_rejects_non_witness_utxo_with_missing_output() -> None
     )
     parsed = parse_psbt(psbt)
     parsed.input_maps[0].records = [
-        record for record in parsed.input_maps[0].records if record.key != b"\x01"
+        record
+        for record in parsed.input_maps[0].records
+        if record.key != bytes([PSBT_IN_WITNESS_UTXO])
     ]
     parsed.input_maps[0].append(
         b"\x00",
@@ -362,19 +392,28 @@ def test_normalise_cln_psbt_v2_to_v0_preserves_metadata() -> None:
     assert parsed.transaction.outputs[0].script == b"\x00\x14" + b"\x33" * 20
 
     assert any(
-        record.key == b"\xfccln-global" and record.value == b"splice metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-global"
+        and record.value == b"splice metadata"
         for record in parsed.global_map.records
     )
     assert any(
-        record.key == b"\xfccln-input" and record.value == b"input metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-input"
+        and record.value == b"input metadata"
         for record in parsed.input_maps[0].records
     )
     assert any(
-        record.key == b"\xfccln-output" and record.value == b"output metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-output"
+        and record.value == b"output metadata"
         for record in parsed.output_maps[0].records
     )
-    assert not any(record.key == b"\x06" for record in parsed.global_map.records)
-    assert not any(record.key == b"\xfb" for record in parsed.global_map.records)
+    assert not any(
+        record.key == bytes([PSBT_GLOBAL_TX_MODIFIABLE])
+        for record in parsed.global_map.records
+    )
+    assert not any(
+        record.key == bytes([PSBT_GLOBAL_VERSION])
+        for record in parsed.global_map.records
+    )
 
 
 def test_normalise_psbt_v0_is_unchanged() -> None:
@@ -418,15 +457,18 @@ def test_add_splice_in_input_accepts_cln_psbt_v2_and_preserves_metadata(
     assert len(parsed.transaction.inputs) == 2
     assert parsed.transaction.inputs[1].txid == classified_utxos[2].utxo.txid
     assert any(
-        record.key == b"\xfccln-global" and record.value == b"splice metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-global"
+        and record.value == b"splice metadata"
         for record in parsed.global_map.records
     )
     assert any(
-        record.key == b"\xfccln-input" and record.value == b"input metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-input"
+        and record.value == b"input metadata"
         for record in parsed.input_maps[0].records
     )
     assert any(
-        record.key == b"\xfccln-output" and record.value == b"output metadata"
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-output"
+        and record.value == b"output metadata"
         for record in parsed.output_maps[0].records
     )
 
@@ -619,12 +661,14 @@ def test_build_and_sign_funding_tx_rejects_changed_input_metadata(
             next(
                 record.value
                 for record in parsed.input_maps[0].records
-                if record.key == b"\x01"
+                if record.key == bytes([PSBT_IN_WITNESS_UTXO])
             )
         )
         witness[0] ^= 1
         parsed.input_maps[0].records = [
-            replace(record, value=bytes(witness)) if record.key == b"\x01" else record
+            replace(record, value=bytes(witness))
+            if record.key == bytes([PSBT_IN_WITNESS_UTXO])
+            else record
             for record in parsed.input_maps[0].records
         ]
         for index in range(len(parsed.input_maps)):
@@ -811,7 +855,7 @@ def test_build_and_sign_funding_tx_returns_signed_psbt(
         wallet=wallet,
     )
 
-    assert signed_psbt.startswith(b"psbt\xff")
+    assert signed_psbt.startswith(PSBT_MAGIC)
     parsed = parse_psbt(signed_psbt)
     for input_map in parsed.input_maps:
         assert any(
@@ -1381,14 +1425,17 @@ def test_add_splice_in_input_preserves_cln_psbt_metadata(
 
     input_records = parsed.input_maps[1].records
     assert [record.key[:1] for record in input_records] == [
-        b"\x00",
-        b"\x01",
-        b"\x03",
-        b"\x06",
-        b"\xfc",
+        bytes([PSBT_IN_NON_WITNESS_UTXO]),
+        bytes([PSBT_IN_WITNESS_UTXO]),
+        bytes([PSBT_IN_SIGHASH_TYPE]),
+        bytes([PSBT_IN_BIP32_DERIVATION]),
+        bytes([PSBT_IN_PROPRIETARY]),
     ]
     assert len(parsed.output_maps[1].records) == 1
-    assert parsed.output_maps[1].records[0].key == b"\xfc\x09lightning\x01"
+    assert (
+        parsed.output_maps[1].records[0].key
+        == bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
+    )
 
     assert parsed.unsigned_tx == serialize_transaction(
         parsed.transaction.version,
@@ -1602,7 +1649,10 @@ def test_sign_splice_psbt_signs_only_jm_input(
     assert txid
     assert len(signed.transaction.inputs) == 2
     assert signed.input_maps[0].records == parsed.input_maps[0].records
-    assert any(record.key[:1] == b"\x02" for record in signed.input_maps[1].records)
+    assert any(
+        record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+        for record in signed.input_maps[1].records
+    )
 
 
 def test_sign_splice_psbt_rejects_signed_jm_input(

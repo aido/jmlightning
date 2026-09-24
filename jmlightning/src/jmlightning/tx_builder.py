@@ -26,8 +26,10 @@ from jmwallet.wallet.psbt import (
     PSBT_IN_FINAL_SCRIPTWITNESS,
     PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PROPRIETARY,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
+    PSBT_MAGIC,
     ParsedPSBT,
     PSBTError,
     PSBTKeyValue,
@@ -48,10 +50,15 @@ PSBT_GLOBAL_FALLBACK_LOCKTIME = 0x03
 PSBT_GLOBAL_INPUT_COUNT = 0x04
 PSBT_GLOBAL_OUTPUT_COUNT = 0x05
 PSBT_GLOBAL_TX_MODIFIABLE = 0x06
+PSBT_IN_PREVIOUS_TXID = 0x0E
+PSBT_IN_OUTPUT_INDEX = 0x0F
+PSBT_IN_SEQUENCE = 0x10
+PSBT_OUT_AMOUNT = 0x03
+PSBT_OUT_SCRIPT = 0x04
 
 # Core Lightning proprietary PSBT key for interactive transaction serial IDs.
 # Key: proprietary type (0xfc), prefix length (9), "lightning", subtype 1.
-CLN_PSBT_SERIAL_ID_KEY = b"\xfc\x09lightning\x01"
+CLN_PSBT_SERIAL_ID_KEY = bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
 
 
 class TxBuilder:
@@ -108,7 +115,7 @@ class TxBuilder:
         structure at the PSBT boundary while retaining every non-structural
         record verbatim.
         """
-        magic = b"psbt\xff"
+        magic = PSBT_MAGIC
         if not psbt.startswith(magic):
             raise ValueError("invalid PSBT magic")
 
@@ -255,9 +262,15 @@ class TxBuilder:
         tx.extend(tx_version_records[0])
         tx.extend(_write_compact_size(input_count))
         for index, records in enumerate(input_maps):
-            txid = _singleton(records, b"\x0e", f"input {index} previous txid")
-            vout = _singleton(records, b"\x0f", f"input {index} output index")
-            sequence_values = [value for key, value in records if key == b"\x10"]
+            txid = _singleton(
+                records, bytes([PSBT_IN_PREVIOUS_TXID]), f"input {index} previous txid"
+            )
+            vout = _singleton(
+                records, bytes([PSBT_IN_OUTPUT_INDEX]), f"input {index} output index"
+            )
+            sequence_values = [
+                value for key, value in records if key == bytes([PSBT_IN_SEQUENCE])
+            ]
             if len(txid) != 32 or len(vout) != 4:
                 raise ValueError(f"PSBT v2 input {index} has invalid outpoint")
             if len(sequence_values) > 1 or (
@@ -271,8 +284,12 @@ class TxBuilder:
 
         tx.extend(_write_compact_size(output_count))
         for index, records in enumerate(output_maps):
-            amount = _singleton(records, b"\x03", f"output {index} amount")
-            script = _singleton(records, b"\x04", f"output {index} script")
+            amount = _singleton(
+                records, bytes([PSBT_OUT_AMOUNT]), f"output {index} amount"
+            )
+            script = _singleton(
+                records, bytes([PSBT_OUT_SCRIPT]), f"output {index} script"
+            )
             if len(amount) != 8:
                 raise ValueError(f"PSBT v2 output {index} has invalid amount")
             tx.extend(amount)
@@ -307,7 +324,12 @@ class TxBuilder:
                     [
                         (key, value)
                         for key, value in records
-                        if key not in {b"\x0e", b"\x0f", b"\x10"}
+                        if key
+                        not in {
+                            bytes([PSBT_IN_PREVIOUS_TXID]),
+                            bytes([PSBT_IN_OUTPUT_INDEX]),
+                            bytes([PSBT_IN_SEQUENCE]),
+                        }
                     ]
                 )
             )
@@ -317,7 +339,8 @@ class TxBuilder:
                     [
                         (key, value)
                         for key, value in records
-                        if key not in {b"\x03", b"\x04"}
+                        if key
+                        not in {bytes([PSBT_OUT_AMOUNT]), bytes([PSBT_OUT_SCRIPT])}
                     ]
                 )
             )
@@ -847,7 +870,7 @@ class TxBuilder:
             parsed.transaction.locktime,
         )
         for index, record in enumerate(parsed.global_map.records):
-            if record.key == b"\x00":
+            if record.key == bytes([PSBT_GLOBAL_UNSIGNED_TX]):
                 parsed.global_map.records[index] = PSBTKeyValue(
                     key=record.key,
                     value=unsigned_tx,

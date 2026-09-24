@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
 from jmwallet.wallet.models import UTXOInfo
@@ -448,28 +448,40 @@ async def test_send_rejects_non_prepared_phase() -> None:
 
 
 @pytest.mark.anyio
-async def test_discard_rejects_non_prepared_phase() -> None:
+async def test_discard_retries_cleanup_for_broadcast_transaction() -> None:
+    coin = _coin()
+    adapter = Mock()
+    adapter.unlock.side_effect = RuntimeError("unlock failed")
+    adapter.close = AsyncMock()
+
     operation = PeerSwapPrepareTxOperation(
         config=Mock(mixdepth=0),
         cln_socket=Path("/tmp/lightning-rpc"),
     )
-    adapter = Mock()
     prepared = PreparedPeerSwapTransaction(
-        tx=Mock(),
+        tx=Mock(version=2, inputs=[], outputs=[], locktime=0),
         txid="22" * 32,
-        locked=[],
+        locked=[coin],
         adapter=adapter,
         psbt=b"",
         phase=PeerSwapPhase.BROADCAST,
     )
     operation._prepared[prepared.txid] = prepared
 
-    with pytest.raises(ValueError, match="is in broadcast state"):
+    with pytest.raises(RuntimeError, match="Failed to fully clean up"):
         await operation.discard(prepared.txid)
-
-    adapter.unlock.assert_not_called()
-    adapter.close.assert_not_called()
     assert operation._prepared[prepared.txid] is prepared
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.close.assert_not_awaited()
+
+    adapter.unlock.side_effect = None
+    await operation.discard(prepared.txid)
+
+    assert operation._prepared == {}
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.unlock.assert_has_calls([call(coin), call(coin)])
+    assert adapter.unlock.call_count == 2
+    adapter.close.assert_awaited_once()
 
 
 @pytest.mark.parametrize("feerate", [True, False, 1.5, []])
