@@ -1299,14 +1299,60 @@ class TxBuilder:
 
             if finalise_transaction:
                 # The PSBT signer returns a partial signature. Build the
-                # corresponding P2WPKH witness only for callers that
-                # broadcast the returned transaction directly.
+                # corresponding P2WPKH witness for callers that broadcast
+                # the returned transaction directly.
                 if len(tx.witnesses) < len(tx.inputs):
                     tx.witnesses.extend(
                         [[] for _ in range(len(tx.inputs) - len(tx.witnesses))]
                     )
                 tx.witnesses[index] = [signature, expected_pubkey]
 
+        if finalise_transaction:
+            self._finalize_psbt_inputs(
+                signed_parsed_psbt,
+                signing_inputs,
+                tx,
+            )
+            signed_psbt = signed_parsed_psbt.serialize()
+
         txid = self._txid(tx)
 
         return tx, txid, signed_psbt
+
+    @staticmethod
+    def _finalize_psbt_inputs(
+        parsed_psbt: ParsedPSBT,
+        signing_inputs: Mapping[int, ClassifiedUTXO],
+        tx: ParsedTransaction,
+    ) -> None:
+        """Replace JM partial signatures with final P2WPKH witnesses."""
+        for index in signing_inputs:
+            input_map = parsed_psbt.input_maps[index]
+            signatures = [
+                record
+                for record in input_map.records
+                if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            ]
+            if len(signatures) != 1:
+                raise RuntimeError(
+                    "JoinMarket wallet did not return exactly one signature "
+                    f"for input {index}"
+                )
+
+            signature = signatures[0].value
+            pubkey = signatures[0].key[1:]
+            witness = encode_varint(2) + encode_varint(len(signature)) + signature
+            witness += encode_varint(len(pubkey)) + pubkey
+
+            input_map.records = [
+                record
+                for record in input_map.records
+                if record.key[:1] != bytes([PSBT_IN_PARTIAL_SIG])
+            ]
+            input_map.append(bytes([PSBT_IN_FINAL_SCRIPTWITNESS]), witness)
+
+            if len(tx.witnesses) < len(tx.inputs):
+                tx.witnesses.extend(
+                    [[] for _ in range(len(tx.inputs) - len(tx.witnesses))]
+                )
+            tx.witnesses[index] = [signature, pubkey]

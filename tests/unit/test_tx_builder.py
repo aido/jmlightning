@@ -17,7 +17,11 @@ from jmcore.bitcoin import (
     parse_derivation_path,
     serialize_transaction,
 )
-from jmwallet.wallet.psbt import PSBT_IN_PARTIAL_SIG, parse_psbt
+from jmwallet.wallet.psbt import (
+    PSBT_IN_FINAL_SCRIPTWITNESS,
+    PSBT_IN_PARTIAL_SIG,
+    parse_psbt,
+)
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.models import ClassifiedUTXO
@@ -549,7 +553,16 @@ def test_build_and_sign_funding_tx_creates_funding_output(
     assert tx.outputs[1].value == plan.change
     assert len(tx.inputs) == len(plan.inputs)
     assert txid
-    assert psbt == wallet.sign_psbt.return_value.psbt
+    parsed = parse_psbt(psbt)
+    for input_map in parsed.input_maps:
+        assert not any(
+            record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            for record in input_map.records
+        )
+        assert any(
+            record.key[:1] == bytes([PSBT_IN_FINAL_SCRIPTWITNESS])
+            for record in input_map.records
+        )
 
 
 def test_build_and_sign_funding_tx_uses_psbt_signing(
@@ -798,8 +811,17 @@ def test_build_and_sign_funding_tx_returns_signed_psbt(
         wallet=wallet,
     )
 
-    assert signed_psbt == wallet.sign_psbt.return_value.psbt
     assert signed_psbt.startswith(b"psbt\xff")
+    parsed = parse_psbt(signed_psbt)
+    for input_map in parsed.input_maps:
+        assert not any(
+            record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
+            for record in input_map.records
+        )
+        assert any(
+            record.key[:1] == bytes([PSBT_IN_FINAL_SCRIPTWITNESS])
+            for record in input_map.records
+        )
 
 
 def test_build_and_sign_funding_tx_returns_correct_txid(
@@ -1004,21 +1026,18 @@ def test_build_and_sign_tx_supports_non_wallet_inputs(
     ]
     assert non_wallet_signatures == []
 
-    # Both JoinMarket inputs must have exactly one valid signature.
-    for index, coin in signing_inputs.items():
-        key = wallet.get_key_for_address(coin.utxo.address)
-        assert key is not None
-        expected_pubkey = key.get_public_key_bytes(compressed=True)
-        signature_key = bytes([PSBT_IN_PARTIAL_SIG]) + expected_pubkey
-
-        signatures = [
-            record
+    # Both JoinMarket inputs must have a final witness and no partial signature.
+    for index in signing_inputs:
+        assert not any(
+            record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
             for record in parsed.input_maps[index].records
-            if record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
-        ]
-
-        assert len(signatures) == 1
-        assert signatures[0].key == signature_key
+        )
+        final_witness = next(
+            record.value
+            for record in parsed.input_maps[index].records
+            if record.key[:1] == bytes([PSBT_IN_FINAL_SCRIPTWITNESS])
+        )
+        assert final_witness
 
 
 def test_build_and_sign_funding_tx_rejects_duplicate_signed_indices(
