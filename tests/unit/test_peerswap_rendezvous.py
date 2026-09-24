@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -432,6 +433,75 @@ def test_dispatcher_inspects_completed_txprepare_when_cancel_fails() -> None:
 
     operation.discard.assert_awaited_once_with("22" * 32)
     dispatcher.close()
+
+
+def test_rendezvous_cancel_watcher_cannot_cancel_after_dispatch_finishes() -> None:
+    from concurrent.futures import Future
+
+    cancel_entered = threading.Event()
+    cancel_release = threading.Event()
+    finished = threading.Event()
+    cancelled = threading.Event()
+    closed = threading.Event()
+
+    class CancellableHandler:
+        def start_request(
+            self, request_id: str, method: str, params: object
+        ) -> Future[object]:
+            del request_id, method, params
+            future: Future[object] = Future()
+            future.set_result({"ok": True})
+            return future
+
+        def cancel_request(self, request_id: str) -> None:
+            del request_id
+            cancelled.set()
+
+        def finish_request(self, request_id: str) -> None:
+            del request_id
+            finished.set()
+
+        def close(self) -> None:
+            closed.set()
+
+    class CancelRpc:
+        def call(self, method: str, params: object = None) -> Any:
+            del params
+            if method == "jmpeerswap-request":
+                return {
+                    "request_id": "req-1",
+                    "method": "txsend",
+                    "params": {},
+                }
+            if method == "jmpeerswap-cancel":
+                cancel_entered.set()
+                assert cancel_release.wait(timeout=2)
+                return {"request_id": "req-1", "state": "cancelled"}
+            return {"accepted": True}
+
+    handler = CancellableHandler()
+    client = PeerSwapRendezvousClient(
+        Path("/tmp/lightning-rpc"),
+        cast(Callable[[str, object], object], handler),
+        pool_size=1,
+        rpc_factory=lambda _: cast(LightningRpc, CancelRpc()),
+    )
+    client.start()
+    try:
+        assert finished.wait(timeout=2)
+        assert cancel_entered.wait(timeout=2)
+
+        client.stop()
+        assert closed.is_set()
+
+        cancel_release.set()
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline and not cancelled.is_set():
+            time.sleep(0.01)
+        assert not cancelled.is_set()
+    finally:
+        cancel_release.set()
+        client.stop()
 
 
 def test_rendezvous_client_cancels_active_dispatch_on_peer_disconnect() -> None:

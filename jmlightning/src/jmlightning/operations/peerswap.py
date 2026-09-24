@@ -860,6 +860,7 @@ class PeerSwapRendezvousClient:
         cancel_request: Callable[[str], None],
     ) -> None:
         cancelled = threading.Event()
+        request_finished = threading.Event()
         future = start_request(request_id, method, params)
         if not isinstance(future, Future):
             raise TypeError("PeerSwap cancellable handler returned an invalid future")
@@ -876,8 +877,11 @@ class PeerSwapRendezvousClient:
                     and result.get("request_id") == request_id
                     and result.get("state") in {"cancelled", "timed_out"}
                 ):
-                    cancelled.set()
-                    cancel_request(request_id)
+                    with self._dispatch_condition:
+                        if request_finished.is_set():
+                            return
+                        cancelled.set()
+                        cancel_request(request_id)
             except Exception as exc:
                 if not self._stopping.is_set():
                     logger.exception(
@@ -907,6 +911,7 @@ class PeerSwapRendezvousClient:
                 finish_request = getattr(self.handler, "finish_request", None)
                 if callable(finish_request):
                     finish_request(request_id)
+                request_finished.set()
                 return
             if isinstance(exc, ValueError):
                 self._send_error(rpc, request_id, -32602, str(exc))
@@ -915,6 +920,7 @@ class PeerSwapRendezvousClient:
             finish_request = getattr(self.handler, "finish_request", None)
             if callable(finish_request):
                 finish_request(request_id)
+            request_finished.set()
             return
 
         if cancelled.is_set():
@@ -958,6 +964,7 @@ class PeerSwapRendezvousClient:
             finish_request = getattr(self.handler, "finish_request", None)
             if callable(finish_request):
                 finish_request(request_id)
+            request_finished.set()
 
     @staticmethod
     def _send_error(
