@@ -330,6 +330,7 @@ class TxBuilder:
         funding_address: str,
         change_address: str,
         wallet: WalletService,
+        finalise_psbt: bool = False,
     ) -> tuple[ParsedTransaction, str, int, bytes]:
 
         self._validate_plan(plan)
@@ -423,6 +424,7 @@ class TxBuilder:
             signing_inputs=signing_inputs,
             psbt_inputs=psbt_inputs,
             wallet=wallet,
+            finalise_transaction=finalise_psbt,
         )
 
         return tx, txid, funding_vout, signed_psbt
@@ -433,6 +435,7 @@ class TxBuilder:
         funding_addresses: list[str],
         change_address: str,
         wallet: WalletService,
+        finalise_psbt: bool = False,
     ) -> tuple[ParsedTransaction, str, bytes]:
         """Build and sign one transaction funding multiple channels."""
         self._validate_plan(plan)
@@ -521,6 +524,7 @@ class TxBuilder:
             signing_inputs=signing_inputs,
             psbt_inputs=psbt_inputs,
             wallet=wallet,
+            finalise_transaction=finalise_psbt,
         )
 
     @staticmethod
@@ -1113,6 +1117,7 @@ class TxBuilder:
         signing_inputs: Mapping[int, ClassifiedUTXO],
         psbt_inputs: list[PSBTInput],
         wallet: WalletService,
+        finalise_transaction: bool,
     ) -> tuple[ParsedTransaction, str, bytes]:
         """Build and cryptographically validate a signed transaction PSBT."""
 
@@ -1128,7 +1133,7 @@ class TxBuilder:
             tx=tx,
             signing_inputs=signing_inputs,
             wallet=wallet,
-            finalise_transaction=True,
+            finalise_transaction=finalise_transaction,
         )
         return signed_tx, txid, signed_psbt
 

@@ -320,6 +320,7 @@ class PeerSwapPrepareTxOperation:
                     funding_addresses=[output.address for output in request.outputs],
                     change_address=change_address,
                     wallet=jmadapter.require_wallet(),
+                    finalise_psbt=True,
                 )
                 self._validate_txid(txid, "JoinMarket transaction id")
                 logger.info(
@@ -1107,20 +1108,30 @@ class PeerSwapOperationDispatcher:
         with self._close_lock:
             if self._closed:
                 return
-            loop = self._loop
-            thread = self._loop_thread
-            if loop is None:
-                loop = self._ensure_loop()
+            with self._lock:
+                loop = self._loop
                 thread = self._loop_thread
+                if loop is None:
+                    loop = self._ensure_loop()
+                    thread = self._loop_thread
+                # Stop accepting new requests before waiting for the active
+                # ones. In particular, txsend deliberately waits for an
+                # in-flight broadcast after cancellation so shutdown must not
+                # race operation.close() against that work.
+                self._closed = True
+                active = list(self._active.values())
 
-            active = [future for future, _ in self._active.values()]
-            for future in active:
-                future.cancel()
-            for future in active:
+            # Do not cancel active requests here. Their coroutines own cleanup
+            # and txsend may have an externally visible broadcast in flight.
+            # Waiting for the request to settle gives operation.close() a
+            # stable view of _prepared state and avoids closing a wallet while
+            # a request can still mutate it.
+            for future, _ in active:
                 try:
                     future.result()
                 except Exception:
                     pass
+
             close_future = asyncio.run_coroutine_threadsafe(
                 self.operation.close(),
                 loop,

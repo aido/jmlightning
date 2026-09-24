@@ -110,6 +110,7 @@ async def test_txprepare_builds_and_locks_joinmarket_transaction() -> None:
         funding_addresses=[PEERSWAP_OUTPUT_ADDRESS],
         change_address=PEERSWAP_CHANGE_ADDRESS,
         wallet=adapter.require_wallet.return_value,
+        finalise_psbt=True,
     )
     adapter.close.assert_not_awaited()
 

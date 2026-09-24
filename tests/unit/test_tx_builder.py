@@ -555,11 +555,11 @@ def test_build_and_sign_funding_tx_creates_funding_output(
     assert txid
     parsed = parse_psbt(psbt)
     for input_map in parsed.input_maps:
-        assert not any(
+        assert any(
             record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
             for record in input_map.records
         )
-        assert any(
+        assert not any(
             record.key[:1] == bytes([PSBT_IN_FINAL_SCRIPTWITNESS])
             for record in input_map.records
         )
@@ -814,11 +814,11 @@ def test_build_and_sign_funding_tx_returns_signed_psbt(
     assert signed_psbt.startswith(b"psbt\xff")
     parsed = parse_psbt(signed_psbt)
     for input_map in parsed.input_maps:
-        assert not any(
+        assert any(
             record.key[:1] == bytes([PSBT_IN_PARTIAL_SIG])
             for record in input_map.records
         )
-        assert any(
+        assert not any(
             record.key[:1] == bytes([PSBT_IN_FINAL_SCRIPTWITNESS])
             for record in input_map.records
         )
@@ -1012,6 +1012,7 @@ def test_build_and_sign_tx_supports_non_wallet_inputs(
         signing_inputs=signing_inputs,
         psbt_inputs=psbt_inputs,
         wallet=wallet,
+        finalise_transaction=True,
     )[2]
 
     parsed = parse_psbt(signed_psbt)

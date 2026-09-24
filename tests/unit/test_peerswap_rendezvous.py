@@ -149,6 +149,42 @@ def test_dispatcher_close_closes_operation_before_stopping_loop() -> None:
     operation.close.assert_awaited_once()
 
 
+def test_dispatcher_close_waits_for_active_request_before_operation_close() -> None:
+    from concurrent.futures import Future
+
+    operation = Mock()
+    operation.close = AsyncMock()
+    dispatcher = PeerSwapOperationDispatcher(
+        cast(PeerSwapPrepareTxOperation, operation)
+    )
+
+    started = threading.Event()
+    release = threading.Event()
+
+    class BlockingFuture(Future[object]):
+        def result(self, timeout: float | None = None) -> object:
+            started.set()
+            if not release.wait(timeout):
+                raise TimeoutError
+            return None
+
+    future = BlockingFuture()
+    with dispatcher._lock:
+        dispatcher._active["req-1"] = (future, "txsend")
+
+    close_thread = threading.Thread(target=dispatcher.close)
+    close_thread.start()
+
+    assert started.wait(timeout=1)
+    operation.close.assert_not_awaited()
+
+    release.set()
+    close_thread.join(timeout=2)
+
+    assert not close_thread.is_alive()
+    operation.close.assert_awaited_once()
+
+
 def test_runtime_uses_dispatcher_as_rendezvous_handler(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
