@@ -959,7 +959,7 @@ def test_get_fee_rate_uses_explicit_cln_feerate() -> None:
 
     rpc.parsefeerate.return_value = {"perkw": 11_000}
 
-    assert backend.get_fee_rate(feerate="urgent") == 2.75
+    assert backend.get_fee_rate(feerate="urgent") == 44.0
     rpc.parsefeerate.assert_called_once_with("urgent")
     rpc.estimatefees.assert_not_called()
 

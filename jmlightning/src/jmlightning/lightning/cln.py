@@ -380,7 +380,7 @@ class CLNBackend(LightningBackend):
             if not isinstance(perkw, int) or isinstance(perkw, bool) or perkw <= 0:
                 raise RuntimeError("CLN parsefeerate returned an invalid fee rate")
 
-            fee_rate = perkw / 4000.0
+            fee_rate = perkw / 250.0
             if not isfinite(fee_rate) or fee_rate <= 0:
                 raise RuntimeError("CLN parsefeerate returned an invalid fee rate")
 
