@@ -1034,6 +1034,8 @@ class PeerSwapOperationDispatcher:
         self._close_lock = threading.Lock()
         self._active: dict[str, tuple[Future[object], str]] = {}
         self._cancel_cleanup_requests: set[str] = set()
+        self._pending_cleanup_count = 0
+        self._cleanup_condition = threading.Condition(self._lock)
         self._closed = False
 
     def __call__(self, method: str, params: object) -> object:
@@ -1081,53 +1083,61 @@ class PeerSwapOperationDispatcher:
             if request_id in self._cancel_cleanup_requests:
                 return
             self._cancel_cleanup_requests.add(request_id)
+            self._pending_cleanup_count += 1
 
         def cleanup_completed(done: Future[object]) -> None:
-            if done.cancelled():
-                return
             try:
-                result = done.result()
-            except Exception:
-                return
-            if not isinstance(result, dict):
-                return
-            txid = result.get("txid")
-            if not isinstance(txid, str):
-                return
+                if done.cancelled():
+                    return
+                try:
+                    result = done.result()
+                except Exception:
+                    return
+                if not isinstance(result, dict):
+                    return
+                txid = result.get("txid")
+                if not isinstance(txid, str):
+                    return
 
-            with self._lock:
-                loop = self._loop
-                loop_thread = self._loop_thread
-            if loop is None:
-                loop = self._ensure_loop()
                 with self._lock:
+                    loop = self._loop
                     loop_thread = self._loop_thread
+                if loop is None:
+                    loop = self._ensure_loop()
+                    with self._lock:
+                        loop_thread = self._loop_thread
 
-            coroutine = self.operation.discard(txid.lower())
-            if loop_thread is threading.current_thread():
-                loop.create_task(coroutine)
-                return
+                coroutine = self.operation.discard(txid.lower())
+                if loop_thread is threading.current_thread():
+                    loop.create_task(coroutine)
+                    return
 
-            discard = asyncio.run_coroutine_threadsafe(coroutine, loop)
-            try:
-                discard.result()
-            except Exception as exc:
-                logger.error(
-                    "Failed to discard cancelled PeerSwap txprepare {}: {}",
-                    txid,
-                    exc,
-                )
+                discard = asyncio.run_coroutine_threadsafe(coroutine, loop)
+                try:
+                    discard.result()
+                except Exception as exc:
+                    logger.error(
+                        "Failed to discard cancelled PeerSwap txprepare {}: {}",
+                        txid,
+                        exc,
+                    )
+            finally:
+                with self._cleanup_condition:
+                    self._pending_cleanup_count -= 1
+                    if self._pending_cleanup_count == 0:
+                        self._cleanup_condition.notify_all()
 
-        if future.done():
+        with self._lock:
+            cleanup_started = future.done()
+            if not cleanup_started:
+                future.add_done_callback(cleanup_completed)
+        if cleanup_started:
             cleanup_completed(future)
-        else:
-            future.add_done_callback(cleanup_completed)
 
     def finish_request(self, request_id: str) -> None:
         """Release the rendezvous operation handle after response delivery."""
         with self._lock:
             self._active.pop(request_id, None)
-            self._cancel_cleanup_requests.discard(request_id)
 
     def close(self) -> None:
         """Close prepared PeerSwap state and stop the event loop."""
@@ -1157,6 +1167,13 @@ class PeerSwapOperationDispatcher:
                     future.result()
                 except Exception:
                     pass
+
+            # A completed txprepare can still have a cancellation cleanup
+            # callback running after the request itself has settled. Keep that
+            # work accounted for so operation.close() cannot race its discard.
+            with self._cleanup_condition:
+                while self._pending_cleanup_count:
+                    self._cleanup_condition.wait()
 
             close_future = asyncio.run_coroutine_threadsafe(
                 self.operation.close(),

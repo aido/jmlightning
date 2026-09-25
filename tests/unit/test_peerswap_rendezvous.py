@@ -199,6 +199,46 @@ def test_dispatcher_close_closes_operation_before_stopping_loop() -> None:
     operation.close.assert_awaited_once()
 
 
+def test_dispatcher_close_waits_for_pending_cancel_cleanup() -> None:
+    from concurrent.futures import Future
+
+    operation = Mock(spec=PeerSwapPrepareTxOperation)
+    cleanup_started = threading.Event()
+    cleanup_release = threading.Event()
+
+    async def discard(txid: str) -> dict[str, bool]:
+        assert txid == "22" * 32
+        cleanup_started.set()
+        assert cleanup_release.wait(timeout=2)
+        return {}
+
+    operation.discard = discard
+    operation.close = AsyncMock()
+    dispatcher = PeerSwapOperationDispatcher(operation)
+    future: Future[object] = Future()
+    with dispatcher._lock:
+        dispatcher._active["req-1"] = (future, "txprepare")
+
+    future.set_result({"txid": "22" * 32})
+
+    cancel_thread = threading.Thread(target=dispatcher.cancel_request, args=("req-1",))
+    cancel_thread.start()
+    assert cleanup_started.wait(timeout=1)
+
+    close_thread = threading.Thread(target=dispatcher.close)
+    close_thread.start()
+    time.sleep(0.05)
+    operation.close.assert_not_awaited()
+
+    cleanup_release.set()
+    cancel_thread.join(timeout=2)
+    close_thread.join(timeout=2)
+
+    assert not cancel_thread.is_alive()
+    assert not close_thread.is_alive()
+    operation.close.assert_awaited_once()
+
+
 def test_dispatcher_close_waits_for_active_request_before_operation_close() -> None:
     from concurrent.futures import Future
 

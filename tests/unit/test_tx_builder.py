@@ -34,6 +34,7 @@ from jmwallet.wallet.signing import sign_p2wpkh_input
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
 from jmlightning.tx_builder import (
+    CLN_PSBT_SERIAL_ID_KEY,
     PSBT_GLOBAL_FALLBACK_LOCKTIME,
     PSBT_GLOBAL_INPUT_COUNT,
     PSBT_GLOBAL_OUTPUT_COUNT,
@@ -1432,10 +1433,7 @@ def test_add_splice_in_input_preserves_cln_psbt_metadata(
         bytes([PSBT_IN_PROPRIETARY]),
     ]
     assert len(parsed.output_maps[1].records) == 1
-    assert (
-        parsed.output_maps[1].records[0].key
-        == bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
-    )
+    assert parsed.output_maps[1].records[0].key == CLN_PSBT_SERIAL_ID_KEY
 
     assert parsed.unsigned_tx == serialize_transaction(
         parsed.transaction.version,
