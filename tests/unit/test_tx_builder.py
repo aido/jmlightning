@@ -18,6 +18,7 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_UNSIGNED_TX,
     PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTWITNESS,
@@ -27,6 +28,9 @@ from jmwallet.wallet.psbt import (
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
     PSBT_MAGIC,
+    ParsedPSBT,
+    PSBTKeyValue,
+    PSBTMap,
     parse_psbt,
 )
 from jmwallet.wallet.signing import sign_p2wpkh_input
@@ -45,6 +49,7 @@ from jmlightning.tx_builder import (
     PSBT_IN_SEQUENCE,
     PSBT_OUT_AMOUNT,
     PSBT_OUT_SCRIPT,
+    SpliceContribution,
     TxBuilder,
 )
 
@@ -234,6 +239,23 @@ def _build_splice_plan(
         warnings=[],
         rationale="test splice plan",
     )
+
+
+def _sync_unsigned_tx(parsed: ParsedPSBT) -> None:
+    unsigned_tx = serialize_transaction(
+        parsed.transaction.version,
+        parsed.transaction.inputs,
+        parsed.transaction.outputs,
+        parsed.transaction.locktime,
+    )
+    for index, record in enumerate(parsed.global_map.records):
+        if record.key == bytes([PSBT_GLOBAL_UNSIGNED_TX]):
+            parsed.global_map.records[index] = record.__class__(
+                key=record.key,
+                value=unsigned_tx,
+            )
+            return
+    raise AssertionError("PSBT fixture is missing the unsigned transaction")
 
 
 def test_cln_input_weight_rejects_unsupported_script() -> None:
@@ -445,7 +467,7 @@ def test_add_splice_in_input_accepts_cln_psbt_v2_and_preserves_metadata(
     builder = TxBuilder()
     wallet = _mock_wallet()
 
-    result = builder.add_splice_in_input(
+    result, _contribution = builder.add_splice_in_input(
         psbt=_build_cln_splice_psbt_v2(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1404,7 +1426,7 @@ def test_add_splice_in_input_preserves_cln_psbt_metadata(
     wallet = _mock_wallet()
     original = parse_psbt(_build_splice_psbt())
 
-    updated = builder.add_splice_in_input(
+    updated, _contribution = builder.add_splice_in_input(
         psbt=original.serialize(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1538,7 +1560,7 @@ def test_find_splice_input_index_finds_appended_jm_input(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1568,7 +1590,7 @@ def test_find_splice_input_index_rejects_duplicate_jm_input(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1595,7 +1617,7 @@ def test_sign_splice_psbt_signs_only_jm_input(
     builder = TxBuilder()
     wallet = _mock_wallet()
 
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1659,16 +1681,15 @@ def test_sign_splice_psbt_rejects_signed_jm_input(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    parsed = parse_psbt(
-        builder.add_splice_in_input(
-            psbt=_build_splice_psbt(),
-            coin=classified_utxos[2],
-            plan=_build_splice_plan(classified_utxos),
-            change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
-            wallet=wallet,
-            prev_tx=splice_prev_tx,
-        )
+    splice_psbt, _contribution = builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        plan=_build_splice_plan(classified_utxos),
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=wallet,
+        prev_tx=splice_prev_tx,
     )
+    parsed = parse_psbt(splice_psbt)
     pubkey = wallet.get_key_for_address.return_value.get_public_key_bytes(
         compressed=True,
     )
@@ -1694,7 +1715,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_outpoint(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1730,7 +1751,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_value(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1766,7 +1787,7 @@ def test_sign_splice_psbt_rejects_mismatched_jm_script(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1802,7 +1823,7 @@ def test_sign_splice_psbt_validates_every_jm_input(
 ) -> None:
     builder = TxBuilder()
     wallet = _mock_wallet()
-    splice_psbt = builder.add_splice_in_input(
+    splice_psbt, _contribution = builder.add_splice_in_input(
         psbt=_build_splice_psbt(),
         coin=classified_utxos[2],
         plan=_build_splice_plan(classified_utxos),
@@ -1847,6 +1868,131 @@ def test_sign_splice_psbt_rejects_invalid_signing_index(
             signing_inputs={1: classified_utxos[2]},
             wallet=_mock_wallet(),
         )
+
+
+def _capture_splice_contribution(
+    builder: TxBuilder,
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> tuple[bytes, SpliceContribution]:
+    return builder.add_splice_in_input(
+        psbt=_build_splice_psbt(),
+        coin=classified_utxos[2],
+        plan=_build_splice_plan(classified_utxos),
+        change_address="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+        wallet=_mock_wallet(),
+        prev_tx=splice_prev_tx,
+    )
+
+
+@pytest.mark.parametrize("mutation", ["remove_change", "extra_output"])
+def test_validate_splice_psbt_rejects_output_tampering(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+    mutation: str,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+
+    if mutation == "remove_change":
+        parsed.transaction.outputs.pop()
+        parsed.output_maps.pop()
+    else:
+        parsed.transaction.outputs.append(
+            TxOutput.from_address(
+                "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh",
+                1_000,
+            )
+        )
+        parsed.output_maps.append(parsed.output_maps[-1].__class__())
+    _sync_unsigned_tx(parsed)
+
+    with pytest.raises(RuntimeError, match="permitted output changes"):
+        builder.validate_splice_psbt(parsed.serialize(), contribution)
+
+
+def test_validate_splice_psbt_rejects_fee_inflation(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+
+    parsed.transaction.outputs[0] = TxOutput(
+        value=contribution.channel_output[0] + contribution.channel_contribution,
+        script=contribution.channel_output[1],
+    )
+    parsed.transaction.inputs.append(
+        TxInput.from_hex(
+            txid="cc" * 32,
+            vout=0,
+            sequence=0xFFFFFFFF,
+            value=1_000,
+            scriptpubkey="0014" + "44" * 20,
+        )
+    )
+    parsed.transaction.witnesses.append([])
+    parsed.input_maps.append(
+        PSBTMap(
+            records=[
+                PSBTKeyValue(
+                    key=bytes([PSBT_IN_WITNESS_UTXO]),
+                    value=(1_000).to_bytes(8, "little")
+                    + b"\x16\x00\x14"
+                    + b"\x44" * 20,
+                )
+            ]
+        )
+    )
+    _sync_unsigned_tx(parsed)
+
+    with pytest.raises(RuntimeError, match="exceeds maximum permitted fee"):
+        builder.validate_splice_psbt(parsed.serialize(), contribution)
+
+
+def test_validate_splice_psbt_accepts_final_channel_contribution(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+
+    parsed.transaction.outputs[0] = TxOutput(
+        value=contribution.channel_output[0] + contribution.channel_contribution,
+        script=contribution.channel_output[1],
+    )
+    _sync_unsigned_tx(parsed)
+
+    builder.validate_splice_psbt(parsed.serialize(), contribution)
+
+
+def test_validate_splice_psbt_accepts_reordered_inputs_and_outputs(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+
+    parsed.transaction.inputs.reverse()
+    parsed.transaction.witnesses.reverse()
+    parsed.input_maps.reverse()
+    parsed.transaction.outputs.reverse()
+    parsed.output_maps.reverse()
+    _sync_unsigned_tx(parsed)
+
+    builder.validate_splice_psbt(parsed.serialize(), contribution)
 
 
 @pytest.mark.parametrize(

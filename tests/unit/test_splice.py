@@ -83,7 +83,7 @@ def _build_splice_test_doubles() -> tuple[
 
     tx_builder = Mock()
     tx_builder.estimate_splice_fee.return_value = (100, 100)
-    tx_builder.add_splice_in_input.return_value = b"candidate-psbt"
+    tx_builder.add_splice_in_input.return_value = (b"candidate-psbt", Mock())
     tx_builder.find_splice_input_index.return_value = 1
     tx_builder.sign_splice_psbt.return_value = (
         Mock(),
@@ -258,6 +258,7 @@ async def test_splice_update_repeats_until_commitments_secured() -> None:
         )
         await operation.execute("22" * 32)
 
+    assert tx_builder.validate_splice_psbt.call_count == 4
     assert cln.splice_update.call_count == 2
     assert cln.splice_update.call_args_list[0].kwargs["psbt"] == b"candidate-psbt"
     assert cln.splice_update.call_args_list[1].kwargs["psbt"] == b"first-updated"

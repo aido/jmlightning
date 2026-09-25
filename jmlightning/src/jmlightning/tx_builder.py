@@ -1,6 +1,7 @@
 import secrets
+from collections import Counter
 from collections.abc import Mapping
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from jmcore.bitcoin import (
     BIP32Derivation,
@@ -59,6 +60,18 @@ PSBT_OUT_SCRIPT = 0x04
 # Core Lightning proprietary PSBT key for interactive transaction serial IDs.
 # Key: proprietary type (0xfc), prefix length (9), "lightning", subtype 1.
 CLN_PSBT_SERIAL_ID_KEY = bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
+
+
+@dataclass(frozen=True)
+class SpliceContribution:
+    jm_outpoint: tuple[str, int]
+    jm_value: int
+    change_script: bytes | None
+    change_value: int
+    channel_output: tuple[int, bytes]
+    channel_contribution: int
+    baseline_outputs: tuple[tuple[int, bytes], ...]
+    max_fee: int
 
 
 class TxBuilder:
@@ -684,7 +697,7 @@ class TxBuilder:
         change_address: str,
         wallet: WalletService,
         prev_tx: bytes,
-    ) -> bytes:
+    ) -> tuple[bytes, SpliceContribution]:
         """Add one JoinMarket input and matching change to a splice PSBT.
 
         The transaction supplied by Core Lightning remains authoritative.
@@ -787,6 +800,27 @@ class TxBuilder:
         if expected_change != plan.change:
             raise ValueError("Splice-in plan change does not match selected input")
 
+        baseline_outputs = tuple(
+            (output.value, output.script) for output in parsed.transaction.outputs
+        )
+        channel_candidates = [
+            output
+            for output in parsed.transaction.outputs
+            if output.script.startswith(b"\x00\x20")
+        ]
+        if len(channel_candidates) == 1:
+            channel_output = (
+                channel_candidates[0].value,
+                channel_candidates[0].script,
+            )
+        elif len(parsed.transaction.outputs) == 1:
+            channel_output = baseline_outputs[0]
+        else:
+            raise ValueError(
+                "Splice PSBT must identify exactly one channel funding output "
+                "before the JoinMarket input is added"
+            )
+
         change = plan.change
         change_output = (
             TxOutput.from_address(change_address, change) if change > 0 else None
@@ -868,7 +902,119 @@ class TxBuilder:
         else:
             raise RuntimeError("Splice PSBT is missing the unsigned transaction")
 
-        return parsed.serialize()
+        contribution = SpliceContribution(
+            jm_outpoint=coin_outpoint,
+            jm_value=coin.utxo.value,
+            change_script=(change_output.script if change_output is not None else None),
+            change_value=change,
+            channel_output=channel_output,
+            channel_contribution=plan.amount,
+            baseline_outputs=baseline_outputs,
+            max_fee=plan.fee,
+        )
+        return parsed.serialize(), contribution
+
+    @staticmethod
+    def _psbt_input_value(parsed_psbt: ParsedPSBT, index: int) -> int:
+        records = parsed_psbt.input_maps[index].records
+        witness = [r for r in records if r.key[:1] == bytes([PSBT_IN_WITNESS_UTXO])]
+        if len(witness) == 1:
+            if len(witness[0].value) < 8:
+                raise RuntimeError("Splice PSBT contains an invalid witness UTXO")
+            return int.from_bytes(witness[0].value[:8], "little")
+
+        non_witness = [
+            r for r in records if r.key[:1] == bytes([PSBT_IN_NON_WITNESS_UTXO])
+        ]
+        if len(non_witness) != 1:
+            raise RuntimeError(
+                f"Splice PSBT input {index} has no authoritative UTXO value"
+            )
+        try:
+            previous = parse_transaction_bytes(non_witness[0].value)
+        except ValueError as exc:
+            raise RuntimeError(
+                "Splice PSBT contains an invalid non-witness UTXO"
+            ) from exc
+        tx_input = parsed_psbt.transaction.inputs[index]
+        if tx_input.vout >= len(previous.outputs):
+            raise RuntimeError("Splice PSBT input references a missing UTXO")
+        return previous.outputs[tx_input.vout].value
+
+    def validate_splice_psbt(
+        self,
+        psbt: bytes,
+        contribution: SpliceContribution,
+    ) -> None:
+        """Validate immutable splice economics before JoinMarket signing."""
+        try:
+            parsed = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
+        except (PSBTError, ValueError) as exc:
+            raise RuntimeError("Invalid splice PSBT") from exc
+
+        if len(parsed.input_maps) != len(parsed.transaction.inputs):
+            raise RuntimeError("Splice PSBT input map count does not match transaction")
+        if len(parsed.output_maps) != len(parsed.transaction.outputs):
+            raise RuntimeError(
+                "Splice PSBT output map count does not match transaction"
+            )
+
+        matches = [
+            i
+            for i, tx_input in enumerate(parsed.transaction.inputs)
+            if (tx_input.txid, tx_input.vout) == contribution.jm_outpoint
+        ]
+        if len(matches) != 1:
+            raise RuntimeError(
+                "Splice PSBT must contain the approved JoinMarket UTXO exactly once"
+            )
+        if self._psbt_input_value(parsed, matches[0]) != contribution.jm_value:
+            raise RuntimeError("Splice PSBT JoinMarket input value was changed")
+
+        actual = Counter((o.value, o.script) for o in parsed.transaction.outputs)
+        expected_pre = Counter(contribution.baseline_outputs)
+        if contribution.change_script is not None:
+            expected_pre[(contribution.change_value, contribution.change_script)] += 1
+
+        expected_final = Counter(contribution.baseline_outputs)
+        expected_final[contribution.channel_output] -= 1
+        if expected_final[contribution.channel_output] == 0:
+            del expected_final[contribution.channel_output]
+        channel_after = (
+            contribution.channel_output[0] + contribution.channel_contribution,
+            contribution.channel_output[1],
+        )
+        expected_final[channel_after] += 1
+        if contribution.change_script is not None:
+            expected_final[(contribution.change_value, contribution.change_script)] += 1
+
+        pre_contribution = actual == expected_pre
+        final_contribution = actual == expected_final
+        if not (pre_contribution or final_contribution):
+            raise RuntimeError(
+                "Splice PSBT does not preserve the intended channel contribution "
+                "and permitted output changes"
+            )
+
+        # The pre-contribution PSBT is an intermediate protocol state. The
+        # JoinMarket input has been added but CLN has not necessarily applied
+        # the corresponding channel-output increase yet, so its apparent
+        # fee is not meaningful. Enforce the fee ceiling once the final
+        # channel contribution is present, immediately before signing.
+        if final_contribution:
+            input_total = sum(
+                self._psbt_input_value(parsed, index)
+                for index in range(len(parsed.transaction.inputs))
+            )
+            output_total = sum(output.value for output in parsed.transaction.outputs)
+            fee = input_total - output_total
+            if fee < 0:
+                raise RuntimeError("Splice PSBT has negative fee")
+            if fee > contribution.max_fee:
+                raise RuntimeError(
+                    "Splice PSBT fee exceeds maximum permitted fee "
+                    f"({fee} > {contribution.max_fee})"
+                )
 
     def _validate_splice_signing_input(
         self,

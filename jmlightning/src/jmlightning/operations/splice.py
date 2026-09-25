@@ -390,13 +390,17 @@ class SpliceOperation:
             previous_tx = await jmadapter.get_raw_transaction(
                 selected[0].utxo.txid,
             )
-            splice_psbt = tx_builder.add_splice_in_input(
+            splice_psbt, splice_contribution = tx_builder.add_splice_in_input(
                 psbt=initial_psbt,
                 coin=selected[0],
                 plan=plan,
                 change_address=change_address,
                 wallet=jmadapter.require_wallet(),
                 prev_tx=previous_tx,
+            )
+            tx_builder.validate_splice_psbt(
+                psbt=splice_psbt,
+                contribution=splice_contribution,
             )
 
             # --------------------------------------------------------
@@ -444,6 +448,23 @@ class SpliceOperation:
                     raise SpliceRecoveryRequiredError(
                         "CLN splice_update returned an invalid PSBT encoding; "
                         "JoinMarket UTXO remains locked for recovery",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=tuple(
+                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                        ),
+                    ) from exc
+
+                try:
+                    tx_builder.validate_splice_psbt(
+                        psbt=splice_psbt,
+                        contribution=splice_contribution,
+                    )
+                except Exception as exc:
+                    raise SpliceRecoveryRequiredError(
+                        "CLN splice_update returned a PSBT that violates the "
+                        "negotiated splice economics; JoinMarket UTXO remains "
+                        "locked for recovery",
                         channel_id=channel_id,
                         txid=None,
                         locked_outpoints=tuple(
@@ -520,6 +541,10 @@ class SpliceOperation:
                     psbt=splice_psbt,
                     signing_inputs=signing_inputs,
                     wallet=jmadapter.require_wallet(),
+                )
+                tx_builder.validate_splice_psbt(
+                    psbt=splice_psbt,
+                    contribution=splice_contribution,
                 )
             except Exception as exc:
                 raise SpliceRecoveryRequiredError(
