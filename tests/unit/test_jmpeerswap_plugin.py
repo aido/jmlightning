@@ -785,6 +785,91 @@ def test_unix_rpc_proxy_forwards_rpc() -> None:
         assert not listen_path.exists()
 
 
+def test_unix_rpc_proxy_closes_upstream_when_client_disconnects() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        directory_path = Path(directory)
+        upstream_path = directory_path / "lightning-rpc"
+        listen_path = directory_path / "peerswap-rpc"
+
+        ready = threading.Event()
+        upstream_closed = threading.Event()
+
+        def upstream_server() -> None:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(upstream_path))
+            server.listen(1)
+            ready.set()
+            client, _ = server.accept()
+            try:
+                client.settimeout(2)
+                assert client.recv(4096) == b"request\n"
+                assert client.recv(4096) == b""
+                upstream_closed.set()
+            finally:
+                client.close()
+                server.close()
+
+        thread = threading.Thread(target=upstream_server)
+        thread.start()
+        assert ready.wait(timeout=2)
+
+        proxy = UnixRPCProxy(listen_path, upstream_path)
+        proxy.start()
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.connect(str(listen_path))
+        client.sendall(b"request\n")
+        client.close()
+
+        assert upstream_closed.wait(timeout=2)
+
+        proxy.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not listen_path.exists()
+
+
+def test_unix_rpc_proxy_closes_client_when_upstream_disconnects() -> None:
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as directory:
+        directory_path = Path(directory)
+        upstream_path = directory_path / "lightning-rpc"
+        listen_path = directory_path / "peerswap-rpc"
+
+        ready = threading.Event()
+
+        def upstream_server() -> None:
+            server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            server.bind(str(upstream_path))
+            server.listen(1)
+            ready.set()
+            client, _ = server.accept()
+            client.close()
+            server.close()
+
+        thread = threading.Thread(target=upstream_server)
+        thread.start()
+        assert ready.wait(timeout=2)
+
+        proxy = UnixRPCProxy(listen_path, upstream_path)
+        proxy.start()
+
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(2)
+        client.connect(str(listen_path))
+
+        assert client.recv(4096) == b""
+
+        client.close()
+        proxy.stop()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+        assert not listen_path.exists()
+
+
 def test_unix_rpc_proxy_forwards_multiple_requests_on_one_connection() -> None:
     import tempfile
 
