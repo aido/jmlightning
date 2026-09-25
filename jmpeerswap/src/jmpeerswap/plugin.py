@@ -6,7 +6,7 @@ import subprocess
 import threading
 from collections.abc import Callable, Mapping
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Empty, Full, Queue
 from typing import TextIO, TypedDict, cast
 
 from loguru import logger
@@ -345,7 +345,13 @@ class PeerSwapProcess:
         with self._pending_lock:
             pending = list(self._pending.values())
         for response_queue in pending:
-            response_queue.put({"error": {"message": message}})
+            try:
+                response_queue.put_nowait({"error": {"message": message}})
+            except Full:
+                # The child may have replied concurrently. The request
+                # thread will consume that response; there is nothing left
+                # for the process-exit error to replace.
+                continue
 
 
 def _forward_method(

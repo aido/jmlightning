@@ -74,6 +74,7 @@ class UnixRPCProxy:
         self._thread: threading.Thread | None = None
         self._stopping = threading.Event()
         self._clients: set[socket.socket] = set()
+        self._socket_identity: tuple[int, int] | None = None
         self._clients_lock = threading.Lock()
 
     def start(self) -> None:
@@ -92,6 +93,8 @@ class UnixRPCProxy:
             raise
 
         os.chmod(self.listen_path, stat.S_IRUSR | stat.S_IWUSR)
+        socket_stat = os.lstat(self.listen_path)
+        self._socket_identity = (socket_stat.st_dev, socket_stat.st_ino)
 
         self._listener = listener
         self._stopping.clear()
@@ -133,6 +136,7 @@ class UnixRPCProxy:
             thread.join(timeout=2)
 
         self._remove_socket()
+        self._socket_identity = None
 
     def _remove_stale_socket(self) -> None:
         try:
@@ -145,16 +149,39 @@ class UnixRPCProxy:
                 f"RPC proxy path exists and is not a socket: {self.listen_path}"
             )
 
-        os.unlink(self.listen_path)
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.settimeout(0.5)
+            probe.connect(str(self.listen_path))
+        except (ConnectionRefusedError, FileNotFoundError):
+            os.unlink(self.listen_path)
+        except OSError as exc:
+            raise RuntimeError(
+                f"RPC proxy socket is in use or cannot be probed: {self.listen_path}"
+            ) from exc
+        else:
+            raise RuntimeError(
+                f"RPC proxy socket is already in use: {self.listen_path}"
+            )
+        finally:
+            probe.close()
 
     def _remove_socket(self) -> None:
+        if self._socket_identity is None:
+            return
+
         try:
-            mode = os.lstat(self.listen_path).st_mode
+            socket_stat = os.lstat(self.listen_path)
         except FileNotFoundError:
             return
 
-        if stat.S_ISSOCK(mode):
-            os.unlink(self.listen_path)
+        if not stat.S_ISSOCK(socket_stat.st_mode):
+            return
+
+        if (socket_stat.st_dev, socket_stat.st_ino) != self._socket_identity:
+            return
+
+        os.unlink(self.listen_path)
 
     def _accept_loop(self) -> None:
         listener = self._listener

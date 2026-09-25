@@ -2,6 +2,7 @@ from pathlib import Path
 from unittest.mock import AsyncMock, Mock, call, patch
 
 import pytest
+from jmcore.constants import MAX_MONEY
 from jmwallet.wallet.models import UTXOInfo
 
 from jmlightning.lightning.backend import FeePriority
@@ -503,6 +504,14 @@ def test_txprepare_rejects_invalid_minconf_types(minconf: object) -> None:
                 "outputs": [{PEERSWAP_OUTPUT_ADDRESS: 100_000}],
                 "minconf": minconf,
             }
+        )
+
+
+@pytest.mark.parametrize("amount", [MAX_MONEY + 1, 0xFFFFFFFFFFFFFFFF])
+def test_txprepare_rejects_amount_above_max_money(amount: int) -> None:
+    with pytest.raises(ValueError, match="Invalid txprepare output amount"):
+        PeerSwapPrepareTxRequest.from_rpc(
+            {"outputs": [{PEERSWAP_OUTPUT_ADDRESS: amount}]}
         )
 
 

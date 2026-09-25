@@ -1005,6 +1005,42 @@ def test_unix_rpc_proxy_handles_handler_response_without_upstream() -> None:
         assert not thread.is_alive()
 
 
+def test_unix_rpc_proxy_refuses_active_socket(tmp_path: Path) -> None:
+    listen_path = tmp_path / "peerswap-rpc"
+    upstream_path = tmp_path / "lightning-rpc"
+
+    first = UnixRPCProxy(listen_path, upstream_path)
+    first.start()
+    try:
+        second = UnixRPCProxy(listen_path, upstream_path)
+        with pytest.raises(RuntimeError, match="already in use"):
+            second.start()
+        assert listen_path.exists()
+    finally:
+        first.stop()
+
+
+def test_unix_rpc_proxy_does_not_remove_replaced_socket(tmp_path: Path) -> None:
+    listen_path = tmp_path / "peerswap-rpc"
+    upstream_path = tmp_path / "lightning-rpc"
+
+    proxy = UnixRPCProxy(listen_path, upstream_path)
+    proxy.start()
+
+    replacement = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    try:
+        listen_path.unlink()
+        replacement.bind(str(listen_path))
+        replacement.listen(1)
+
+        proxy.stop()
+
+        assert listen_path.exists()
+    finally:
+        replacement.close()
+        listen_path.unlink(missing_ok=True)
+
+
 def test_unix_rpc_proxy_refuses_non_socket_path(
     tmp_path: Path,
 ) -> None:

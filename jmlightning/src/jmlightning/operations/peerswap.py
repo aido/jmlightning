@@ -17,6 +17,7 @@ from jmcore.bitcoin import (
     psbt_to_base64,
     serialize_transaction,
 )
+from jmcore.constants import MAX_MONEY
 from loguru import logger
 from pyln.client import LightningRpc
 
@@ -89,7 +90,7 @@ class PeerSwapPrepareTxRequest:
             if (
                 isinstance(amount, bool)
                 or not isinstance(amount, int)
-                or not 0 < amount <= 0xFFFFFFFFFFFFFFFF
+                or not 0 < amount <= MAX_MONEY
             ):
                 raise ValueError(f"Invalid txprepare output amount {index}")
 
