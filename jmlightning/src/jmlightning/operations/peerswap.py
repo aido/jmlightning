@@ -11,9 +11,9 @@ from pathlib import Path
 
 from jmcore.bitcoin import (
     ParsedTransaction,
-    TxOutput,
     address_to_scriptpubkey,
     estimate_vsize,
+    get_address_type,
     psbt_to_base64,
     serialize_transaction,
 )
@@ -704,20 +704,7 @@ class PeerSwapPrepareTxOperation:
 
     @staticmethod
     def _output_type(address: str) -> str:
-        script = TxOutput.from_address(address, 1).script
-
-        if len(script) == 22 and script[:2] == b"\x00\x14":
-            return "p2wpkh"
-        if len(script) == 34 and script[:2] == b"\x00\x20":
-            return "p2wsh"
-        if len(script) == 34 and script[:2] == b"\x51\x20":
-            return "p2tr"
-        if len(script) == 25 and script[:3] == b"\x76\xa9\x14":
-            return "p2pkh"
-        if len(script) == 23 and script[:2] == b"\xa9\x14":
-            return "p2sh"
-
-        raise ValueError("Unsupported PeerSwap funding output address type")
+        return get_address_type(address)
 
 
 class PeerSwapRendezvousClient:
