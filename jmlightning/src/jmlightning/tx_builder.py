@@ -136,17 +136,6 @@ class TxBuilder:
                 raise ValueError("noncanonical PSBT compact size")
             return value, end
 
-        def _write_compact_size(value: int) -> bytes:
-            if value < 0:
-                raise ValueError("negative PSBT compact size")
-            if value < 0xFD:
-                return bytes([value])
-            if value <= 0xFFFF:
-                return b"\xfd" + value.to_bytes(2, "little")
-            if value <= 0xFFFFFFFF:
-                return b"\xfe" + value.to_bytes(4, "little")
-            return b"\xff" + value.to_bytes(8, "little")
-
         def _read_map(
             data: bytes, offset: int
         ) -> tuple[list[tuple[bytes, bytes]], int]:
@@ -170,9 +159,9 @@ class TxBuilder:
         def _write_map(records: list[tuple[bytes, bytes]]) -> bytes:
             result = bytearray()
             for key, value in records:
-                result.extend(_write_compact_size(len(key)))
+                result.extend(encode_varint(len(key)))
                 result.extend(key)
-                result.extend(_write_compact_size(len(value)))
+                result.extend(encode_varint(len(value)))
                 result.extend(value)
             result.append(0)
             return bytes(result)
@@ -260,7 +249,7 @@ class TxBuilder:
 
         tx = bytearray()
         tx.extend(tx_version_records[0])
-        tx.extend(_write_compact_size(input_count))
+        tx.extend(encode_varint(input_count))
         for index, records in enumerate(input_maps):
             txid = _singleton(
                 records, bytes([PSBT_IN_PREVIOUS_TXID]), f"input {index} previous txid"
@@ -282,7 +271,7 @@ class TxBuilder:
             tx.append(0)
             tx.extend(sequence_values[0] if sequence_values else b"\xff\xff\xff\xff")
 
-        tx.extend(_write_compact_size(output_count))
+        tx.extend(encode_varint(output_count))
         for index, records in enumerate(output_maps):
             amount = _singleton(
                 records, bytes([PSBT_OUT_AMOUNT]), f"output {index} amount"
@@ -293,7 +282,7 @@ class TxBuilder:
             if len(amount) != 8:
                 raise ValueError(f"PSBT v2 output {index} has invalid amount")
             tx.extend(amount)
-            tx.extend(_write_compact_size(len(script)))
+            tx.extend(encode_varint(len(script)))
             tx.extend(script)
 
         tx.extend(locktime_records[0] if locktime_records else b"\x00\x00\x00\x00")
