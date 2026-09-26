@@ -115,7 +115,7 @@ Install `jmlightning` on the host that has access to the JoinMarket-NG wallet an
 
 ```bash
 cd jmlightning
-pip install -e ./jmlightning
+pip install -e .
 ```
 
 This installs the `jmlightning` package and the `jm-lightning` CLI.
@@ -125,8 +125,8 @@ This installs the `jmlightning` package and the `jm-lightning` CLI.
 If PeerSwap is to be used, install the `jmpeerswap` plugin on the **Core Lightning node**. It is a separate package from `jmlightning` and does not need the JoinMarket wallet on the Lightning host:
 
 ```bash
-cd jmlightning
-pip install -e ./jmpeerswap
+cd jmpeerswap
+pip install -e .
 ```
 
 This installs the `jm-peerswap` CLN plugin entry point. The plugin runs on the Lightning node and proxies the upstream PeerSwap plugin while providing the rendezvous boundary used by `jmlightning`.

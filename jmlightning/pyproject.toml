@@ -7,6 +7,9 @@ dependencies = [
     "jmcore>=0.39.2,<0.40.0",
     "jmwallet>=0.39.2,<0.40.0",
     "pyln-client>=26.6.8,<27.0.0",
+    "loguru>=0.7.0,<1.0.0",
+    "pydantic>=2.0,<3.0",
+    "typer>=0.12,<1.0",
 ]
 
 [project.scripts]
