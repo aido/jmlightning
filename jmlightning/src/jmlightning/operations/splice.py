@@ -3,10 +3,9 @@ from __future__ import annotations
 import base64
 import binascii
 from collections.abc import Callable
-from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import typer
 from jmcore.bitcoin import estimate_vsize
@@ -16,6 +15,7 @@ from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
+from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.recovery import RecoveryJournal
@@ -27,12 +27,7 @@ SpliceConfirmationCallback = Callable[
 ]
 
 
-class SplicePhase(StrEnum):
-    PRESTART = auto()
-    LOCKED = auto()
-    STARTED = auto()
-    UPDATED = auto()
-    SIGNED = auto()
+SplicePhase: TypeAlias = LifecyclePhase
 
 
 class SpliceRecoveryRequiredError(RuntimeError):
@@ -99,11 +94,9 @@ class SpliceOperation:
 
         selected: list[ClassifiedUTXO] = []
         locked: list[ClassifiedUTXO] = []
-        phase = SplicePhase.PRESTART
+        lifecycle = OperationLifecycle()
         txid: str | None = None
-        release_locks = True
         operation_error: Exception | None = None
-        cleanup_errors: list[Exception] = []
 
         try:
             # --------------------------------------------------------
@@ -280,7 +273,7 @@ class SpliceOperation:
                 jmadapter.lock(coin)
                 locked.append(coin)
 
-            phase = SplicePhase.LOCKED
+            lifecycle.transition(LifecyclePhase.LOCKED)
 
             # Keep the JoinMarket reservations alive while this operation
             # waits on CLN or operator input.
@@ -301,7 +294,7 @@ class SpliceOperation:
                 result = recovery_journal.call(
                     recovery_id,
                     action="splice_init",
-                    phase=SplicePhase.LOCKED.value,
+                    phase=LifecyclePhase.LOCKED.value,
                     fn=lambda: cln.splice_init(
                         channel_id=channel_id,
                         amount=plan.amount,
@@ -313,7 +306,7 @@ class SpliceOperation:
             except Exception as exc:
                 # splice_init has no transaction id with which to identify
                 # an accepted-but-unknown operation. Do not unlock inputs.
-                release_locks = False
+                lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
                     "CLN splice_init outcome is unknown; "
                     "JoinMarket UTXO remains locked for recovery",
@@ -326,7 +319,7 @@ class SpliceOperation:
 
             returned_psbt = result.get("psbt")
             if not isinstance(returned_psbt, str) or not returned_psbt:
-                release_locks = False
+                lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
                     "CLN splice_init returned an invalid PSBT; "
                     "JoinMarket UTXO remains locked for recovery",
@@ -343,7 +336,7 @@ class SpliceOperation:
                     validate=True,
                 )
             except (ValueError, binascii.Error) as exc:
-                release_locks = False
+                lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
                     "CLN splice_init returned an invalid PSBT encoding; "
                     "JoinMarket UTXO remains locked for recovery",
@@ -354,8 +347,8 @@ class SpliceOperation:
                     ),
                 ) from exc
 
-            phase = SplicePhase.STARTED
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.STARTED)
+            lifecycle.release_locks = False
 
             # --------------------------------------------------------
             # Calculate the exact initiator fee for this splice
@@ -368,7 +361,7 @@ class SpliceOperation:
                     add_change_output=self.config.amount != 0,
                 )
             except (RuntimeError, ValueError) as exc:
-                release_locks = False
+                lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
                     "Unable to calculate the splice fee from the CLN PSBT; "
                     "JoinMarket UTXO remains locked for recovery",
@@ -381,7 +374,7 @@ class SpliceOperation:
 
             splice_change = selected[0].utxo.value - plan.amount - splice_fee
             if splice_change < 0:
-                release_locks = False
+                lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
                     "Selected JoinMarket UTXO cannot fund the CLN splice fee; "
                     "JoinMarket UTXO remains locked for recovery",
@@ -439,7 +432,7 @@ class SpliceOperation:
                     update_result = recovery_journal.call(
                         recovery_id,
                         action="splice_update",
-                        phase=phase.value,
+                        phase=lifecycle.phase.value,
                         fn=lambda: cln.splice_update(
                             channel_id=channel_id,
                             psbt=splice_psbt,
@@ -532,10 +525,10 @@ class SpliceOperation:
                     )
 
                 commitments_secured = returned_commitments_secured
-                phase = SplicePhase.UPDATED
+                lifecycle.transition(LifecyclePhase.UPDATED)
 
                 if not commitments_secured:
-                    phase = SplicePhase.STARTED
+                    lifecycle.transition(LifecyclePhase.STARTED)
 
             if confirm is not None and not confirm(
                 channel_id,
@@ -605,7 +598,7 @@ class SpliceOperation:
                 signed_result = recovery_journal.call(
                     recovery_id,
                     action="splice_signed",
-                    phase=SplicePhase.UPDATED.value,
+                    phase=LifecyclePhase.UPDATED.value,
                     fn=lambda: cln.splice_signed(
                         channel_id=channel_id,
                         psbt=splice_psbt,
@@ -703,8 +696,8 @@ class SpliceOperation:
                     ),
                 )
 
-            phase = SplicePhase.SIGNED
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.SIGNED)
+            lifecycle.release_locks = False
 
             logger.info(
                 "CLN accepted splice transaction {}.",
@@ -722,57 +715,37 @@ class SpliceOperation:
             )
             raise
         finally:
-            # --------------------------------------------------------
-            # Cleanup
-            # --------------------------------------------------------
+            await lifecycle.cleanup(
+                locked=locked,
+                adapter=jmadapter,
+                close_message="Failed to close JoinMarket wallet after splice",
+                unlock_message="Failed to unlock",
+            )
 
-            if release_locks:
-                for coin in locked:
-                    try:
-                        jmadapter.unlock(coin)
-                    except Exception as exc:
-                        cleanup_errors.append(exc)
-                        logger.error(
-                            "Failed to unlock {}:{} after splice phase {}: {}",
-                            coin.utxo.txid,
-                            coin.utxo.vout,
-                            phase,
-                            exc,
-                        )
-
-            try:
-                await jmadapter.close()
-            except Exception as exc:
-                cleanup_errors.append(exc)
-                logger.error(
-                    "Failed to close JoinMarket wallet after splice phase {}: {}",
-                    phase,
-                    exc,
-                )
-
-            if not cleanup_errors and (release_locks or phase is SplicePhase.SIGNED):
-                recovery_journal.resolve(recovery_id)
-
-            if cleanup_errors and operation_error is None:
+            if lifecycle.cleanup_errors and operation_error is None:
                 logger.warning(
                     "Splice completed successfully, but JoinMarket cleanup failed",
                 )
 
-            if cleanup_errors and operation_error is not None:
-                logger.error(
+            lifecycle.resolve_if_clean(
+                recovery_journal,
+                recovery_id,
+                terminal_phase=LifecyclePhase.SIGNED,
+            )
+
+            lifecycle.raise_recovery_if_needed(
+                operation_error,
+                SpliceRecoveryRequiredError,
+                lambda error: SpliceRecoveryRequiredError(
                     "Channel splice failed and cleanup also failed; "
                     "manual recovery is required",
-                )
-                if not isinstance(operation_error, SpliceRecoveryRequiredError):
-                    raise SpliceRecoveryRequiredError(
-                        "Channel splice failed and cleanup also failed; "
-                        "manual recovery is required",
-                        channel_id=channel_id,
-                        txid=txid,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
-                    ) from operation_error
+                    channel_id=channel_id,
+                    txid=txid,
+                    locked_outpoints=tuple(
+                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                    ),
+                ),
+            )
 
         if txid is None:
             raise RuntimeError("Splice completed without a transaction id")

@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import typer
 from jmcore.bitcoin import ParsedTransaction, estimate_vsize
@@ -15,6 +14,7 @@ from jmlightning.config import CLNConfig
 from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
+from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.recovery import RecoveryJournal
@@ -26,12 +26,7 @@ OpenChannelConfirmationCallback = Callable[
 ]
 
 
-class FundingPhase(StrEnum):
-    PRESTART = auto()
-    LOCKED = auto()
-    STARTED = auto()
-    WITHHELD = auto()
-    BROADCAST = auto()
+FundingPhase: TypeAlias = LifecyclePhase
 
 
 class OpenChannelCancelledError(RuntimeError):
@@ -94,11 +89,9 @@ class OpenChannelOperation:
 
         selected: list[ClassifiedUTXO] = []
         locked: list[ClassifiedUTXO] = []
-        phase = FundingPhase.PRESTART
+        lifecycle = OperationLifecycle()
         txid: str | None = None
-        release_locks = True
         operation_error: Exception | None = None
-        cleanup_errors: list[Exception] = []
 
         try:
             # --------------------------------------------------------
@@ -283,7 +276,7 @@ class OpenChannelOperation:
                 jmadapter.lock(coin)
                 locked.append(coin)
 
-            phase = FundingPhase.LOCKED
+            lifecycle.transition(LifecyclePhase.LOCKED)
 
             # Keep the JoinMarket reservations alive while this operation
             # waits on CLN or operator input. Renewal runs independently of
@@ -308,7 +301,7 @@ class OpenChannelOperation:
                 funding_address = recovery_journal.call(
                     recovery_id,
                     action="fundchannel_start",
-                    phase=FundingPhase.LOCKED.value,
+                    phase=LifecyclePhase.LOCKED.value,
                     fn=lambda: cln.open_channel_start(
                         peer_id=peer_id,
                         amount=plan.amount,
@@ -322,7 +315,7 @@ class OpenChannelOperation:
                 # There is no transaction id yet with which to identify
                 # a possibly-created funding operation, so do not guess
                 # and do not unlock the inputs.
-                release_locks = False
+                lifecycle.release_locks = False
                 raise OpenChannelRecoveryRequiredError(
                     "CLN fundchannel_start outcome is unknown; "
                     "JoinMarket UTXOs remain locked for recovery",
@@ -330,8 +323,8 @@ class OpenChannelOperation:
                     txid=None,
                 ) from exc
 
-            phase = FundingPhase.STARTED
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.STARTED)
+            lifecycle.release_locks = False
 
             logger.info(
                 "CLN funding address obtained: {}",
@@ -360,14 +353,14 @@ class OpenChannelOperation:
                     recovery_journal.call(
                         recovery_id,
                         action="fundchannel_cancel",
-                        phase=phase.value,
+                        phase=lifecycle.phase.value,
                         fn=lambda: cln.cancel_channel_funding(peer_id),
                         locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         txid=txid,
                     )
                 except Exception as cancel_exc:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise OpenChannelRecoveryRequiredError(
                         "Unable to cancel CLN channel funding after "
                         "local transaction preparation failed; "
@@ -376,8 +369,8 @@ class OpenChannelOperation:
                         txid=txid,
                     ) from cancel_exc
 
-                phase = FundingPhase.LOCKED
-                release_locks = True
+                lifecycle.transition(LifecyclePhase.LOCKED)
+                lifecycle.release_locks = True
                 raise exc
 
             if confirm is not None and not confirm(
@@ -393,14 +386,14 @@ class OpenChannelOperation:
                     recovery_journal.call(
                         recovery_id,
                         action="fundchannel_cancel",
-                        phase=phase.value,
+                        phase=lifecycle.phase.value,
                         fn=lambda: cln.cancel_channel_funding(peer_id),
                         locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         txid=txid,
                     )
                 except Exception as cancel_exc:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise OpenChannelRecoveryRequiredError(
                         "Unable to cancel CLN channel funding after "
                         "user declined channel funding; "
@@ -409,8 +402,8 @@ class OpenChannelOperation:
                         txid=txid,
                     ) from cancel_exc
 
-                phase = FundingPhase.LOCKED
-                release_locks = True
+                lifecycle.transition(LifecyclePhase.LOCKED)
+                lifecycle.release_locks = True
 
                 raise OpenChannelCancelledError(
                     "Channel funding cancelled by user",
@@ -426,7 +419,7 @@ class OpenChannelOperation:
                 recovery_journal.call(
                     recovery_id,
                     action="fundchannel_complete",
-                    phase=FundingPhase.STARTED.value,
+                    phase=LifecyclePhase.STARTED.value,
                     fn=lambda: cln.open_channel_complete(
                         peer_id=peer_id,
                         psbt=signed_psbt,
@@ -443,7 +436,7 @@ class OpenChannelOperation:
                         txid=txid,
                     )
                 except Exception as status_exc:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise OpenChannelRecoveryRequiredError(
                         "Unable to determine CLN channel completion state; "
                         "JoinMarket UTXOs remain locked for recovery",
@@ -452,12 +445,12 @@ class OpenChannelOperation:
                     ) from status_exc
 
                 if status is ChannelFundingStatus.WITHHELD:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     try:
                         recovery_journal.call(
                             recovery_id,
                             action="fundchannel_cancel",
-                            phase=phase.value,
+                            phase=lifecycle.phase.value,
                             fn=lambda: cln.cancel_channel_funding(peer_id),
                             locked_outpoints=[
                                 (c.utxo.txid, c.utxo.vout) for c in locked
@@ -473,13 +466,13 @@ class OpenChannelOperation:
                             txid=txid,
                         ) from cancel_exc
 
-                    release_locks = True
-                    phase = FundingPhase.LOCKED
+                    lifecycle.release_locks = True
+                    lifecycle.transition(LifecyclePhase.LOCKED)
                 elif status is ChannelFundingStatus.ABSENT:
-                    release_locks = True
-                    phase = FundingPhase.LOCKED
+                    lifecycle.release_locks = True
+                    lifecycle.transition(LifecyclePhase.LOCKED)
                 else:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise OpenChannelRecoveryRequiredError(
                         "CLN channel completion outcome is ambiguous; "
                         "funding may already have been broadcast",
@@ -489,7 +482,7 @@ class OpenChannelOperation:
 
                 raise
 
-            phase = FundingPhase.WITHHELD
+            lifecycle.transition(LifecyclePhase.WITHHELD)
 
             # --------------------------------------------------------
             # Broadcast through CLN
@@ -501,7 +494,7 @@ class OpenChannelOperation:
                 broadcast_result = recovery_journal.call(
                     recovery_id,
                     action="sendpsbt",
-                    phase=FundingPhase.WITHHELD.value,
+                    phase=LifecyclePhase.WITHHELD.value,
                     fn=lambda: cln.send_psbt(signed_psbt),
                     locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
@@ -515,7 +508,7 @@ class OpenChannelOperation:
                         txid=txid,
                     )
                 except Exception as status_exc:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise OpenChannelRecoveryRequiredError(
                         "Unable to determine CLN sendpsbt outcome; "
                         "JoinMarket UTXOs remain locked for recovery",
@@ -524,12 +517,12 @@ class OpenChannelOperation:
                     ) from status_exc
 
                 if status is ChannelFundingStatus.WITHHELD:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     try:
                         recovery_journal.call(
                             recovery_id,
                             action="fundchannel_cancel",
-                            phase=phase.value,
+                            phase=lifecycle.phase.value,
                             fn=lambda: cln.cancel_channel_funding(peer_id),
                             locked_outpoints=[
                                 (c.utxo.txid, c.utxo.vout) for c in locked
@@ -545,8 +538,8 @@ class OpenChannelOperation:
                             txid=txid,
                         ) from cancel_exc
 
-                    release_locks = True
-                    phase = FundingPhase.LOCKED
+                    lifecycle.release_locks = True
+                    lifecycle.transition(LifecyclePhase.LOCKED)
                     raise
 
                 if status is ChannelFundingStatus.BROADCAST:
@@ -554,8 +547,8 @@ class OpenChannelOperation:
                     # the expected funding transaction is no longer
                     # withheld. Never cancel and never unlock inputs
                     # after broadcast.
-                    phase = FundingPhase.BROADCAST
-                    release_locks = False
+                    lifecycle.transition(LifecyclePhase.BROADCAST)
+                    lifecycle.release_locks = False
                     logger.warning(
                         "sendpsbt outcome was ambiguous, but CLN confirms "
                         "funding transaction {} was broadcast; treating "
@@ -566,14 +559,14 @@ class OpenChannelOperation:
 
                 # ABSENT means the channel and transaction are both
                 # absent from CLN's authoritative state.
-                phase = FundingPhase.LOCKED
-                release_locks = True
+                lifecycle.transition(LifecyclePhase.LOCKED)
+                lifecycle.release_locks = True
                 raise
 
             result_txid = broadcast_result.get("txid")
 
             if not isinstance(result_txid, str) or result_txid != txid:
-                release_locks = False
+                lifecycle.release_locks = False
                 raise OpenChannelRecoveryRequiredError(
                     "CLN sendpsbt returned an unexpected funding transaction id; "
                     "JoinMarket UTXOs remain locked for recovery",
@@ -581,8 +574,8 @@ class OpenChannelOperation:
                     txid=txid,
                 )
 
-            phase = FundingPhase.BROADCAST
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.BROADCAST)
+            lifecycle.release_locks = False
 
             logger.info(
                 "Funding transaction broadcast through CLN: {}",
@@ -599,37 +592,20 @@ class OpenChannelOperation:
             raise
 
         finally:
-            if release_locks:
-                for coin in locked:
-                    try:
-                        jmadapter.unlock(coin)
-                    except Exception as exc:
-                        cleanup_errors.append(exc)
-                        logger.error(
-                            "Failed to unlock {}:{} after funding phase {}: {}",
-                            coin.utxo.txid,
-                            coin.utxo.vout,
-                            phase,
-                            exc,
-                        )
+            await lifecycle.cleanup(
+                locked=locked,
+                adapter=jmadapter,
+                close_message="Failed to close JoinMarket wallet after funding",
+                unlock_message="Failed to unlock",
+            )
 
-            try:
-                await jmadapter.close()
-            except Exception as exc:
-                cleanup_errors.append(exc)
-                logger.error(
-                    "Failed to close JoinMarket wallet after funding phase {}: {}",
-                    phase,
-                    exc,
-                )
-
-            if cleanup_errors and operation_error is None:
-                if phase is not FundingPhase.BROADCAST:
+            if lifecycle.cleanup_errors and operation_error is None:
+                if lifecycle.phase is not LifecyclePhase.BROADCAST:
                     raise OpenChannelRecoveryRequiredError(
                         "Channel funding cleanup failed; manual recovery is required",
                         peer_id=peer_id,
                         txid=txid,
-                    ) from cleanup_errors[0]
+                    ) from lifecycle.cleanup_errors[0]
 
                 logger.warning(
                     "Funding transaction {} was broadcast successfully, "
@@ -637,23 +613,22 @@ class OpenChannelOperation:
                     txid,
                 )
 
-            if not cleanup_errors and (
-                release_locks or phase is FundingPhase.BROADCAST
-            ):
-                recovery_journal.resolve(recovery_id)
+            lifecycle.resolve_if_clean(
+                recovery_journal,
+                recovery_id,
+                terminal_phase=LifecyclePhase.BROADCAST,
+            )
 
-            if cleanup_errors and operation_error is not None:
-                logger.error(
+            lifecycle.raise_recovery_if_needed(
+                operation_error,
+                OpenChannelRecoveryRequiredError,
+                lambda error: OpenChannelRecoveryRequiredError(
                     "Channel funding failed and cleanup also failed; "
                     "manual recovery is required",
-                )
-                if not isinstance(operation_error, OpenChannelRecoveryRequiredError):
-                    raise OpenChannelRecoveryRequiredError(
-                        "Channel funding failed and cleanup also failed; "
-                        "manual recovery is required",
-                        peer_id=peer_id,
-                        txid=txid,
-                    ) from operation_error
+                    peer_id=peer_id,
+                    txid=txid,
+                ),
+            )
 
 
 def confirm_open_channel(

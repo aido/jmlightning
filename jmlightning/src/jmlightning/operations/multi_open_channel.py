@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
-from typing import cast
+from typing import TypeAlias, cast
 
 import typer
 from jmcore.bitcoin import ParsedTransaction, estimate_vsize
@@ -15,6 +14,7 @@ from jmlightning.config import CLNConfig
 from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
+from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.recovery import RecoveryJournal
@@ -26,12 +26,7 @@ MultiOpenChannelConfirmationCallback = Callable[
 ]
 
 
-class MultiOpenChannelPhase(StrEnum):
-    PRESTART = auto()
-    LOCKED = auto()
-    STARTED = auto()
-    WITHHELD = auto()
-    BROADCAST = auto()
+MultiOpenChannelPhase: TypeAlias = LifecyclePhase
 
 
 class MultiOpenChannelCancelledError(RuntimeError):
@@ -89,10 +84,9 @@ class MultiOpenChannelOperation:
         locked: list[ClassifiedUTXO] = []
         started: list[str] = []
         txid: str | None = None
-        phase = MultiOpenChannelPhase.PRESTART
-        release_locks = True
+        lifecycle = OperationLifecycle()
         operation_error: Exception | None = None
-        cleanup_errors: list[Exception] = []
+        cleanup_errors = lifecycle.cleanup_errors
 
         try:
             # --------------------------------------------------------
@@ -215,7 +209,7 @@ class MultiOpenChannelOperation:
             for coin in selected:
                 jmadapter.lock(coin)
                 locked.append(coin)
-            phase = MultiOpenChannelPhase.LOCKED
+            lifecycle.transition(LifecyclePhase.LOCKED)
 
             # Keep the JoinMarket reservations alive while this operation
             # waits on CLN or operator input.
@@ -236,7 +230,7 @@ class MultiOpenChannelOperation:
                     funding_address = recovery_journal.call(
                         recovery_id,
                         action="fundchannel_start",
-                        phase=MultiOpenChannelPhase.LOCKED.value,
+                        phase=LifecyclePhase.LOCKED.value,
                         fn=lambda: cln.open_channel_start(
                             peer_id=peer_id,
                             amount=amount,
@@ -247,7 +241,7 @@ class MultiOpenChannelOperation:
                     )
                 except Exception as exc:
                     cleanup_errors.extend(self._cancel_started_channels(cln, started))
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise MultiOpenChannelRecoveryRequiredError(
                         "A channel start failed; CLN funding state may be "
                         "ambiguous; JoinMarket UTXOs remain locked for recovery",
@@ -257,8 +251,8 @@ class MultiOpenChannelOperation:
                 started.append(peer_id)
                 funding_addresses.append(funding_address)
 
-            phase = MultiOpenChannelPhase.STARTED
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.STARTED)
+            lifecycle.release_locks = False
 
             # --------------------------------------------------------
             # Prepare the shared funding transaction
@@ -274,9 +268,9 @@ class MultiOpenChannelOperation:
                 )
             except Exception as exc:
                 cleanup_errors.extend(self._cancel_started_channels(cln, started))
-                release_locks = not cleanup_errors
-                if release_locks:
-                    phase = MultiOpenChannelPhase.LOCKED
+                lifecycle.release_locks = not cleanup_errors
+                if lifecycle.release_locks:
+                    lifecycle.transition(LifecyclePhase.LOCKED)
                 raise MultiOpenChannelRecoveryRequiredError(
                     "Unable to prepare the shared funding transaction; "
                     "JoinMarket UTXOs remain locked for recovery"
@@ -293,15 +287,15 @@ class MultiOpenChannelOperation:
             if confirm is not None and not confirm(destinations, plan, tx, txid):
                 cleanup_errors.extend(self._cancel_started_channels(cln, started))
                 if cleanup_errors:
-                    release_locks = False
+                    lifecycle.release_locks = False
                     raise MultiOpenChannelRecoveryRequiredError(
                         "Unable to cancel all CLN channel funding after user decline; "
                         "JoinMarket UTXOs remain locked for recovery",
                         peers=started,
                         txid=txid,
                     )
-                phase = MultiOpenChannelPhase.LOCKED
-                release_locks = True
+                lifecycle.transition(LifecyclePhase.LOCKED)
+                lifecycle.release_locks = True
                 raise MultiOpenChannelCancelledError(
                     "Multi-channel funding cancelled by user",
                 )
@@ -326,7 +320,7 @@ class MultiOpenChannelOperation:
                     recovery_journal.call(
                         recovery_id,
                         action="fundchannel_complete",
-                        phase=MultiOpenChannelPhase.STARTED.value,
+                        phase=LifecyclePhase.STARTED.value,
                         fn=complete_channel,
                         locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
@@ -347,9 +341,9 @@ class MultiOpenChannelOperation:
                             txid=txid,
                         ) from exc
                     cleanup_errors.extend(self._cancel_started_channels(cln, started))
-                    release_locks = not cleanup_errors
-                    if release_locks:
-                        phase = MultiOpenChannelPhase.LOCKED
+                    lifecycle.release_locks = not cleanup_errors
+                    if lifecycle.release_locks:
+                        lifecycle.transition(LifecyclePhase.LOCKED)
                     if cleanup_errors:
                         raise MultiOpenChannelRecoveryRequiredError(
                             "Unable to cancel CLN channel funding after completion "
@@ -359,7 +353,7 @@ class MultiOpenChannelOperation:
                         ) from exc
                     raise
 
-            phase = MultiOpenChannelPhase.WITHHELD
+            lifecycle.transition(LifecyclePhase.WITHHELD)
 
             # --------------------------------------------------------
             # Broadcast the shared funding transaction through CLN
@@ -371,7 +365,7 @@ class MultiOpenChannelOperation:
                 broadcast_result = recovery_journal.call(
                     recovery_id,
                     action="sendpsbt",
-                    phase=MultiOpenChannelPhase.WITHHELD.value,
+                    phase=LifecyclePhase.WITHHELD.value,
                     fn=lambda: cln.send_psbt(signed_psbt),
                     locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
@@ -413,8 +407,8 @@ class MultiOpenChannelOperation:
                         txid=txid,
                     ) from exc
 
-                release_locks = True
-                phase = MultiOpenChannelPhase.LOCKED
+                lifecycle.release_locks = True
+                lifecycle.transition(LifecyclePhase.LOCKED)
                 raise
 
             result_txid = broadcast_result.get("txid")
@@ -426,57 +420,52 @@ class MultiOpenChannelOperation:
                     txid=txid,
                 )
 
-            phase = MultiOpenChannelPhase.BROADCAST
-            release_locks = False
+            lifecycle.transition(LifecyclePhase.BROADCAST)
+            lifecycle.release_locks = False
             logger.info("Funding transaction broadcast through CLN: {}", txid)
         except Exception as exc:
             operation_error = exc
             logger.error("Ah jaysus, failed to fund channels: {}", exc)
             raise
         finally:
-            if release_locks:
-                for coin in locked:
-                    try:
-                        jmadapter.unlock(coin)
-                    except Exception as exc:
-                        cleanup_errors.append(exc)
-                        logger.error(
-                            "Failed to unlock {}:{} after funding phase {}: {}",
-                            coin.utxo.txid,
-                            coin.utxo.vout,
-                            phase,
-                            exc,
-                        )
+            await lifecycle.cleanup(
+                locked=locked,
+                adapter=jmadapter,
+                close_message="Failed to close JoinMarket wallet after funding",
+                unlock_message="Failed to unlock",
+            )
 
-            try:
-                await jmadapter.close()
-            except Exception as exc:
-                cleanup_errors.append(exc)
-                logger.error(
-                    "Failed to close JoinMarket wallet after funding phase {}: {}",
-                    phase,
-                    exc,
-                )
-
-            if not cleanup_errors and (
-                release_locks or phase is MultiOpenChannelPhase.BROADCAST
-            ):
-                recovery_journal.resolve(recovery_id)
-
-            if cleanup_errors and operation_error is None:
-                if phase is not MultiOpenChannelPhase.BROADCAST:
+            if lifecycle.cleanup_errors and operation_error is None:
+                if lifecycle.phase is not LifecyclePhase.BROADCAST:
                     raise MultiOpenChannelRecoveryRequiredError(
                         "Multi-channel funding cleanup failed; "
                         "manual recovery is required",
                         peers=started,
                         txid=txid,
-                    ) from cleanup_errors[0]
+                    ) from lifecycle.cleanup_errors[0]
 
                 logger.warning(
                     "Funding transaction {} was broadcast successfully, "
                     "but JoinMarket cleanup failed",
                     txid,
                 )
+
+            lifecycle.resolve_if_clean(
+                recovery_journal,
+                recovery_id,
+                terminal_phase=LifecyclePhase.BROADCAST,
+            )
+
+            lifecycle.raise_recovery_if_needed(
+                operation_error,
+                MultiOpenChannelRecoveryRequiredError,
+                lambda error: MultiOpenChannelRecoveryRequiredError(
+                    "Multi-channel funding failed and cleanup also failed; "
+                    "manual recovery is required",
+                    peers=started,
+                    txid=txid,
+                ),
+            )
 
     @staticmethod
     def _cancel_started_channels(cln: CLNBackend, peers: list[str]) -> list[Exception]:

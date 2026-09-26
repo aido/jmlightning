@@ -322,6 +322,28 @@ async def test_send_failure_with_withheld_state_cancels_and_unlocks() -> None:
 
 
 @pytest.mark.anyio
+async def test_operation_failure_with_cleanup_failure_requires_recovery() -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
+    cln.send_psbt.side_effect = RuntimeError("send failed")
+    jmadapter.unlock.side_effect = RuntimeError("unlock failed")
+
+    with _patch_multi_open_channel_doubles(jmadapter, cln, tx_builder, plan):
+        operation = MultiOpenChannelOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+
+        with pytest.raises(
+            MultiOpenChannelRecoveryRequiredError,
+            match="failed and cleanup also failed",
+        ):
+            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+
+    jmadapter.unlock.assert_called_once_with(coin)
+    jmadapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_send_failure_with_cancel_failure_requires_recovery() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
     cln.send_psbt.side_effect = RuntimeError("connection lost")

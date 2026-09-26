@@ -974,7 +974,6 @@ Do not place any of the following in the repository:
 Use appropriate secret-management mechanisms for production deployments.
 
 ---
-
 ## 📂 Repository Structure
 
 ```text
@@ -982,6 +981,7 @@ Use appropriate secret-management mechanisms for production deployments.
 ├── pyproject.toml                 # repository/test/tooling configuration
 ├── LICENCE
 ├── README.md
+├── TODO.md
 ├── jmlightning/
 │   ├── pyproject.toml
 │   └── src/
@@ -1006,6 +1006,7 @@ Use appropriate secret-management mechanisms for production deployments.
 │           │
 │           └── operations/
 │               ├── __init__.py
+│               ├── lifecycle.py
 │               ├── open_channel.py
 │               ├── multi_open_channel.py
 │               ├── splice.py
@@ -1035,6 +1036,7 @@ Use appropriate secret-management mechanisms for production deployments.
         ├── test_cln.py
         ├── test_joinmarket_adapter.py
         ├── test_jmpeerswap_plugin.py
+        ├── test_lifecycle.py
         ├── test_open_channel.py
         ├── test_peerswap_operation.py
         ├── test_peerswap_rendezvous.py

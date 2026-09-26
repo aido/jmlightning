@@ -5,9 +5,9 @@ import threading
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
+from typing import TypeAlias
 
 from jmcore.bitcoin import (
     ParsedTransaction,
@@ -25,17 +25,12 @@ from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
+from jmlightning.operations.lifecycle import LifecyclePhase
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.tx_builder import TxBuilder
 
-
-class PeerSwapPhase(StrEnum):
-    """Lifecycle state for a prepared PeerSwap transaction."""
-
-    PREPARED = auto()
-    BROADCAST = auto()
-    DISCARDED = auto()
+PeerSwapPhase: TypeAlias = LifecyclePhase
 
 
 @dataclass(frozen=True, slots=True)
