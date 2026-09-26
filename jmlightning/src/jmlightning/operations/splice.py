@@ -536,7 +536,7 @@ class SpliceOperation:
 
             if confirm is not None and not confirm(
                 channel_id,
-                plan,
+                splice_plan,
                 splice_psbt,
             ):
                 logger.info("Channel splice-in declined by user.")

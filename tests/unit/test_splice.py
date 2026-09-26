@@ -331,7 +331,11 @@ async def test_confirmation_happens_before_splice_signed() -> None:
 
     def confirm(channel_id: str, received_plan: object, psbt: bytes) -> bool:
         assert channel_id == "22" * 32
-        assert received_plan is plan
+        assert isinstance(received_plan, ExecutionPlan)
+        assert received_plan is not plan
+        assert received_plan.fee == 100
+        assert received_plan.change == 99_900
+        assert received_plan.vsize == 25
         assert psbt == b"updated-psbt"
         events.append("confirm")
         return True
@@ -406,11 +410,15 @@ async def test_confirmation_receives_actual_plan_and_psbt() -> None:
         )
         await operation.execute("22" * 32, confirm=confirm)
 
-    assert captured == {
-        "channel_id": "22" * 32,
-        "plan": plan,
-        "psbt": b"updated-psbt",
-    }
+    received_plan = captured["plan"]
+    assert isinstance(received_plan, ExecutionPlan)
+    assert received_plan is not plan
+    assert received_plan.fee == 100
+    assert received_plan.change == 99_900
+    assert received_plan.vsize == 25
+    assert plan.vsize != received_plan.vsize
+    assert captured["channel_id"] == "22" * 32
+    assert captured["psbt"] == b"updated-psbt"
 
 
 @pytest.mark.anyio
