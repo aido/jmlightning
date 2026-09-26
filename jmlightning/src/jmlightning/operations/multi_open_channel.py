@@ -382,10 +382,14 @@ class MultiOpenChannelOperation:
                         for state in states.values()
                     )
                     or cleanup_errors
+                    or any(
+                        state is ChannelFundingStatus.ABSENT
+                        for state in states.values()
+                    )
                 ):
                     raise MultiOpenChannelRecoveryRequiredError(
-                        "Unable to determine CLN broadcast outcome; JoinMarket "
-                        "UTXOs remain locked for recovery",
+                        "Unable to prove that CLN sendpsbt did not broadcast; "
+                        "JoinMarket UTXOs remain locked for recovery",
                         peers=started,
                         txid=txid,
                     ) from exc

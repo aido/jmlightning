@@ -501,7 +501,7 @@ class OpenChannelOperation:
                     psbt=signed_psbt,
                     txid=txid,
                 )
-            except Exception:
+            except Exception as exc:
                 try:
                     status = cln.get_channel_funding_status(
                         peer_id=peer_id,
@@ -557,11 +557,19 @@ class OpenChannelOperation:
                     )
                     return
 
-                # ABSENT means the channel and transaction are both
-                # absent from CLN's authoritative state.
-                lifecycle.transition(LifecyclePhase.LOCKED)
-                lifecycle.release_locks = True
-                raise
+                # After sendpsbt has been invoked, ABSENT is not enough
+                # evidence to release the JoinMarket inputs. The transaction
+                # may have been broadcast even if CLN cannot currently
+                # observe it. Leave the durable recovery record in place so
+                # recovery can also consult the Bitcoin backend before
+                # releasing the inputs.
+                lifecycle.release_locks = False
+                raise OpenChannelRecoveryRequiredError(
+                    "Unable to prove that CLN sendpsbt did not broadcast; "
+                    "JoinMarket UTXOs remain locked for recovery",
+                    peer_id=peer_id,
+                    txid=txid,
+                ) from exc
 
             result_txid = broadcast_result.get("txid")
 

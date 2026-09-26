@@ -198,7 +198,7 @@ async def test_send_failure_with_broadcast_state_keeps_utxos_locked() -> None:
 
         with pytest.raises(
             MultiOpenChannelRecoveryRequiredError,
-            match="Unable to determine CLN broadcast outcome",
+            match="Unable to prove that CLN sendpsbt did not broadcast",
         ):
             await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
 
@@ -299,6 +299,30 @@ async def test_completion_failure_with_status_error_requires_recovery() -> None:
 
     jmadapter.unlock.assert_not_called()
     cln.cancel_channel_funding.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_send_failure_with_absent_state_requires_recovery() -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
+    cln.send_psbt.side_effect = RuntimeError("connection lost")
+    cln.get_channel_funding_status.return_value = ChannelFundingStatus.ABSENT
+
+    with _patch_multi_open_channel_doubles(jmadapter, cln, tx_builder, plan):
+        operation = MultiOpenChannelOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+
+        with pytest.raises(
+            MultiOpenChannelRecoveryRequiredError,
+            match="Unable to prove that CLN sendpsbt did not broadcast",
+        ):
+            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+
+    assert cln.get_channel_funding_status.call_count == 2
+    cln.cancel_channel_funding.assert_not_called()
+    jmadapter.unlock.assert_not_called()
+    jmadapter.close.assert_awaited_once()
 
 
 @pytest.mark.anyio

@@ -128,7 +128,7 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_psbt_failure_with_absent_state_unlocks() -> None:
+async def test_send_psbt_failure_with_absent_state_requires_recovery() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
 
     cln.send_psbt.side_effect = RuntimeError("sendpsbt failed")
@@ -147,7 +147,10 @@ async def test_send_psbt_failure_with_absent_state_unlocks() -> None:
             cln_socket=Path("/tmp/lightning-rpc"),
         )
 
-        with pytest.raises(RuntimeError, match="sendpsbt failed"):
+        with pytest.raises(
+            OpenChannelRecoveryRequiredError,
+            match="Unable to prove that CLN sendpsbt did not broadcast",
+        ):
             await operation.execute("02" + "11" * 32)
 
     cln.get_channel_funding_status.assert_called_once_with(
@@ -155,7 +158,7 @@ async def test_send_psbt_failure_with_absent_state_unlocks() -> None:
         txid="txid",
     )
     cln.cancel_channel_funding.assert_not_called()
-    jmadapter.unlock.assert_called_once_with(coin)
+    jmadapter.unlock.assert_not_called()
     jmadapter.close.assert_awaited_once()
 
 
