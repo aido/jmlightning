@@ -1,4 +1,3 @@
-import secrets
 from collections import Counter
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
@@ -21,16 +20,13 @@ from jmcore.bitcoin import (
 )
 from jmwallet.wallet.psbt import (
     PSBT_GLOBAL_UNSIGNED_TX,
-    PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
     PSBT_IN_NON_WITNESS_UTXO,
     PSBT_IN_PARTIAL_SIG,
-    PSBT_IN_PROPRIETARY,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
-    PSBT_MAGIC,
     ParsedPSBT,
     PSBTError,
     PSBTKeyValue,
@@ -40,26 +36,9 @@ from jmwallet.wallet.psbt import (
 from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import verify_p2wpkh_signature
 
+from jmlightning.lightning import cln as cln_compat
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan
-
-# BIP370 PSBT v2 global fields. jmwallet only supports the
-# BIP174/v0 global fields, so the v2 transaction-structure fields are
-# removed when converting a CLN splice PSBT to v0.
-PSBT_GLOBAL_TX_VERSION = 0x02
-PSBT_GLOBAL_FALLBACK_LOCKTIME = 0x03
-PSBT_GLOBAL_INPUT_COUNT = 0x04
-PSBT_GLOBAL_OUTPUT_COUNT = 0x05
-PSBT_GLOBAL_TX_MODIFIABLE = 0x06
-PSBT_IN_PREVIOUS_TXID = 0x0E
-PSBT_IN_OUTPUT_INDEX = 0x0F
-PSBT_IN_SEQUENCE = 0x10
-PSBT_OUT_AMOUNT = 0x03
-PSBT_OUT_SCRIPT = 0x04
-
-# Core Lightning proprietary PSBT key for interactive transaction serial IDs.
-# Key: proprietary type (0xfc), prefix length (9), "lightning", subtype 1.
-CLN_PSBT_SERIAL_ID_KEY = bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
 
 
 @dataclass(frozen=True)
@@ -75,9 +54,6 @@ class SpliceContribution:
 
 
 class TxBuilder:
-    def __init__(self) -> None:
-        pass
-
     def _txid(self, tx: ParsedTransaction) -> str:
         raw = serialize_transaction(
             tx.version,
@@ -118,236 +94,6 @@ class TxBuilder:
                 f"fee={plan.fee}, "
                 f"change={plan.change}"
             )
-
-    @staticmethod
-    def _normalise_psbt_v2_to_v0(psbt: bytes) -> bytes:
-        """Convert a BIP370 PSBT v2 to the BIP174 v0 form used by jmwallet.
-
-        Core Lightning emits splice PSBTs using PSBT v2. jmwallet's PSBT
-        parser deliberately accepts v0 only, so normalise the transaction
-        structure at the PSBT boundary while retaining every non-structural
-        record verbatim.
-        """
-        magic = PSBT_MAGIC
-        if not psbt.startswith(magic):
-            raise ValueError("invalid PSBT magic")
-
-        def _read_compact_size(data: bytes, offset: int) -> tuple[int, int]:
-            if offset >= len(data):
-                raise ValueError("truncated PSBT compact size")
-            first = data[offset]
-            offset += 1
-            if first < 0xFD:
-                return first, offset
-            size = {0xFD: 2, 0xFE: 4, 0xFF: 8}[first]
-            end = offset + size
-            if end > len(data):
-                raise ValueError("truncated PSBT compact size")
-            value = int.from_bytes(data[offset:end], "little")
-            minimum = {0xFD: 0xFD, 0xFE: 0x10000, 0xFF: 0x100000000}[first]
-            if value < minimum:
-                raise ValueError("noncanonical PSBT compact size")
-            return value, end
-
-        def _read_map(
-            data: bytes, offset: int
-        ) -> tuple[list[tuple[bytes, bytes]], int]:
-            records: list[tuple[bytes, bytes]] = []
-            while True:
-                key_len, offset = _read_compact_size(data, offset)
-                if key_len == 0:
-                    return records, offset
-                key_end = offset + key_len
-                if key_end > len(data):
-                    raise ValueError("truncated PSBT key")
-                key = data[offset:key_end]
-                offset = key_end
-                value_len, offset = _read_compact_size(data, offset)
-                value_end = offset + value_len
-                if value_end > len(data):
-                    raise ValueError("truncated PSBT value")
-                records.append((key, data[offset:value_end]))
-                offset = value_end
-
-        def _write_map(records: list[tuple[bytes, bytes]]) -> bytes:
-            result = bytearray()
-            for key, value in records:
-                result.extend(encode_varint(len(key)))
-                result.extend(key)
-                result.extend(encode_varint(len(value)))
-                result.extend(value)
-            result.append(0)
-            return bytes(result)
-
-        offset = len(magic)
-        global_records, offset = _read_map(psbt, offset)
-
-        version_records = [
-            value
-            for key, value in global_records
-            if key == bytes([PSBT_GLOBAL_VERSION])
-        ]
-        if not version_records:
-            return psbt
-        if len(version_records) != 1 or len(version_records[0]) != 4:
-            raise ValueError("invalid PSBT version record")
-
-        version = int.from_bytes(version_records[0], "little")
-        if version == 0:
-            return psbt
-        if version != 2:
-            raise ValueError(f"unsupported PSBT version: {version}")
-
-        input_count_records = [
-            value
-            for key, value in global_records
-            if key == bytes([PSBT_GLOBAL_INPUT_COUNT])
-        ]
-        output_count_records = [
-            value
-            for key, value in global_records
-            if key == bytes([PSBT_GLOBAL_OUTPUT_COUNT])
-        ]
-        tx_version_records = [
-            value
-            for key, value in global_records
-            if key == bytes([PSBT_GLOBAL_TX_VERSION])
-        ]
-        locktime_records = [
-            value
-            for key, value in global_records
-            if key == bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME])
-        ]
-
-        if len(input_count_records) != 1 or len(output_count_records) != 1:
-            raise ValueError("PSBT v2 is missing input/output counts")
-        if len(tx_version_records) != 1 or len(tx_version_records[0]) != 4:
-            raise ValueError("PSBT v2 has an invalid transaction version")
-        if len(locktime_records) > 1 or (
-            locktime_records and len(locktime_records[0]) != 4
-        ):
-            raise ValueError("PSBT v2 has an invalid fallback locktime")
-
-        def _decode_count(value: bytes, context: str) -> int:
-            if not value:
-                raise ValueError(f"PSBT v2 {context} count is empty")
-            count, end = _read_compact_size(value, 0)
-            if end != len(value):
-                raise ValueError(f"PSBT v2 {context} count has trailing data")
-            return count
-
-        input_count = _decode_count(input_count_records[0], "input")
-        output_count = _decode_count(output_count_records[0], "output")
-
-        input_maps: list[list[tuple[bytes, bytes]]] = []
-        for _ in range(input_count):
-            records, offset = _read_map(psbt, offset)
-            input_maps.append(records)
-
-        output_maps: list[list[tuple[bytes, bytes]]] = []
-        for _ in range(output_count):
-            records, offset = _read_map(psbt, offset)
-            output_maps.append(records)
-
-        if offset != len(psbt):
-            raise ValueError("trailing data after PSBT maps")
-
-        def _singleton(
-            records: list[tuple[bytes, bytes]], key_type: bytes, context: str
-        ) -> bytes:
-            values = [value for key, value in records if key == key_type]
-            if len(values) != 1:
-                raise ValueError(f"PSBT v2 {context} record must occur exactly once")
-            return values[0]
-
-        tx = bytearray()
-        tx.extend(tx_version_records[0])
-        tx.extend(encode_varint(input_count))
-        for index, records in enumerate(input_maps):
-            txid = _singleton(
-                records, bytes([PSBT_IN_PREVIOUS_TXID]), f"input {index} previous txid"
-            )
-            vout = _singleton(
-                records, bytes([PSBT_IN_OUTPUT_INDEX]), f"input {index} output index"
-            )
-            sequence_values = [
-                value for key, value in records if key == bytes([PSBT_IN_SEQUENCE])
-            ]
-            if len(txid) != 32 or len(vout) != 4:
-                raise ValueError(f"PSBT v2 input {index} has invalid outpoint")
-            if len(sequence_values) > 1 or (
-                sequence_values and len(sequence_values[0]) != 4
-            ):
-                raise ValueError(f"PSBT v2 input {index} has invalid sequence")
-            tx.extend(txid)
-            tx.extend(vout)
-            tx.append(0)
-            tx.extend(sequence_values[0] if sequence_values else b"\xff\xff\xff\xff")
-
-        tx.extend(encode_varint(output_count))
-        for index, records in enumerate(output_maps):
-            amount = _singleton(
-                records, bytes([PSBT_OUT_AMOUNT]), f"output {index} amount"
-            )
-            script = _singleton(
-                records, bytes([PSBT_OUT_SCRIPT]), f"output {index} script"
-            )
-            if len(amount) != 8:
-                raise ValueError(f"PSBT v2 output {index} has invalid amount")
-            tx.extend(amount)
-            tx.extend(encode_varint(len(script)))
-            tx.extend(script)
-
-        tx.extend(locktime_records[0] if locktime_records else b"\x00\x00\x00\x00")
-
-        # Keep all metadata and remove only v2 structural globals. The v0
-        # unsigned transaction replaces the v2 transaction fields.
-        v2_globals_to_remove = {
-            bytes([PSBT_GLOBAL_UNSIGNED_TX]),
-            bytes([PSBT_GLOBAL_TX_VERSION]),
-            bytes([PSBT_GLOBAL_FALLBACK_LOCKTIME]),
-            bytes([PSBT_GLOBAL_INPUT_COUNT]),
-            bytes([PSBT_GLOBAL_OUTPUT_COUNT]),
-            bytes([PSBT_GLOBAL_TX_MODIFIABLE]),
-            bytes([PSBT_GLOBAL_VERSION]),
-        }
-        v0_globals = [
-            (key, value)
-            for key, value in global_records
-            if key not in v2_globals_to_remove
-        ]
-        v0_globals.insert(0, (bytes([PSBT_GLOBAL_UNSIGNED_TX]), bytes(tx)))
-
-        result = bytearray(magic)
-        result.extend(_write_map(v0_globals))
-        for records in input_maps:
-            result.extend(
-                _write_map(
-                    [
-                        (key, value)
-                        for key, value in records
-                        if key
-                        not in {
-                            bytes([PSBT_IN_PREVIOUS_TXID]),
-                            bytes([PSBT_IN_OUTPUT_INDEX]),
-                            bytes([PSBT_IN_SEQUENCE]),
-                        }
-                    ]
-                )
-            )
-        for records in output_maps:
-            result.extend(
-                _write_map(
-                    [
-                        (key, value)
-                        for key, value in records
-                        if key
-                        not in {bytes([PSBT_OUT_AMOUNT]), bytes([PSBT_OUT_SCRIPT])}
-                    ]
-                )
-            )
-
-        return bytes(result)
 
     def build_and_sign_funding_tx(
         self,
@@ -552,142 +298,18 @@ class TxBuilder:
             finalise_transaction=finalise_psbt,
         )
 
-    @staticmethod
-    def _new_cln_serial_id(existing: set[int]) -> int:
-        """Generate a fresh initiator-role serial ID for a splice PSBT."""
-        while True:
-            # CLN encodes the transaction role in the low bit. jm-lightning
-            # is the splice initiator when it adds its own input/output, so
-            # these serial IDs must have even parity.
-            serial_id = secrets.randbits(63) << 1
-            if serial_id != 0 and serial_id not in existing:
-                return serial_id
-
-    @staticmethod
-    def _cln_input_weight(parsed_psbt: ParsedPSBT, index: int) -> int:
-        """Calculate CLN's splice weight for one input.
-
-        This mirrors ``psbt_input_get_weight(..., PSBT_GUESS_2OF2)`` in
-        Core Lightning for standard SegWit inputs.
-        """
-        input_map = parsed_psbt.input_maps[index]
-        witness_records = [
-            record
-            for record in input_map.records
-            if record.key[:1] == bytes([PSBT_IN_WITNESS_UTXO])
-        ]
-
-        script: bytes | None = None
-        if len(witness_records) == 1:
-            value = witness_records[0].value
-            if len(value) < 9:
-                raise ValueError("Invalid witness UTXO record")
-            script_len, offset = decode_varint(value, 8)
-            if offset + script_len != len(value):
-                raise ValueError("Invalid witness UTXO record")
-            script = value[offset:]
-
-        if script is None:
-            non_witness_records = [
-                record
-                for record in input_map.records
-                if record.key[:1] == bytes([PSBT_IN_NON_WITNESS_UTXO])
-            ]
-            if len(non_witness_records) == 1:
-                previous_transaction = parse_transaction_bytes(
-                    non_witness_records[0].value,
-                )
-                vout = parsed_psbt.transaction.inputs[index].vout
-                if vout >= len(previous_transaction.outputs):
-                    raise ValueError("Invalid non-witness UTXO record")
-                script = previous_transaction.outputs[vout].script
-
-        if script is None:
-            raise ValueError("Splice input is missing UTXO data")
-
-        # These values mirror CLN's bitcoin_tx_input_weight() and
-        # bitcoin_tx_input_witness_weight()/bitcoin_tx_2of2_input_witness_weight().
-        if script.startswith(b"\x00\x14"):
-            return 271  # P2WPKH
-        if script.startswith(b"\x00\x20"):
-            return 387  # P2WSH, guessed as the channel's 2-of-2 input
-        if script.startswith(b"\x51\x20"):
-            return 230  # P2TR
-
-        raise ValueError("Unsupported splice input script type")
-
-    @staticmethod
-    def _cln_output_weight(script: bytes) -> int:
-        """Calculate CLN's weight for one standard transaction output."""
-        return (8 + len(encode_varint(len(script))) + len(script)) * 4
-
-    @staticmethod
-    def _cln_core_weight(num_inputs: int, num_outputs: int) -> int:
-        """Calculate CLN's common transaction-field weight."""
-        return (
-            4 + len(encode_varint(num_inputs)) + len(encode_varint(num_outputs)) + 4
-        ) * 4 + 2
-
     def estimate_splice_fee(
         self,
         psbt: bytes,
         feerate_per_kw: int,
         add_change_output: bool = True,
     ) -> tuple[int, int]:
-        """Estimate the initiator fee using CLN's splice weight calculation.
-
-        ``feerate_per_kw`` uses CLN's native satoshis per 1000 weight
-        units. The returned tuple is ``(fee, weight)``.
-        """
-        if feerate_per_kw <= 0:
-            raise ValueError("Fee rate must be positive")
-
-        try:
-            parsed_psbt = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
-        except PSBTError as exc:
-            raise ValueError("Invalid splice PSBT") from exc
-
-        input_weight = sum(
-            self._cln_input_weight(parsed_psbt, index)
-            for index in range(len(parsed_psbt.input_maps))
+        """Estimate the initiator fee using CLN compatibility rules."""
+        return cln_compat.estimate_splice_fee(
+            psbt=psbt,
+            feerate_per_kw=feerate_per_kw,
+            add_change_output=add_change_output,
         )
-        output_weight = sum(
-            self._cln_output_weight(output.script)
-            for output in parsed_psbt.transaction.outputs
-        )
-
-        # jm-lightning adds one P2WPKH JoinMarket input and, unless the
-        # splice is a sweep, one P2WPKH change output.
-        input_weight += 271
-        output_count = len(parsed_psbt.transaction.outputs)
-        if add_change_output:
-            output_weight += 124
-            output_count += 1
-
-        weight = (
-            input_weight
-            + output_weight
-            + self._cln_core_weight(
-                len(parsed_psbt.transaction.inputs) + 1,
-                output_count,
-            )
-        )
-
-        fee = (feerate_per_kw * weight) // 1000
-        return fee, weight
-
-    @staticmethod
-    def _cln_serial_ids(parsed_psbt: ParsedPSBT) -> set[int]:
-        """Return all existing Core Lightning serial IDs in a PSBT."""
-        serial_ids: set[int] = set()
-        for psbt_map in [*parsed_psbt.input_maps, *parsed_psbt.output_maps]:
-            for record in psbt_map.records:
-                if record.key != CLN_PSBT_SERIAL_ID_KEY:
-                    continue
-                if len(record.value) != 8:
-                    raise ValueError("Invalid Core Lightning serial ID")
-                serial_ids.add(int.from_bytes(record.value, "big"))
-        return serial_ids
 
     def add_splice_in_input(
         self,
@@ -723,7 +345,7 @@ class TxBuilder:
             raise ValueError("Splice-in plan does not match the selected input")
 
         try:
-            psbt = self._normalise_psbt_v2_to_v0(psbt)
+            psbt = cln_compat.normalise_psbt_v2_to_v0(psbt)
             parsed = parse_psbt(psbt)
             previous_transaction = parse_transaction_bytes(prev_tx)
         except (PSBTError, ValueError) as exc:
@@ -839,11 +461,11 @@ class TxBuilder:
         if change_output is not None:
             parsed.transaction.outputs.append(change_output)
 
-        serial_ids = self._cln_serial_ids(parsed)
-        jm_input_serial_id = self._new_cln_serial_id(serial_ids)
+        serial_ids = cln_compat.serial_ids(parsed)
+        jm_input_serial_id = cln_compat.new_serial_id(serial_ids)
         serial_ids.add(jm_input_serial_id)
         change_serial_id = (
-            self._new_cln_serial_id(serial_ids) if change_output is not None else None
+            cln_compat.new_serial_id(serial_ids) if change_output is not None else None
         )
 
         witness_utxo = (
@@ -873,7 +495,7 @@ class TxBuilder:
             ),
         )
         new_input_map.append(
-            CLN_PSBT_SERIAL_ID_KEY,
+            cln_compat.CLN_PSBT_SERIAL_ID_KEY,
             jm_input_serial_id.to_bytes(8, "big"),
         )
         parsed.input_maps.append(new_input_map)
@@ -881,7 +503,7 @@ class TxBuilder:
             assert change_serial_id is not None
             change_map = PSBTMap()
             change_map.append(
-                CLN_PSBT_SERIAL_ID_KEY,
+                cln_compat.CLN_PSBT_SERIAL_ID_KEY,
                 change_serial_id.to_bytes(8, "big"),
             )
             parsed.output_maps.append(change_map)
@@ -948,7 +570,7 @@ class TxBuilder:
     ) -> None:
         """Validate immutable splice economics before JoinMarket signing."""
         try:
-            parsed = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
+            parsed = parse_psbt(cln_compat.normalise_psbt_v2_to_v0(psbt))
         except (PSBTError, ValueError) as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
 
@@ -1106,7 +728,7 @@ class TxBuilder:
     ) -> int:
         """Find the approved JoinMarket input in a negotiated splice PSBT."""
         try:
-            parsed_psbt = parse_psbt(self._normalise_psbt_v2_to_v0(psbt))
+            parsed_psbt = parse_psbt(cln_compat.normalise_psbt_v2_to_v0(psbt))
         except PSBTError as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
 
@@ -1144,7 +766,7 @@ class TxBuilder:
         metadata and signatures on non-JM inputs are preserved.
         """
         try:
-            psbt = self._normalise_psbt_v2_to_v0(psbt)
+            psbt = cln_compat.normalise_psbt_v2_to_v0(psbt)
             parsed_psbt = parse_psbt(psbt)
         except PSBTError as exc:
             raise RuntimeError("Invalid splice PSBT") from exc

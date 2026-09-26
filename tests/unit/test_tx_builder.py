@@ -35,9 +35,7 @@ from jmwallet.wallet.psbt import (
 )
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
-from jmlightning.models import ClassifiedUTXO
-from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
-from jmlightning.tx_builder import (
+from jmlightning.lightning.cln import (
     CLN_PSBT_SERIAL_ID_KEY,
     PSBT_GLOBAL_FALLBACK_LOCKTIME,
     PSBT_GLOBAL_INPUT_COUNT,
@@ -49,9 +47,13 @@ from jmlightning.tx_builder import (
     PSBT_IN_SEQUENCE,
     PSBT_OUT_AMOUNT,
     PSBT_OUT_SCRIPT,
-    SpliceContribution,
-    TxBuilder,
+    _input_weight,
+    new_serial_id,
+    normalise_psbt_v2_to_v0,
 )
+from jmlightning.models import ClassifiedUTXO
+from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
+from jmlightning.tx_builder import SpliceContribution, TxBuilder
 
 
 def _mock_wallet() -> Mock:
@@ -259,7 +261,6 @@ def _sync_unsigned_tx(parsed: ParsedPSBT) -> None:
 
 
 def test_cln_input_weight_rejects_unsupported_script() -> None:
-    builder = TxBuilder()
     tx_input = TxInput.from_hex(
         txid="11" * 32,
         vout=0,
@@ -284,7 +285,7 @@ def test_cln_input_weight_rejects_unsupported_script() -> None:
     parsed = parse_psbt(psbt)
 
     with pytest.raises(ValueError, match="Unsupported splice input script type"):
-        builder._cln_input_weight(parsed, 0)
+        _input_weight(parsed, 0)
 
 
 def test_cln_input_weight_uses_non_witness_utxo() -> None:
@@ -344,7 +345,7 @@ def test_cln_input_weight_uses_non_witness_utxo() -> None:
         ),
     )
 
-    assert builder._cln_input_weight(parsed, 0) == 271
+    assert _input_weight(parsed, 0) == 271
 
 
 def test_cln_input_weight_rejects_non_witness_utxo_with_missing_output() -> None:
@@ -395,13 +396,11 @@ def test_cln_input_weight_rejects_non_witness_utxo_with_missing_output() -> None
     )
 
     with pytest.raises(ValueError, match="Invalid non-witness UTXO record"):
-        builder._cln_input_weight(parsed, 0)
+        _input_weight(parsed, 0)
 
 
 def test_normalise_cln_psbt_v2_to_v0_preserves_metadata() -> None:
-    builder = TxBuilder()
-
-    normalised = builder._normalise_psbt_v2_to_v0(_build_cln_splice_psbt_v2())
+    normalised = normalise_psbt_v2_to_v0(_build_cln_splice_psbt_v2())
     parsed = parse_psbt(normalised)
 
     assert parsed.transaction.version == 2
@@ -442,7 +441,7 @@ def test_normalise_cln_psbt_v2_to_v0_preserves_metadata() -> None:
 def test_normalise_psbt_v0_is_unchanged() -> None:
     psbt = _build_splice_psbt()
 
-    assert TxBuilder._normalise_psbt_v2_to_v0(psbt) == psbt
+    assert normalise_psbt_v2_to_v0(psbt) == psbt
 
 
 def test_estimate_splice_fee_matches_cln_weight_for_channel_psbt() -> None:
@@ -2040,9 +2039,7 @@ def test_validate_plan_rejects_inconsistent_amounts(
 
 
 def test_new_cln_serial_id_is_even_and_unique() -> None:
-    builder = TxBuilder()
-
-    serial_id = builder._new_cln_serial_id({2, 4, 6})
+    serial_id = new_serial_id({2, 4, 6})
 
     assert serial_id % 2 == 0
     assert serial_id not in {2, 4, 6}

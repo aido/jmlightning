@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 from collections.abc import Callable
+from dataclasses import replace
 from math import ceil
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -385,9 +386,12 @@ class SpliceOperation:
                     ),
                 )
 
-            plan.fee = splice_fee
-            plan.change = splice_change
-            plan.vsize = (splice_weight + 3) // 4
+            splice_plan = replace(
+                plan,
+                fee=splice_fee,
+                change=splice_change,
+                vsize=(splice_weight + 3) // 4,
+            )
 
             logger.info(
                 "CLN splice weight: {} wu, required fee: {} sats",
@@ -410,7 +414,7 @@ class SpliceOperation:
             splice_psbt, splice_contribution = tx_builder.add_splice_in_input(
                 psbt=initial_psbt,
                 coin=selected[0],
-                plan=plan,
+                plan=splice_plan,
                 change_address=change_address,
                 wallet=jmadapter.require_wallet(),
                 prev_tx=previous_tx,
