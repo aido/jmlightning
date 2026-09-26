@@ -76,6 +76,12 @@ class SpliceOperation:
         channel_id: str,
         confirm: SpliceConfirmationCallback | None = None,
     ) -> str:
+        if self.config.amount <= 0:
+            raise ValueError(
+                "Splice-in amount must be greater than zero; "
+                "splice sweep is not supported"
+            )
+
         policy = PolicyEngine()
         planner = Planner()
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))

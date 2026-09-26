@@ -123,6 +123,26 @@ def _patch_splice_doubles(
 
 
 @pytest.mark.anyio
+async def test_zero_amount_is_rejected_before_starting_splice() -> None:
+    config, _coin, jmadapter, _cln, _plan, _tx_builder = _build_splice_test_doubles()
+    config.amount = 0
+
+    operation = SpliceOperation(
+        config=config,
+        cln_socket=Path("/tmp/lightning-rpc"),
+    )
+
+    with pytest.raises(
+        ValueError,
+        match="Splice-in amount must be greater than zero; "
+        "splice sweep is not supported",
+    ):
+        await operation.execute("22" * 32)
+
+    jmadapter.connect.assert_not_awaited()
+
+
+@pytest.mark.anyio
 async def test_selection_requires_exactly_one_utxo() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
     second_coin = replace(

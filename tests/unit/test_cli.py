@@ -384,6 +384,24 @@ def test_open_channel_passes_confirmation_callback_by_default(
     assert confirms == [confirm_open_channel]
 
 
+def test_splice_in_rejects_zero_amount_before_setup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        cli,
+        "setup_cli",
+        lambda **kwargs: pytest.fail("setup_cli must not run for zero splice amount"),
+    )
+
+    with pytest.raises(
+        typer.BadParameter, match="splice-in amount must be greater than zero"
+    ):
+        cli.splice_in(
+            channel_id="22" * 32,
+            amount=0,
+        )
+
+
 def test_splice_in_runs_operation_without_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

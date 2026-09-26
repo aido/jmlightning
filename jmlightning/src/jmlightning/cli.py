@@ -367,6 +367,12 @@ def splice_in(
 ) -> None:
     """Splice a JoinMarket UTXO into an existing CLN channel."""
 
+    if amount <= 0:
+        raise typer.BadParameter(
+            "splice-in amount must be greater than zero; splice sweep is not supported",
+            param_hint="--amount",
+        )
+
     settings = setup_cli(
         data_dir=data_dir,
         config_file=config_file,
