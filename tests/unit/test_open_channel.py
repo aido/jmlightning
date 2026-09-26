@@ -1,3 +1,4 @@
+import tempfile
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
@@ -21,6 +22,7 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
     peer_id = "02" + "11" * 32
 
     config = Mock()
+    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False
@@ -161,6 +163,7 @@ def _build_open_channel_test_doubles() -> tuple[
     Mock, ClassifiedUTXO, Mock, Mock, Mock, Mock
 ]:
     config = Mock()
+    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False

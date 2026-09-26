@@ -4,6 +4,7 @@ from collections.abc import Callable
 from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
+from typing import cast
 
 import typer
 from jmcore.bitcoin import ParsedTransaction, estimate_vsize
@@ -16,6 +17,7 @@ from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
+from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
 OpenChannelConfirmationCallback = Callable[
@@ -77,7 +79,16 @@ class OpenChannelOperation:
     ) -> None:
         policy = PolicyEngine()
         planner = Planner()
-        jmadapter = JoinMarketAdapter(config=self.config)
+        recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
+        recovery_id = recovery_journal.create(
+            "open_channel",
+            {"peer_id": peer_id},
+        )
+        jmadapter = JoinMarketAdapter(
+            config=self.config,
+            recovery_journal=recovery_journal,
+            recovery_id=recovery_id,
+        )
         cln = CLNBackend(str(self.cln_socket))
         tx_builder = TxBuilder()
 
@@ -294,10 +305,17 @@ class OpenChannelOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                funding_address = cln.open_channel_start(
-                    peer_id=peer_id,
-                    amount=plan.amount,
-                    announce=self.config.announce,
+                funding_address = recovery_journal.call(
+                    recovery_id,
+                    action="fundchannel_start",
+                    phase=FundingPhase.LOCKED.value,
+                    fn=lambda: cln.open_channel_start(
+                        peer_id=peer_id,
+                        amount=plan.amount,
+                        announce=self.config.announce,
+                    ),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
                 )
             except Exception as exc:
                 # We cannot know whether CLN accepted the RPC request.
@@ -339,7 +357,15 @@ class OpenChannelOperation:
                 # funding operation. Never unlock JoinMarket inputs while
                 # that operation may still exist.
                 try:
-                    cln.cancel_channel_funding(peer_id)
+                    recovery_journal.call(
+                        recovery_id,
+                        action="fundchannel_cancel",
+                        phase=phase.value,
+                        fn=lambda: cln.cancel_channel_funding(peer_id),
+                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        owner_tokens=jmadapter._owner_tokens(),
+                        txid=txid,
+                    )
                 except Exception as cancel_exc:
                     release_locks = False
                     raise OpenChannelRecoveryRequiredError(
@@ -364,7 +390,15 @@ class OpenChannelOperation:
                 logger.info("Channel funding declined by user.")
 
                 try:
-                    cln.cancel_channel_funding(peer_id)
+                    recovery_journal.call(
+                        recovery_id,
+                        action="fundchannel_cancel",
+                        phase=phase.value,
+                        fn=lambda: cln.cancel_channel_funding(peer_id),
+                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        owner_tokens=jmadapter._owner_tokens(),
+                        txid=txid,
+                    )
                 except Exception as cancel_exc:
                     release_locks = False
                     raise OpenChannelRecoveryRequiredError(
@@ -389,9 +423,18 @@ class OpenChannelOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                cln.open_channel_complete(
-                    peer_id=peer_id,
+                recovery_journal.call(
+                    recovery_id,
+                    action="fundchannel_complete",
+                    phase=FundingPhase.STARTED.value,
+                    fn=lambda: cln.open_channel_complete(
+                        peer_id=peer_id,
+                        psbt=signed_psbt,
+                    ),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
                     psbt=signed_psbt,
+                    txid=txid,
                 )
             except Exception as exc:
                 try:
@@ -411,7 +454,17 @@ class OpenChannelOperation:
                 if status is ChannelFundingStatus.WITHHELD:
                     release_locks = False
                     try:
-                        cln.cancel_channel_funding(peer_id)
+                        recovery_journal.call(
+                            recovery_id,
+                            action="fundchannel_cancel",
+                            phase=phase.value,
+                            fn=lambda: cln.cancel_channel_funding(peer_id),
+                            locked_outpoints=[
+                                (c.utxo.txid, c.utxo.vout) for c in locked
+                            ],
+                            owner_tokens=jmadapter._owner_tokens(),
+                            txid=txid,
+                        )
                     except Exception as cancel_exc:
                         raise OpenChannelRecoveryRequiredError(
                             "Unable to cancel withheld CLN channel funding; "
@@ -445,7 +498,16 @@ class OpenChannelOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                broadcast_result = cln.send_psbt(signed_psbt)
+                broadcast_result = recovery_journal.call(
+                    recovery_id,
+                    action="sendpsbt",
+                    phase=FundingPhase.WITHHELD.value,
+                    fn=lambda: cln.send_psbt(signed_psbt),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
+                    psbt=signed_psbt,
+                    txid=txid,
+                )
             except Exception:
                 try:
                     status = cln.get_channel_funding_status(
@@ -464,7 +526,17 @@ class OpenChannelOperation:
                 if status is ChannelFundingStatus.WITHHELD:
                     release_locks = False
                     try:
-                        cln.cancel_channel_funding(peer_id)
+                        recovery_journal.call(
+                            recovery_id,
+                            action="fundchannel_cancel",
+                            phase=phase.value,
+                            fn=lambda: cln.cancel_channel_funding(peer_id),
+                            locked_outpoints=[
+                                (c.utxo.txid, c.utxo.vout) for c in locked
+                            ],
+                            owner_tokens=jmadapter._owner_tokens(),
+                            txid=txid,
+                        )
                     except Exception as cancel_exc:
                         raise OpenChannelRecoveryRequiredError(
                             "Unable to cancel withheld CLN channel funding; "
@@ -564,6 +636,11 @@ class OpenChannelOperation:
                     "but JoinMarket cleanup failed",
                     txid,
                 )
+
+            if not cleanup_errors and (
+                release_locks or phase is FundingPhase.BROADCAST
+            ):
+                recovery_journal.resolve(recovery_id)
 
             if cleanup_errors and operation_error is not None:
                 logger.error(

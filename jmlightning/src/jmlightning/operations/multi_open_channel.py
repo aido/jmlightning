@@ -4,6 +4,7 @@ from collections.abc import Callable
 from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
+from typing import cast
 
 import typer
 from jmcore.bitcoin import ParsedTransaction, estimate_vsize
@@ -16,6 +17,7 @@ from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
+from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
 MultiOpenChannelConfirmationCallback = Callable[
@@ -70,7 +72,16 @@ class MultiOpenChannelOperation:
 
         policy = PolicyEngine()
         planner = Planner()
-        jmadapter = JoinMarketAdapter(config=self.config)
+        recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
+        recovery_id = recovery_journal.create(
+            "multi_open_channel",
+            {"peers": peer_ids},
+        )
+        jmadapter = JoinMarketAdapter(
+            config=self.config,
+            recovery_journal=recovery_journal,
+            recovery_id=recovery_id,
+        )
         cln = CLNBackend(str(self.cln_socket))
         tx_builder = TxBuilder()
 
@@ -222,10 +233,17 @@ class MultiOpenChannelOperation:
             funding_addresses: list[str] = []
             for peer_id, amount in destinations:
                 try:
-                    funding_address = cln.open_channel_start(
-                        peer_id=peer_id,
-                        amount=amount,
-                        announce=self.config.announce,
+                    funding_address = recovery_journal.call(
+                        recovery_id,
+                        action="fundchannel_start",
+                        phase=MultiOpenChannelPhase.LOCKED.value,
+                        fn=lambda: cln.open_channel_start(
+                            peer_id=peer_id,
+                            amount=amount,
+                            announce=self.config.announce,
+                        ),
+                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        owner_tokens=jmadapter._owner_tokens(),
                     )
                 except Exception as exc:
                     cleanup_errors.extend(self._cancel_started_channels(cln, started))
@@ -298,7 +316,23 @@ class MultiOpenChannelOperation:
             # records each channel as withheld until the shared PSBT is sent.
             for peer_id in started:
                 try:
-                    cln.open_channel_complete(peer_id=peer_id, psbt=signed_psbt)
+
+                    def complete_channel(peer_id: str = peer_id) -> dict[str, object]:
+                        return cln.open_channel_complete(
+                            peer_id=peer_id,
+                            psbt=signed_psbt,
+                        )
+
+                    recovery_journal.call(
+                        recovery_id,
+                        action="fundchannel_complete",
+                        phase=MultiOpenChannelPhase.STARTED.value,
+                        fn=complete_channel,
+                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        owner_tokens=jmadapter._owner_tokens(),
+                        psbt=signed_psbt,
+                        txid=txid,
+                    )
                 except Exception as exc:
                     states, status_errors = self._get_funding_states(cln, started, txid)
                     cleanup_errors.extend(status_errors)
@@ -334,7 +368,16 @@ class MultiOpenChannelOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                broadcast_result = cln.send_psbt(signed_psbt)
+                broadcast_result = recovery_journal.call(
+                    recovery_id,
+                    action="sendpsbt",
+                    phase=MultiOpenChannelPhase.WITHHELD.value,
+                    fn=lambda: cln.send_psbt(signed_psbt),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
+                    psbt=signed_psbt,
+                    txid=txid,
+                )
             except Exception as exc:
                 states, status_errors = self._get_funding_states(cln, started, txid)
                 cleanup_errors.extend(status_errors)
@@ -414,6 +457,11 @@ class MultiOpenChannelOperation:
                     phase,
                     exc,
                 )
+
+            if not cleanup_errors and (
+                release_locks or phase is MultiOpenChannelPhase.BROADCAST
+            ):
+                recovery_journal.resolve(recovery_id)
 
             if cleanup_errors and operation_error is None:
                 if phase is not MultiOpenChannelPhase.BROADCAST:

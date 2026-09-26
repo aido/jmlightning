@@ -6,6 +6,7 @@ from collections.abc import Callable
 from enum import StrEnum, auto
 from math import ceil
 from pathlib import Path
+from typing import cast
 
 import typer
 from jmcore.bitcoin import estimate_vsize
@@ -17,6 +18,7 @@ from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
+from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
 SpliceConfirmationCallback = Callable[
@@ -76,7 +78,16 @@ class SpliceOperation:
     ) -> str:
         policy = PolicyEngine()
         planner = Planner()
-        jmadapter = JoinMarketAdapter(config=self.config)
+        recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
+        recovery_id = recovery_journal.create(
+            "splice",
+            {"channel_id": channel_id},
+        )
+        jmadapter = JoinMarketAdapter(
+            config=self.config,
+            recovery_journal=recovery_journal,
+            recovery_id=recovery_id,
+        )
         cln = CLNBackend(str(self.cln_socket))
         tx_builder = TxBuilder()
 
@@ -281,10 +292,17 @@ class SpliceOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                result = cln.splice_init(
-                    channel_id=channel_id,
-                    amount=plan.amount,
-                    feerate_per_kw=splice_feerate_per_kw,
+                result = recovery_journal.call(
+                    recovery_id,
+                    action="splice_init",
+                    phase=SplicePhase.LOCKED.value,
+                    fn=lambda: cln.splice_init(
+                        channel_id=channel_id,
+                        amount=plan.amount,
+                        feerate_per_kw=splice_feerate_per_kw,
+                    ),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
                 )
             except Exception as exc:
                 # splice_init has no transaction id with which to identify
@@ -412,8 +430,16 @@ class SpliceOperation:
             while not commitments_secured:
                 jmadapter.renew_locks(locked)
                 try:
-                    update_result = cln.splice_update(
-                        channel_id=channel_id,
+                    update_result = recovery_journal.call(
+                        recovery_id,
+                        action="splice_update",
+                        phase=phase.value,
+                        fn=lambda: cln.splice_update(
+                            channel_id=channel_id,
+                            psbt=splice_psbt,
+                        ),
+                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        owner_tokens=jmadapter._owner_tokens(),
                         psbt=splice_psbt,
                     )
                 except Exception as exc:
@@ -542,6 +568,12 @@ class SpliceOperation:
                     signing_inputs=signing_inputs,
                     wallet=jmadapter.require_wallet(),
                 )
+                txid = _signed_txid
+                recovery_journal.update(
+                    recovery_id,
+                    txid=txid,
+                    psbt=base64.b64encode(splice_psbt).decode("ascii"),
+                )
                 tx_builder.validate_splice_psbt(
                     psbt=splice_psbt,
                     contribution=splice_contribution,
@@ -564,8 +596,16 @@ class SpliceOperation:
             jmadapter.renew_locks(locked)
 
             try:
-                signed_result = cln.splice_signed(
-                    channel_id=channel_id,
+                signed_result = recovery_journal.call(
+                    recovery_id,
+                    action="splice_signed",
+                    phase=SplicePhase.UPDATED.value,
+                    fn=lambda: cln.splice_signed(
+                        channel_id=channel_id,
+                        psbt=splice_psbt,
+                    ),
+                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    owner_tokens=jmadapter._owner_tokens(),
                     psbt=splice_psbt,
                 )
             except Exception as exc:
@@ -703,6 +743,9 @@ class SpliceOperation:
                     phase,
                     exc,
                 )
+
+            if not cleanup_errors and (release_locks or phase is SplicePhase.SIGNED):
+                recovery_journal.resolve(recovery_id)
 
             if cleanup_errors and operation_error is None:
                 logger.warning(

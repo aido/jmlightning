@@ -1,3 +1,4 @@
+import tempfile
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -373,6 +374,7 @@ def _build_test_doubles() -> tuple[
     Mock, ClassifiedUTXO, Mock, Mock, ExecutionPlan, Mock
 ]:
     config = Mock()
+    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
     config.mixdepth = 0
     config.announce = False
     config.fee_priority = FeePriority.NORMAL

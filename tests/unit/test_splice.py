@@ -1,3 +1,4 @@
+import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,7 @@ def _build_splice_test_doubles() -> tuple[
     Mock,
 ]:
     config = Mock()
+    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
     config.amount = 100_000
     config.mixdepth = 0
     config.fee_priority = FeePriority.NORMAL

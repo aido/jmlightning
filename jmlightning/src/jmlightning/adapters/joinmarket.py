@@ -16,6 +16,7 @@ from jmwallet.wallet.signer import SignedInput
 
 from jmlightning.config import CLNConfig
 from jmlightning.models import ClassifiedUTXO
+from jmlightning.recovery import RecoveryJournal
 
 logger = logging.getLogger(__name__)
 
@@ -51,9 +52,16 @@ class JoinMarketAdapter:
     Policy decisions are deliberately kept outside this adapter.
     """
 
-    def __init__(self, config: CLNConfig):
+    def __init__(
+        self,
+        config: CLNConfig,
+        recovery_journal: RecoveryJournal | None = None,
+        recovery_id: str | None = None,
+    ):
         self.config = config
         self.wallet: WalletService | None = None
+        self._recovery_journal = recovery_journal
+        self._recovery_id = recovery_id
 
         # Outpoints reserved by this adapter during an operation. The
         # persisted JoinMarket reservation is the authoritative cross-process
@@ -78,6 +86,34 @@ class JoinMarketAdapter:
         # record cache is not a thread-safe interface. Serialise reservation
         # mutations made by the main operation and the renewal worker.
         self._reservation_io = threading.Lock()
+
+    def configure_recovery(self, journal: RecoveryJournal, record_id: str) -> None:
+        self._recovery_journal = journal
+        self._recovery_id = record_id
+
+    def _owner_tokens(self) -> dict[tuple[str, int], str]:
+        with self._lock_state:
+            return dict(self._lock_owners)
+
+    def _journal_before_reservation(
+        self,
+        *,
+        action: str,
+        outpoint: tuple[str, int],
+    ) -> None:
+        if self._recovery_journal is None or self._recovery_id is None:
+            return
+        self._recovery_journal.before_mutation(
+            self._recovery_id,
+            action=action,
+            phase="locked",
+            locked_outpoints=list(self._owner_tokens()),
+            owner_tokens=self._owner_tokens(),
+        )
+
+    def _journal_after_reservation(self, phase: str = "locked") -> None:
+        if self._recovery_journal is not None and self._recovery_id is not None:
+            self._recovery_journal.after_mutation(self._recovery_id, phase=phase)
 
     async def get_raw_transaction(self, txid: str) -> bytes:
         """Return the complete raw transaction for a JoinMarket UTXO."""
@@ -357,6 +393,14 @@ class JoinMarketAdapter:
         # reservation is a temporary lease. Mixing the two lifetimes means an
         # expired lease can be reacquired by another process while a stale
         # cleanup path can still unfreeze the new owner's UTXO.
+        if self._recovery_journal is not None and self._recovery_id is not None:
+            self._recovery_journal.before_mutation(
+                self._recovery_id,
+                action="reserve_coinjoin_inputs",
+                phase="locked",
+                locked_outpoints=[*self._locked_utxos, outpoint],
+                owner_tokens={**self._owner_tokens(), outpoint: owner},
+            )
         with self._reservation_io:
             reserved = wallet.reserve_coinjoin_inputs(
                 {outpoint},
@@ -371,6 +415,7 @@ class JoinMarketAdapter:
         with self._lock_state:
             self._locked_utxos.add(outpoint)
             self._lock_owners[outpoint] = owner
+        self._journal_after_reservation()
 
     def start_lock_renewal(self) -> None:
         """Start renewal independently of the asyncio event loop.
@@ -434,12 +479,17 @@ class JoinMarketAdapter:
         with self._lock_state:
             owners = list(self._lock_owners.items())
         for outpoint, owner in owners:
+            self._journal_before_reservation(
+                action="renew_coinjoin_inputs",
+                outpoint=outpoint,
+            )
             with self._reservation_io:
                 renewed = wallet.renew_coinjoin_inputs(
                     {outpoint},
                     owner=owner,
                     ttl=LOCK_TTL_SECONDS,
                 )
+            self._journal_after_reservation()
             if not renewed:
                 raise RuntimeError(
                     f"JoinMarket reservation for {outpoint[0]}:{outpoint[1]} "
@@ -486,12 +536,16 @@ class JoinMarketAdapter:
                 "JoinMarket reservation owner"
             )
 
+        self._journal_before_reservation(
+            action="renew_coinjoin_inputs", outpoint=outpoint
+        )
         with self._reservation_io:
             renewed = wallet.renew_coinjoin_inputs(
                 {outpoint},
                 owner=owner,
                 ttl=LOCK_TTL_SECONDS,
             )
+        self._journal_after_reservation()
         if not renewed:
             raise RuntimeError(
                 f"JoinMarket reservation for {coin.utxo.txid}:{coin.utxo.vout} "
@@ -537,6 +591,9 @@ class JoinMarketAdapter:
             # operation this adapter performs.
             return
 
+        self._journal_before_reservation(
+            action="release_coinjoin_inputs", outpoint=outpoint
+        )
         try:
             with self._reservation_io:
                 wallet.release_coinjoin_inputs({outpoint}, owner=owner)
@@ -550,6 +607,36 @@ class JoinMarketAdapter:
         with self._lock_state:
             self._lock_owners.pop(outpoint, None)
             self._locked_utxos.discard(outpoint)
+        self._journal_after_reservation()
+
+    def recover_release(
+        self,
+        outpoint: tuple[str, int],
+        owner: str,
+    ) -> None:
+        """Release a persisted reservation only for its recorded owner."""
+        wallet = self._require_wallet()
+        with self._reservation_io:
+            wallet.release_coinjoin_inputs({outpoint}, owner=owner)
+
+    def recover_renew(
+        self,
+        outpoint: tuple[str, int],
+        owner: str,
+    ) -> None:
+        """Renew a persisted reservation for recovery reconciliation."""
+        wallet = self._require_wallet()
+        with self._reservation_io:
+            renewed = wallet.renew_coinjoin_inputs(
+                {outpoint},
+                owner=owner,
+                ttl=LOCK_TTL_SECONDS,
+            )
+        if not renewed:
+            raise RuntimeError(
+                f"JoinMarket reservation for {outpoint[0]}:{outpoint[1]} "
+                "cannot be renewed by the recorded owner"
+            )
 
     def get_change_address(
         self,

@@ -304,7 +304,9 @@ def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:
             "params": {"probe": request.name},
         }
 
-    assert [method for method, _ in process.calls] == sorted(PEERSWAP_BTC_RPC_METHODS)
+    assert sorted([method for method, _ in process.calls]) == sorted(
+        PEERSWAP_BTC_RPC_METHODS
+    )
 
 
 def test_peer_swap_manifest_methods_are_registered_without_renaming() -> None:

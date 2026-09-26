@@ -40,6 +40,7 @@ from jmlightning.operations.splice import (
     SpliceOperation,
     confirm_splice_in,
 )
+from jmlightning.recovery import RecoveryManager
 
 __all__ = ["app"]
 
@@ -399,6 +400,59 @@ def splice_in(
         )
     )
     typer.echo(f"Splice transaction: {splice_txid}")
+
+
+@app.command()
+def recover(
+    cln_socket: Annotated[
+        Path,
+        typer.Option(
+            "--cln-socket",
+            help="Path to CLN unix socket",
+        ),
+    ] = Path("/run/lightningd/lightning-rpc"),
+    data_dir: Annotated[
+        Path | None,
+        typer.Option(
+            "--data-dir",
+            "-d",
+            envvar="JOINMARKET_DATA_DIR",
+            help="JoinMarket data directory",
+        ),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--config-file",
+            envvar="JOINMARKET_CONFIG_FILE",
+            help="JoinMarket config file path",
+        ),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--mnemonic-file",
+            "-f",
+            help="Path to mnemonic file",
+        ),
+    ] = None,
+) -> None:
+    """Reconcile durable JoinMarket reservations after an ambiguous operation."""
+    settings = setup_cli(data_dir=data_dir, config_file=config_file)
+    resolved = resolve_mnemonic(settings, mnemonic_file=mnemonic_file)
+    if not resolved:
+        logger.error("Could not resolve JoinMarket mnemonic.")
+        raise typer.Exit(1)
+    config = build_cln_config(
+        settings=settings,
+        resolved_mnemonic=resolved,
+        amount=0,
+        mixdepth=0,
+    )
+    resolved_ids = asyncio.run(
+        RecoveryManager(config=config, cln_socket=cln_socket).reconcile_all()
+    )
+    typer.echo(f"Resolved {len(resolved_ids)} recovery record(s).")
 
 
 def _peerswap_config(

@@ -325,6 +325,52 @@ class CLNBackend(LightningBackend):
                 f"Failed to determine CLN funding status for {peer_id}: {exc}"
             ) from exc
 
+    def get_funding_start_status(self, peer_id: str) -> ChannelFundingStatus:
+        """Check whether CLN still reports an in-flight channel open."""
+        try:
+            result = self.rpc.listpeerchannels(peer_id)
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN listpeerchannels returned an invalid response")
+            channels = result.get("channels", [])
+            if not isinstance(channels, list):
+                raise RuntimeError(
+                    "CLN listpeerchannels returned invalid channels data"
+                )
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                inflight = channel.get("inflight", [])
+                if isinstance(inflight, list) and inflight:
+                    return ChannelFundingStatus.WITHHELD
+            return ChannelFundingStatus.ABSENT
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to determine CLN funding-start status for {peer_id}: {exc}"
+            ) from exc
+
+    def get_splice_funding_status(self, channel_id: str) -> ChannelFundingStatus:
+        """Check the authoritative CLN state of an in-flight splice."""
+        try:
+            result = self.rpc.listpeerchannels(channel_id)
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN listpeerchannels returned an invalid response")
+            channels = result.get("channels", [])
+            if not isinstance(channels, list):
+                raise RuntimeError(
+                    "CLN listpeerchannels returned invalid channels data"
+                )
+            for channel in channels:
+                if not isinstance(channel, dict):
+                    continue
+                inflight = channel.get("inflight", [])
+                if isinstance(inflight, list) and inflight:
+                    return ChannelFundingStatus.WITHHELD
+            return ChannelFundingStatus.ABSENT
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to determine CLN splice status for {channel_id}: {exc}"
+            ) from exc
+
     def send_psbt(self, psbt: bytes) -> dict[str, object]:
         """Finalise and broadcast a fully signed PSBT through CLN."""
         try:
