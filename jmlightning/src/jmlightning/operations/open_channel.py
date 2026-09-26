@@ -26,7 +26,7 @@ OpenChannelConfirmationCallback = Callable[
 ]
 
 
-FundingPhase: TypeAlias = LifecyclePhase
+OpenChannelPhase: TypeAlias = LifecyclePhase
 
 
 class OpenChannelCancelledError(RuntimeError):

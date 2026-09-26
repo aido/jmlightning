@@ -810,6 +810,31 @@ def test_get_channel_funding_status_rejects_malformed_transaction_data(
         )
 
 
+def test_get_splice_funding_status_filters_by_channel_id() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    channel_id = "11" * 32 + ":0"
+    rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "channel_id": channel_id,
+                "inflight": [{"funding_txid": "22" * 32}],
+            }
+        ]
+    }
+
+    assert (
+        backend.get_splice_funding_status(channel_id) is ChannelFundingStatus.WITHHELD
+    )
+    rpc.listpeerchannels.assert_called_once_with(channel_id=channel_id)
+
+
 def test_get_splice_feerate_per_kw_returns_splice_rate() -> None:
     rpc = Mock()
     backend = CLNBackend("/tmp/lightning-rpc")

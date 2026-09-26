@@ -1093,7 +1093,7 @@ class TxBuilder:
                 tx.witnesses[index] = [signature, expected_pubkey]
 
         if finalise_transaction:
-            self._finalize_psbt_inputs(
+            self._finalise_psbt_inputs(
                 signed_parsed_psbt,
                 signing_inputs,
                 tx,
@@ -1105,7 +1105,7 @@ class TxBuilder:
         return tx, txid, signed_psbt
 
     @staticmethod
-    def _finalize_psbt_inputs(
+    def _finalise_psbt_inputs(
         parsed_psbt: ParsedPSBT,
         signing_inputs: Mapping[int, ClassifiedUTXO],
         tx: ParsedTransaction,

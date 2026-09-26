@@ -691,7 +691,7 @@ class CLNBackend(LightningBackend):
     def get_splice_funding_status(self, channel_id: str) -> ChannelFundingStatus:
         """Check the authoritative CLN state of an in-flight splice."""
         try:
-            result = self.rpc.listpeerchannels(channel_id)
+            result = self.rpc.listpeerchannels(channel_id=channel_id)
             if not isinstance(result, dict):
                 raise RuntimeError("CLN listpeerchannels returned an invalid response")
             channels = result.get("channels", [])

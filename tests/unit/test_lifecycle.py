@@ -6,7 +6,7 @@ from jmwallet.wallet.models import UTXOInfo
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.operations.multi_open_channel import MultiOpenChannelPhase
-from jmlightning.operations.open_channel import FundingPhase
+from jmlightning.operations.open_channel import OpenChannelPhase
 from jmlightning.operations.peerswap import PeerSwapPhase
 from jmlightning.operations.splice import SplicePhase
 
@@ -35,7 +35,7 @@ def test_shared_lifecycle_phase_covers_operation_states() -> None:
     assert LifecyclePhase.BROADCAST.value == "broadcast"
     assert LifecyclePhase.PREPARED.value == "prepared"
     assert LifecyclePhase.DISCARDED.value == "discarded"
-    assert FundingPhase is LifecyclePhase
+    assert OpenChannelPhase is LifecyclePhase
     assert MultiOpenChannelPhase is LifecyclePhase
     assert SplicePhase is LifecyclePhase
     assert PeerSwapPhase is LifecyclePhase
