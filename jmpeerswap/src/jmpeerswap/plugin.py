@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import itertools
 import json
+import shutil
 import subprocess
 import threading
 from collections.abc import Callable, Mapping
@@ -20,6 +21,125 @@ __all__ = ["DEFERRED_RESPONSE", "DeferredResponse", "PeerSwapRendezvous"]
 
 PEERSWAP_INIT_TIMEOUT = 120.0
 PEERSWAP_MANIFEST_TIMEOUT = 30.0
+
+
+class _PeerSwapManifestEntry(TypedDict):
+    name: str
+
+
+class _PeerSwapManifest(TypedDict):
+    rpcmethods: list[_PeerSwapManifestEntry]
+    options: list[dict[str, object]]
+    subscriptions: list[str]
+    hooks: list[str]
+    notifications: list[object]
+    custommessages: list[object]
+    dynamic: bool
+
+
+# PeerSwap 7.0.0 API exposed through this bridge. CLN requires this surface
+# during getmanifest, before the configured peerswap-plugin value is passed to
+# init. Keep this as the single bridge API definition; tests consume it too.
+PEERSWAP_BRIDGE_MANIFEST: _PeerSwapManifest = {
+    "rpcmethods": [
+        {"name": name}
+        for name in (
+            "peerswap-listpeers",
+            "peerswap-getswap",
+            "peerswap-listactiveswaps",
+            "peerswap-allowswaprequests",
+            "peerswap-addpeer",
+            "peerswap-removepeer",
+            "peerswap-addsuspeer",
+            "peerswap-removesuspeer",
+            "peerswap-swap-in",
+            "peerswap-swap-out",
+            "peerswap-listswaps",
+            "peerswap-reloadpolicy",
+            "peerswap-listswaprequests",
+            "peerswap-listconfig",
+            "peerswap-getpremiumrate",
+            "peerswap-updatepremiumrate",
+            "peerswap-getglobalpremiumrate",
+            "peerswap-updateglobalpremiumrate",
+            "peerswap-deletepremiumrate",
+        )
+    ],
+    "options": [
+        {
+            "name": "peerswap-bitcoin-rpchost",
+            "default": "",
+            "description": "bitcoind rpchost",
+        },
+        {
+            "name": "peerswap-bitcoin-rpcport",
+            "default": "",
+            "description": "bitcoind rpcport",
+        },
+        {
+            "name": "peerswap-bitcoin-rpcuser",
+            "default": "",
+            "description": "bitcoind rpcuser",
+        },
+        {
+            "name": "peerswap-bitcoin-rpcpassword",
+            "default": "",
+            "description": "bitcoind rpcpassword",
+        },
+        {
+            "name": "peerswap-bitcoin-cookiefilepath",
+            "default": "",
+            "description": "path to bitcoin cookie file",
+        },
+        {
+            "name": "peerswap-elementsd-rpchost",
+            "default": "",
+            "description": "elementsd rpchost",
+        },
+        {
+            "name": "peerswap-elementsd-rpcport",
+            "default": "",
+            "description": "elementsd rpcport",
+        },
+        {
+            "name": "peerswap-elementsd-rpcuser",
+            "default": "",
+            "description": "elementsd rpcuser",
+        },
+        {
+            "name": "peerswap-elementsd-rpcpassword",
+            "default": "",
+            "description": "elementsd rpcpassword",
+        },
+        {
+            "name": "peerswap-elementsd-rpcwallet",
+            "default": "",
+            "description": "liquid-rpcwallet",
+        },
+        {
+            "name": "peerswap-elementsd-rpcpasswordfile",
+            "default": "",
+            "description": "elementsd rpcpassword filepath",
+        },
+        {
+            "name": "peerswap-elementsd-swaps",
+            "default": False,
+            "description": "enable/disable liquid",
+            "type": "bool",
+        },
+        {
+            "name": "peerswap-policy-path",
+            "default": "",
+            "description": "Path to the policy file. "
+            "If empty the default policy is used",
+        },
+    ],
+    "subscriptions": ["connect", "shutdown"],
+    "hooks": ["custommsg"],
+    "notifications": [],
+    "custommessages": [],
+    "dynamic": True,
+}
 
 
 class _InitParams(TypedDict):
@@ -146,6 +266,11 @@ class PeerSwapProcess:
             initialiser.join(timeout=1)
 
         self._fail_pending("PeerSwap stopped")
+
+    def set_executable(self, executable: str) -> None:
+        if self.process is not None:
+            raise RuntimeError("PeerSwap is running")
+        self.executable = executable
 
     def set_parent_rpc(self, callback: Callable[[str, object], object]) -> None:
         self._parent_rpc = callback
@@ -465,10 +590,82 @@ def _make_forwarder(
     return forward
 
 
+def _validate_peer_swap_manifest(manifest: dict[str, object]) -> None:
+    """Ensure the selected PeerSwap binary implements the bridge contract."""
+    expected = PEERSWAP_BRIDGE_MANIFEST
+
+    def named_entries(value: object, field: str) -> dict[str, dict[str, object]]:
+        if not isinstance(value, list):
+            raise ValueError(f"PeerSwap manifest {field} must be a list")
+        result: dict[str, dict[str, object]] = {}
+        for entry in value:
+            if not isinstance(entry, dict):
+                raise ValueError(f"PeerSwap manifest {field} entry must be an object")
+            name = entry.get("name")
+            if not isinstance(name, str) or not name:
+                raise ValueError(f"PeerSwap manifest {field} entry requires a name")
+            result[name] = entry
+        return result
+
+    actual_rpc = named_entries(manifest.get("rpcmethods", []), "rpcmethods")
+    actual_options = named_entries(manifest.get("options", []), "options")
+    actual_subscriptions = manifest.get("subscriptions", [])
+    actual_hooks = manifest.get("hooks", [])
+    actual_notifications = manifest.get("notifications", [])
+    actual_custommessages = manifest.get("custommessages", [])
+
+    if not isinstance(actual_subscriptions, list):
+        raise ValueError("PeerSwap manifest subscriptions must be a list")
+    if not isinstance(actual_hooks, list):
+        raise ValueError("PeerSwap manifest hooks must be a list")
+    if not isinstance(actual_notifications, list):
+        raise ValueError("PeerSwap manifest notifications must be a list")
+    if not isinstance(actual_custommessages, list):
+        raise ValueError("PeerSwap manifest custommessages must be a list")
+
+    for name in (
+        "peerswap-lbtc-getaddress",
+        "peerswap-lbtc-getbalance",
+        "peerswap-lbtc-sendtoaddress",
+    ):
+        actual_rpc.pop(name, None)
+
+    expected_rpc = named_entries(expected["rpcmethods"], "rpcmethods")
+    expected_options = named_entries(expected["options"], "options")
+    if set(actual_rpc) != set(expected_rpc):
+        raise RuntimeError(
+            "PeerSwap executable manifest RPC methods do not match the bridge API"
+        )
+    if set(actual_options) != set(expected_options):
+        raise RuntimeError(
+            "PeerSwap executable manifest options do not match the bridge API"
+        )
+    if set(actual_subscriptions) != set(expected["subscriptions"]):
+        raise RuntimeError(
+            "PeerSwap executable manifest subscriptions do not match the bridge API"
+        )
+    if set(actual_hooks) != set(expected["hooks"]):
+        raise RuntimeError(
+            "PeerSwap executable manifest hooks do not match the bridge API"
+        )
+    if actual_notifications != expected["notifications"]:
+        raise RuntimeError(
+            "PeerSwap executable manifest notifications do not match the bridge API"
+        )
+    if actual_custommessages != expected["custommessages"]:
+        raise RuntimeError(
+            "PeerSwap executable manifest custom messages do not match the bridge API"
+        )
+    if manifest.get("dynamic") is not expected["dynamic"]:
+        raise RuntimeError(
+            "PeerSwap executable manifest dynamic flag does not match the bridge API"
+        )
+
+
 def _register_peer_swap_manifest(
     plugin: Plugin,
     process: PeerSwapProcess,
-    manifest: dict[str, object],
+    manifest: Mapping[str, object],
 ) -> None:
     """Expose PeerSwap's manifest through the bridge plugin.
 
@@ -630,6 +827,19 @@ def _register_rendezvous_methods(
     )
 
 
+def _resolve_peer_swap_executable(executable: str) -> str:
+    resolved = shutil.which(executable)
+    if resolved is not None:
+        return resolved
+
+    path = Path(executable)
+    if not path.is_file() or not path.stat().st_mode & 0o111:
+        raise FileNotFoundError(
+            f"PeerSwap executable not found or not executable: {executable}"
+        )
+    return str(path.resolve())
+
+
 def _peer_swap_executable(
     plugin: Plugin, options: Mapping[str, object] | None = None
 ) -> str:
@@ -716,25 +926,12 @@ def main() -> None:
         "Path to the unmodified PeerSwap plugin executable.",
     )
 
-    process: PeerSwapProcess | None = None
+    process = PeerSwapProcess("peerswap")
     proxy: UnixRPCProxy | None = None
     rendezvous = PeerSwapRendezvous()
 
     _register_rendezvous_methods(plugin, rendezvous)
-
-    original_getmanifest = plugin.methods["getmanifest"].func
-
-    def getmanifest(**params: object) -> object:
-        nonlocal process
-        if process is None:
-            process = PeerSwapProcess("peerswap")
-            process.start(params)
-            if process.manifest is None:
-                raise RuntimeError("PeerSwap did not return a manifest")
-            _register_peer_swap_manifest(plugin, process, process.manifest)
-        return cast(object, original_getmanifest(**params))
-
-    plugin.methods["getmanifest"].func = getmanifest
+    _register_peer_swap_manifest(plugin, process, PEERSWAP_BRIDGE_MANIFEST)
 
     @plugin.init()  # type: ignore[untyped-decorator]
     def init(
@@ -745,14 +942,17 @@ def main() -> None:
         nonlocal process, proxy
 
         executable = _peer_swap_executable(plugin, options)
+        resolved = _resolve_peer_swap_executable(executable)
 
-        if process is None:
-            process = PeerSwapProcess(executable)
+        process.set_executable(resolved)
+        try:
             process.start()
-        elif process.executable != executable:
+            if process.manifest is None:
+                raise RuntimeError("PeerSwap did not return a manifest")
+            _validate_peer_swap_manifest(process.manifest)
+        except BaseException:
             process.stop()
-            process = PeerSwapProcess(executable)
-            process.start()
+            raise
 
         init_message: _InitMessage = {
             "params": {

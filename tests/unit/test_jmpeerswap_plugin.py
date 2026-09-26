@@ -18,39 +18,6 @@ import jmpeerswap.plugin as plugin
 from jmpeerswap.proxy import UnixRPCProxy
 from jmpeerswap.rendezvous import PeerSwapRendezvous
 
-# PeerSwap advertises these Bitcoin/CLN RPC methods. The three
-# peerswap-lbtc-* methods are deliberately excluded because jm-lightning is
-# Bitcoin-only. Keep this list aligned with PeerSwap clightning methods
-# registration so a protocol/API change cannot silently remove bridge coverage.
-PEERSWAP_LBTC_RPC_METHODS = {
-    "peerswap-lbtc-getaddress",
-    "peerswap-lbtc-getbalance",
-    "peerswap-lbtc-sendtoaddress",
-}
-
-
-PEERSWAP_BTC_RPC_METHODS = {
-    "peerswap-listpeers",
-    "peerswap-getswap",
-    "peerswap-listactiveswaps",
-    "peerswap-allowswaprequests",
-    "peerswap-addpeer",
-    "peerswap-removepeer",
-    "peerswap-addsuspeer",
-    "peerswap-removesuspeer",
-    "peerswap-swap-in",
-    "peerswap-swap-out",
-    "peerswap-listswaps",
-    "peerswap-reloadpolicy",
-    "peerswap-listswaprequests",
-    "peerswap-listconfig",
-    "peerswap-getpremiumrate",
-    "peerswap-updatepremiumrate",
-    "peerswap-getglobalpremiumrate",
-    "peerswap-updateglobalpremiumrate",
-    "peerswap-deletepremiumrate",
-}
-
 
 def _write_peer_swap_child(tmp_path: Path, body: str) -> str:
     executable = tmp_path / "peerswap-child"
@@ -87,6 +54,53 @@ def test_peer_swap_executable_uses_configured_option() -> None:
     cln_plugin.options = {"peerswap-plugin": "/usr/local/bin/custom-peerswap"}
 
     assert plugin._peer_swap_executable(cln_plugin) == "/usr/local/bin/custom-peerswap"
+
+
+def test_bridge_manifest_is_registered_before_init_without_starting_peerswap() -> None:
+    cln_plugin = Plugin()
+    process = plugin.PeerSwapProcess("/does/not/exist")
+
+    plugin._register_rendezvous_methods(cln_plugin, plugin.PeerSwapRendezvous())
+    plugin._register_peer_swap_manifest(
+        cln_plugin, process, plugin.PEERSWAP_BRIDGE_MANIFEST
+    )
+
+    expected = {
+        entry["name"] for entry in plugin.PEERSWAP_BRIDGE_MANIFEST["rpcmethods"]
+    }
+    assert expected <= set(cln_plugin.methods)
+    assert process.process is None
+
+
+def test_configured_executable_is_selected_without_replacing_registered_process(
+    tmp_path: Path,
+) -> None:
+    executable = _write_peer_swap_child(tmp_path, "")
+    process = plugin.PeerSwapProcess("peerswap")
+
+    process.set_executable(plugin._resolve_peer_swap_executable(executable))
+
+    assert process.executable == executable
+    assert process.process is None
+
+
+def test_missing_peer_swap_executable_is_rejected() -> None:
+    with pytest.raises(FileNotFoundError, match="PeerSwap executable not found"):
+        plugin._resolve_peer_swap_executable("/does/not/exist/peerswap")
+
+
+def test_peer_swap_manifest_validation_allows_unsupported_liquid_methods() -> None:
+    manifest = {
+        **plugin.PEERSWAP_BRIDGE_MANIFEST,
+        "rpcmethods": [
+            *plugin.PEERSWAP_BRIDGE_MANIFEST["rpcmethods"],
+            {"name": "peerswap-lbtc-getaddress"},
+            {"name": "peerswap-lbtc-getbalance"},
+            {"name": "peerswap-lbtc-sendtoaddress"},
+        ],
+    }
+
+    plugin._validate_peer_swap_manifest(manifest)
 
 
 def test_rendezvous_request_method_is_registered_as_background() -> None:
@@ -244,7 +258,7 @@ def test_proxy_disconnect_uses_rendezvous_request_id() -> None:
     assert rendezvous_request_id in rendezvous._terminal
 
 
-def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:
+def test_peer_swap_manifest_contract_is_fully_forwarded() -> None:
     class FakeProcess:
         def __init__(self) -> None:
             self.calls: list[tuple[str, Any]] = []
@@ -258,20 +272,13 @@ def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:
     plugin._register_peer_swap_manifest(
         cln_plugin,
         cast(plugin.PeerSwapProcess, process),
-        {
-            "rpcmethods": [
-                {"name": name, "description": name}
-                for name in sorted(PEERSWAP_BTC_RPC_METHODS)
-            ],
-            "options": [],
-            "subscriptions": [],
-            "hooks": [],
-            "notifications": [],
-        },
+        plugin.PEERSWAP_BRIDGE_MANIFEST,
     )
 
-    assert PEERSWAP_BTC_RPC_METHODS.isdisjoint(PEERSWAP_LBTC_RPC_METHODS)
-    assert PEERSWAP_BTC_RPC_METHODS <= set(cln_plugin.methods)
+    expected = {
+        entry["name"] for entry in plugin.PEERSWAP_BRIDGE_MANIFEST["rpcmethods"]
+    }
+    assert expected <= set(cln_plugin.methods)
 
     class FakeRequest:
         def __init__(self, name: str) -> None:
@@ -289,7 +296,7 @@ def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:
             self.event.set()
 
     requests: list[FakeRequest] = []
-    for name in sorted(PEERSWAP_BTC_RPC_METHODS):
+    for name in sorted(expected):
         params = {"probe": name}
         request = FakeRequest(name)
         requests.append(request)
@@ -304,9 +311,7 @@ def test_peer_swap_manifest_bitcoin_rpc_surface_is_fully_forwarded() -> None:
             "params": {"probe": request.name},
         }
 
-    assert sorted([method for method, _ in process.calls]) == sorted(
-        PEERSWAP_BTC_RPC_METHODS
-    )
+    assert sorted(method for method, _ in process.calls) == sorted(expected)
 
 
 def test_peer_swap_manifest_methods_are_registered_without_renaming() -> None:
