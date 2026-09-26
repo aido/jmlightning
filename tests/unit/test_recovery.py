@@ -123,3 +123,33 @@ async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
         "owner",
     )
     assert journal.records() == []
+
+
+@pytest.mark.anyio
+async def test_recovery_does_not_cancel_unidentified_withheld_funding(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    journal.update(
+        record_id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+    )
+
+    config = Mock(data_dir=tmp_path)
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    cln.get_funding_start_status = Mock(return_value=ChannelFundingStatus.WITHHELD)
+    cln.cancel_channel_funding = Mock()
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == []
+    cln.cancel_channel_funding.assert_not_called()
+    adapter.recover_release.assert_not_called()
+    assert journal.records()[0].id == record_id

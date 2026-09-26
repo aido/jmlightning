@@ -276,11 +276,20 @@ class RecoveryManager:
             return False
 
         if status is ChannelFundingStatus.WITHHELD:
+            # Without a transaction id, a currently withheld funding candidate
+            # cannot be tied to this recovery record. It may be a later
+            # operation for the same peer/channel after the original operation
+            # was cancelled externally. Cancelling it here could therefore
+            # interfere with an unrelated operation. Leave the record pending
+            # for explicit operator reconciliation instead.
+            if txid is None:
+                return False
+
             await self._cancel(record)
             status = await self._cln_status(record)
             if status is not ChannelFundingStatus.ABSENT:
                 return False
-            if txid is not None and await self._bitcoin_has_transaction(txid):
+            if await self._bitcoin_has_transaction(txid):
                 return False
 
         if status is not ChannelFundingStatus.ABSENT:
