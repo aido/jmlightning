@@ -132,9 +132,9 @@ class Planner:
                 f"Selected {len(selected_coins)} UTXOs. Estimated fee: {fee} sats."
             ),
             funding_outputs=[
-                FundingOutput(amount=amount, output_type=output_type)
-                for amount, output_type in zip(
-                    target_amounts,
+                FundingOutput(amount=funding_amount, output_type=output_type)
+                for funding_amount, output_type in zip(
+                    [amount] if sweep else target_amounts,
                     funding_output_types,
                     strict=True,
                 )

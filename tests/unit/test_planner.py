@@ -82,6 +82,7 @@ def test_build_plan_sweeps_all_available_funds(
     assert plan.amount == 200_000 - plan.fee
     assert plan.change == 0
     assert plan.amount > 0
+    assert plan.funding_outputs == [FundingOutput(plan.amount, "p2wsh")]
     assert "Transaction creates change." not in plan.warnings
 
 
