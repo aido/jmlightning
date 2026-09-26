@@ -89,6 +89,8 @@ are enforced by the policy layer rather than relying on the CLI user to make the
 - The upstream PeerSwap plugin if PeerSwap is enabled
 - A CLN JSON-RPC Unix socket accessible by the process running `jmlightning`
 
+For the current PeerSwap integration, the `jmlightning` process must be able to reach the Lightning node's CLN JSON-RPC socket. The current transport is therefore a **Unix-domain socket** and does not yet provide a fully separated two-host deployment.
+
 For a normal channel-funding deployment only `jmlightning` is required. PeerSwap adds the separate `jmpeerswap` CLN plugin on the Lightning node.
 
 The exact dependency versions are defined by `pyproject.toml`.
@@ -357,7 +359,9 @@ PeerSwap integration has two separate components:
 - `jmlightning` runs on the JoinMarket host and exposes the `peerswap-swap-in` and `peerswap-swap-out` commands. It owns the JoinMarket wallet access, UTXO policy and transaction preparation.
 - `jmpeerswap` runs as a Core Lightning plugin on the Lightning node. It proxies the upstream PeerSwap plugin and intercepts `txprepare`, `txsend` and `txdiscard` so the JoinMarket side can perform the wallet-specific transaction work.
 
-The two components do not need to run on the same host. The Lightning node only needs `jmpeerswap` and the upstream PeerSwap plugin; the JoinMarket host needs `jmlightning` and access to the relevant CLN RPC socket.
+The two components are logically separated into a JoinMarket side and a Lightning side, but the **current transport does not yet provide true host separation**. `jmlightning` currently communicates with CLN through its Unix-domain JSON-RPC socket, so the JoinMarket host must have access to that socket. In practice this means the current deployment is normally on one host, or requires an administrator-controlled mechanism for exposing/forwarding the Unix socket.
+
+A future transport will optionally use a **TCP socket** for the rendezvous boundary so the JoinMarket host and Lightning host can be genuinely separate machines without sharing a Unix socket or filesystem. That transport is planned but is **not implemented yet**.
 
 The PeerSwap transaction path requests the `SWAP` capability. This is intentionally separate from `OPEN_CHANNEL` and `SPLICE`, so swap funding follows the policy assigned to CoinJoin change and other swap-eligible UTXOs.
 
@@ -421,6 +425,29 @@ jm-lightning peerswap-swap-out --help
 
 for the options supported by the installed version.
 
+### Recovery
+
+Operations that reach an ambiguous external state deliberately retain their JoinMarket locks instead of assuming that the transaction was abandoned. The durable recovery journal records the operation state, locked outpoints and the relevant transaction or PSBT information under the JoinMarket data directory.
+
+Use the recovery command to reconcile outstanding records:
+
+```bash
+jm-lightning recover \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The command also accepts `--data-dir`, `--config-file` and `--mnemonic-file` when the JoinMarket configuration is not being resolved from the defaults.
+
+Recovery is deliberately conservative. It checks the authoritative CLN state and the Bitcoin wallet backend before releasing a recorded JoinMarket reservation. A record is not released when the associated transaction is known to have been broadcast, when CLN still has a live or withheld funding state or when the required ownership information is incomplete. The command is a reconciliation tool for durable reservations; it does not attempt to reverse or replace a transaction that may already have been broadcast.
+
+Run:
+
+```bash
+jm-lightning recover --help
+```
+
+for the options supported by the installed version.
+
 ### Sweep Mode
 
 A channel funding request with:
@@ -468,12 +495,25 @@ graph TD
     TX --> JM
     CLN -. implements .-> LB["LightningBackend"]
 
-    PS["jm-peerswap"] --> PROXY["PeerSwap CLN bridge"]
+    PS["jm-peerswap<br/>Lightning host"] --> PROXY["PeerSwap CLN bridge"]
     PROXY --> RS["PeerSwap rendezvous"]
-    RS --> PSOP["PeerSwapPrepareTxOperation"]
+    RS --> CLN
+    CLN --> RS
+    RS --> PSOP["PeerSwapPrepareTxOperation<br/>JoinMarket host"]
     PSOP --> POLICY
     PSOP --> TX
 ```
+
+### Current host model and future separation
+
+The PeerSwap bridge is split into two processes with different responsibilities:
+
+- **Lightning host:** `jm-peerswap` and the upstream PeerSwap plugin. `jm-peerswap` owns the PeerSwap child process, the local PeerSwap RPC proxy and the rendezvous queue.
+- **JoinMarket host:** `jmlightning` and the JoinMarket-NG wallet. `jmlightning` polls the CLN-side rendezvous methods and performs policy, transaction construction and wallet signing.
+- **Current transport:** the JoinMarket side reaches CLN through the CLN JSON-RPC **Unix socket**. The rendezvous therefore crosses the process boundary through CLN RPC, but the socket itself still has to be accessible to `jmlightning`.
+- **Future transport:** an optional TCP transport is planned for the rendezvous boundary. This will allow the JoinMarket and Lightning hosts to be physically separate without sharing the CLN Unix socket or a filesystem. It is a future deployment mode, not a capability of the current release.
+
+This distinction is intentional: the current code has a process-level separation between the PeerSwap bridge and JoinMarket transaction handling, but it should not be presented as a fully isolated two-host security boundary until the TCP transport exists.
 
 ### Design Principles
 
@@ -641,51 +681,75 @@ As with channel funding, an ambiguous RPC outcome deliberately leaves the JoinMa
 
 ## 🤝 PeerSwap Flow
 
-PeerSwap uses a rendezvous layer between the CLN-side PeerSwap plugin and the JoinMarket operation. The transaction RPCs are deliberately intercepted so PeerSwap cannot select arbitrary wallet inputs outside the JoinMarket policy boundary.
+PeerSwap uses a rendezvous layer between the CLN-side PeerSwap plugin and the JoinMarket operation. The bridge intercepts the transaction RPCs on the local PeerSwap RPC proxy, queues them in the rendezvous layer and exposes them to `jmlightning` through two CLN RPC methods: `jmpeerswap-request` and `jmpeerswap-response`. This is the actual transport used by the current implementation.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant PS as PeerSwap
-    participant BR as jm-peerswap<br/>Lightning node
+    participant PS as PeerSwap child
+    participant BR as jm-peerswap<br/>Lightning host
+    participant RV as Rendezvous queue
     participant CLN as Core Lightning
-    participant RV as PeerSwap rendezvous
     participant JMHOST as jmlightning<br/>JoinMarket host
     participant OP as PeerSwapPrepareTxOperation
     participant JM as JoinMarket-NG
     participant P as PolicyEngine
     participant TX as TxBuilder
 
-    PS->>BR: txprepare / txsend / txdiscard
-    BR->>CLN: Intercept PeerSwap transaction RPC
-    CLN->>RV: jmpeerswap-request
-    JMHOST->>CLN: jmpeerswap-request
-    CLN-->>JMHOST: Matched request
-    JMHOST->>OP: Dispatch transaction method
+    PS->>BR: txprepare
+    BR->>RV: Queue txprepare
+    JMHOST->>CLN: jmpeerswap-request()
+    CLN->>BR: Dispatch rendezvous request
+    BR->>RV: Match waiting request
+    RV-->>BR: txprepare request
+    BR-->>CLN: Matched request
+    CLN-->>JMHOST: method + params + request_id
+    JMHOST->>OP: Dispatch txprepare
     OP->>JM: Discover classified UTXOs
     JM-->>OP: Classified UTXOs
     OP->>P: Filter for SWAP
     P-->>OP: Policy-approved UTXOs
     OP->>OP: Select and lock inputs
     OP->>TX: Build and sign transaction
-    TX->>JM: Sign with JoinMarket wallet
+    TX->>JM: Sign JoinMarket inputs
     JM-->>TX: Signed transaction
     TX-->>OP: Prepared transaction + PSBT
-    OP-->>JMHOST: CLN-compatible result
-    JMHOST->>CLN: jmpeerswap-response
-    CLN-->>BR: PeerSwap RPC result
-    BR-->>PS: PeerSwap RPC result
+    JMHOST->>CLN: jmpeerswap-response(request_id, result)
+    CLN->>BR: Dispatch response
+    BR->>RV: Complete queued txprepare
+    RV-->>PS: PeerSwap RPC result
+
     PS->>BR: txsend
-    BR->>CLN: Intercept txsend
-    CLN->>JMHOST: Matched rendezvous request
-    JMHOST->>OP: Broadcast prepared transaction
-    OP->>JM: Broadcast transaction
+    BR->>RV: Queue txsend
+    JMHOST->>CLN: jmpeerswap-request()
+    CLN->>BR: Dispatch rendezvous request
+    BR->>RV: Match waiting request
+    RV-->>BR: txsend request
+    BR-->>CLN: Matched request
+    CLN-->>JMHOST: method + params + request_id
+    JMHOST->>OP: Dispatch txsend
+    OP->>JM: Broadcast prepared transaction
     JM-->>OP: txid
     OP->>JM: Release JoinMarket locks
-    OP-->>JMHOST: txsend result
-    JMHOST->>CLN: jmpeerswap-response
-    CLN-->>BR: Broadcast result
-    BR-->>PS: Broadcast result
+    JMHOST->>CLN: jmpeerswap-response(request_id, result)
+    CLN->>BR: Dispatch response
+    BR->>RV: Complete queued txsend
+    RV-->>PS: Broadcast result
+
+    opt PeerSwap abandons the prepared transaction
+        PS->>BR: txdiscard
+        BR->>RV: Queue txdiscard
+        JMHOST->>CLN: jmpeerswap-request()
+        CLN->>BR: Dispatch rendezvous request
+        BR->>RV: Match waiting request
+        CLN-->>JMHOST: txdiscard request
+        JMHOST->>OP: Discard prepared transaction
+        OP->>JM: Release JoinMarket locks
+        JMHOST->>CLN: jmpeerswap-response(request_id, result)
+        CLN->>BR: Dispatch response
+        BR->>RV: Complete queued txdiscard
+        RV-->>PS: Discard result
+    end
 ```
 
 ### PeerSwap transaction lifecycle
@@ -928,6 +992,7 @@ Use appropriate secret-management mechanisms for production deployments.
 │           ├── models.py
 │           ├── policy.py
 │           ├── planner.py
+│           ├── recovery.py
 │           ├── tx_builder.py
 │           │
 │           ├── adapters/
@@ -1062,6 +1127,14 @@ This is the main privacy boundary of the application.
 Responsible for turning eligible UTXOs and an execution request into an `ExecutionPlan`.
 
 The planner handles UTXO selection and fee-aware transaction planning.
+
+#### `recovery.py`
+
+Provides the durable recovery journal used to record operation phases, locked outpoints, ownership tokens and transaction state before external mutations. Journal updates are written atomically so an interrupted process does not silently lose the reservation record.
+
+#### `recovery_manager.py`
+
+Provides the recovery reconciliation logic used by `jm-lightning recover`. It compares the durable journal with CLN and Bitcoin wallet state and only releases JoinMarket reservations when the recorded operation is safely absent from both authoritative views.
 
 #### `tx_builder.py`
 
