@@ -340,20 +340,12 @@ class RecoveryManager:
             if txid is None:
                 return False
 
-            statuses = await self._peer_statuses(record)
-            await self._cancel(
-                record,
-                [
-                    peer_id
-                    for peer_id, peer_status in statuses.items()
-                    if peer_status is ChannelFundingStatus.WITHHELD
-                ],
-            )
-            status = await self._cln_status(record)
-            if status is not ChannelFundingStatus.ABSENT:
-                return False
-            if await self._bitcoin_has_transaction(txid):
-                return False
+            # fundchannel_cancel is scoped only by peer, not by transaction id.
+            # A recovery record therefore cannot safely cancel the exact funding
+            # operation it describes: a newer funding attempt for the same peer
+            # could have replaced it between the status check and cancellation.
+            # Leave withheld funding pending for explicit operator reconciliation.
+            return False
 
         if status is not ChannelFundingStatus.ABSENT:
             return False
@@ -422,22 +414,3 @@ class RecoveryManager:
         if any(status is ChannelFundingStatus.WITHHELD for status in statuses):
             return ChannelFundingStatus.WITHHELD
         return ChannelFundingStatus.ABSENT
-
-    async def _cancel(self, record: RecoveryRecord, peers: list[str]) -> None:
-        for peer_id in peers:
-            if not isinstance(peer_id, str):
-                raise RuntimeError("Recovery record has invalid peer ids")
-            self.journal.before_mutation(
-                record.id,
-                action="recovery_cancel",
-                phase=record.phase,
-                locked_outpoints=record.locked_outpoints,
-                owner_tokens={
-                    (txid, vout): owner
-                    for key, owner in record.owner_tokens.items()
-                    for txid, vout_text in [key.rsplit(":", 1)]
-                    for vout in [int(vout_text)]
-                },
-                txid=record.txid,
-            )
-            self.cln.cancel_channel_funding(peer_id)

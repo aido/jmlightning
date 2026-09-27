@@ -199,7 +199,7 @@ async def test_recovery_keeps_all_owner_tokens_across_partial_release(
 
 
 @pytest.mark.anyio
-async def test_multi_open_recovery_only_cancels_withheld_recorded_funding(
+async def test_multi_open_recovery_leaves_withheld_funding_pending(
     tmp_path: Path,
 ) -> None:
     journal = RecoveryJournal(tmp_path)
@@ -236,20 +236,18 @@ async def test_multi_open_recovery_only_cancels_withheld_recorded_funding(
         side_effect=lambda peer_id, _txid: statuses[peer_id]
     )
 
-    def cancel(peer_id: str) -> None:
-        statuses[peer_id] = ChannelFundingStatus.ABSENT
-
-    cln.cancel_channel_funding = Mock(side_effect=cancel)
+    cln.cancel_channel_funding = Mock()
 
     resolved = await manager.reconcile_all()
 
-    assert resolved == [record_id]
-    cln.cancel_channel_funding.assert_called_once_with("peer-a")
-    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+    assert resolved == []
+    cln.cancel_channel_funding.assert_not_called()
+    adapter.recover_release.assert_not_called()
+    assert journal.records()[0].id == record_id
 
 
 @pytest.mark.anyio
-async def test_recovery_does_not_cancel_unidentified_withheld_funding(
+async def test_recovery_does_not_cancel_withheld_funding(
     tmp_path: Path,
 ) -> None:
     journal = RecoveryJournal(tmp_path)
@@ -258,6 +256,7 @@ async def test_recovery_does_not_cancel_unidentified_withheld_funding(
         record_id,
         locked_outpoints=[("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
     )
 
     config = Mock(data_dir=tmp_path)
@@ -266,8 +265,17 @@ async def test_recovery_does_not_cancel_unidentified_withheld_funding(
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
     adapter.recover_release = Mock()
+    setattr(
+        adapter,
+        "require_wallet",
+        Mock(
+            return_value=SimpleNamespace(
+                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+            )
+        ),
+    )
     cln = cast(Any, manager.cln)
-    cln.get_funding_start_status = Mock(return_value=ChannelFundingStatus.WITHHELD)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.WITHHELD)
     cln.cancel_channel_funding = Mock()
 
     resolved = await manager.reconcile_all()
