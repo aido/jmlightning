@@ -21,6 +21,29 @@ def test_recovery_journal_is_atomic_and_mode_0600(tmp_path: Path) -> None:
     assert data[0]["id"] == record_id
 
 
+def test_recovery_journal_preserves_txid_after_successful_mutation(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("splice", {"channel_id": "channel"})
+    txid = "bb" * 32
+
+    journal.call(
+        record_id,
+        action="splice_signed",
+        phase="updated",
+        fn=lambda: "ok",
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={("aa" * 32, 0): "owner"},
+        psbt=b"psbt",
+        txid=txid,
+    )
+
+    record = journal.records()[0]
+    assert record.action is None
+    assert record.txid == txid
+
+
 def test_recovery_journal_keeps_pending_mutation_after_failure(tmp_path: Path) -> None:
     journal = RecoveryJournal(tmp_path)
     record_id = journal.create("splice", {"channel_id": "channel"})

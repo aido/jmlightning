@@ -610,6 +610,7 @@ class SpliceOperation:
                     locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                     psbt=splice_psbt,
+                    txid=txid,
                 )
             except Exception as exc:
                 raise SpliceRecoveryRequiredError(
