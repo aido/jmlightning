@@ -138,6 +138,36 @@ async def test_recovery_does_not_release_when_bitcoin_backend_has_tx(
 
 
 @pytest.mark.anyio
+async def test_recovery_does_not_auto_release_with_neutrino_backend(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    journal.create("open_channel", {"peer_id": "peer"})
+    record = journal.records()[0]
+    journal.update(
+        record.id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="neutrino")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.ABSENT)
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == []
+    adapter.recover_release.assert_not_called()
+    assert journal.records()[0].id == record.id
+
+
+@pytest.mark.anyio
 async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
     tmp_path: Path,
 ) -> None:

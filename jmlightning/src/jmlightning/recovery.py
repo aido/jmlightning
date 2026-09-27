@@ -341,19 +341,29 @@ class RecoveryManager:
         finally:
             self.journal.release_lifetime()
 
-    async def _bitcoin_has_transaction(self, txid: str) -> bool:
+    async def _bitcoin_has_transaction(self, txid: str) -> bool | None:
+        # Neutrino cannot establish transaction absence: its get_transaction()
+        # lookup is limited to transactions observed in the watched mempool and
+        # returns None for confirmed transactions as well as unknown ones.
+        # Treat an unknown result as indeterminate rather than releasing a
+        # reservation after a transaction was actually broadcast.
+        if self.adapter.config.backend_type == "neutrino":
+            return None
+
         transaction = await self.adapter.require_wallet().backend.get_transaction(txid)
-        # Wallet backends return None when the transaction is not known. A
-        # transaction object is sufficient evidence that the selected input
+        # A transaction object is sufficient evidence that the selected input
         # may already be spent; recovery therefore never releases it.
         return transaction is not None
 
     async def _reconcile(self, record: RecoveryRecord) -> bool:
         txid = record.txid
-        if txid is not None and await self._bitcoin_has_transaction(txid):
-            # A Bitcoin backend observation is authoritative enough to keep
-            # the reservation. Never release after broadcast.
-            return False
+        if txid is not None:
+            bitcoin_has_transaction = await self._bitcoin_has_transaction(txid)
+            if bitcoin_has_transaction is not False:
+                # A Bitcoin backend observation is either evidence that the
+                # transaction exists or that its absence cannot be established.
+                # In both cases, never release after an ambiguous broadcast.
+                return False
 
         status = await self._cln_status(record)
         if status is ChannelFundingStatus.BROADCAST:

@@ -415,6 +415,16 @@ def test_parse_cln_psbt_v2_preserves_metadata_and_txid_endianness() -> None:
         and record.value == b"splice metadata"
         for record in parsed.global_map.records
     )
+    assert any(
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-input"
+        and record.value == b"input metadata"
+        for record in parsed.input_maps[0].records
+    )
+    assert any(
+        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-output"
+        and record.value == b"output metadata"
+        for record in parsed.output_maps[0].records
+    )
 
 
 def test_txid_is_returned_in_big_endian_display_order() -> None:
