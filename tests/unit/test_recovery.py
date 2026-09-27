@@ -4,12 +4,16 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 
 from jmlightning.lightning.backend import ChannelFundingStatus
-from jmlightning.recovery import RecoveryJournal, RecoveryManager
+from jmlightning.recovery import (
+    RecoveryJournal,
+    RecoveryJournalBusyError,
+    RecoveryManager,
+)
 
 
 def test_recovery_journal_is_atomic_and_mode_0600(tmp_path: Path) -> None:
@@ -176,3 +180,39 @@ async def test_recovery_does_not_cancel_unidentified_withheld_funding(
     cln.cancel_channel_funding.assert_not_called()
     adapter.recover_release.assert_not_called()
     assert journal.records()[0].id == record_id
+
+
+def test_recovery_journal_lifetime_lock_is_exclusive(tmp_path: Path) -> None:
+    journal = RecoveryJournal(tmp_path)
+    contender = RecoveryJournal(tmp_path)
+
+    journal.acquire_lifetime()
+    try:
+        with pytest.raises(RecoveryJournalBusyError, match="owned by a live operation"):
+            contender.acquire_lifetime(nonblocking=True)
+    finally:
+        journal.release_lifetime()
+
+    contender.acquire_lifetime(nonblocking=True)
+    contender.release_lifetime()
+
+
+@pytest.mark.anyio
+async def test_recovery_refuses_live_operation(tmp_path: Path) -> None:
+    journal = RecoveryJournal(tmp_path)
+    journal.acquire_lifetime()
+    try:
+        config = Mock(data_dir=tmp_path)
+        manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+
+        with patch.object(
+            manager.adapter, "connect", new_callable=AsyncMock
+        ) as mock_connect:
+            with pytest.raises(
+                RecoveryJournalBusyError, match="owned by a live operation"
+            ):
+                await manager.reconcile_all()
+
+            mock_connect.assert_not_awaited()
+    finally:
+        journal.release_lifetime()

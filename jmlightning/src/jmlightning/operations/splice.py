@@ -81,7 +81,7 @@ class SpliceOperation:
         policy = PolicyEngine()
         planner = Planner()
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
-        recovery_id = recovery_journal.create(
+        recovery_id = recovery_journal.begin(
             "splice",
             {"channel_id": channel_id},
         )
@@ -720,37 +720,40 @@ class SpliceOperation:
             )
             raise
         finally:
-            await lifecycle.cleanup(
-                locked=locked,
-                adapter=jmadapter,
-                close_message="Failed to close JoinMarket wallet after splice",
-                unlock_message="Failed to unlock",
-            )
-
-            if lifecycle.cleanup_errors and operation_error is None:
-                logger.warning(
-                    "Splice completed successfully, but JoinMarket cleanup failed",
+            try:
+                await lifecycle.cleanup(
+                    locked=locked,
+                    adapter=jmadapter,
+                    close_message="Failed to close JoinMarket wallet after splice",
+                    unlock_message="Failed to unlock",
                 )
 
-            lifecycle.resolve_if_clean(
-                recovery_journal,
-                recovery_id,
-                terminal_phase=LifecyclePhase.SIGNED,
-            )
+                if lifecycle.cleanup_errors and operation_error is None:
+                    logger.warning(
+                        "Splice completed successfully, but JoinMarket cleanup failed",
+                    )
 
-            lifecycle.raise_recovery_if_needed(
-                operation_error,
-                SpliceRecoveryRequiredError,
-                lambda error: SpliceRecoveryRequiredError(
-                    "Channel splice failed and cleanup also failed; "
-                    "manual recovery is required",
-                    channel_id=channel_id,
-                    txid=txid,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                lifecycle.resolve_if_clean(
+                    recovery_journal,
+                    recovery_id,
+                    terminal_phase=LifecyclePhase.SIGNED,
+                )
+
+                lifecycle.raise_recovery_if_needed(
+                    operation_error,
+                    SpliceRecoveryRequiredError,
+                    lambda error: SpliceRecoveryRequiredError(
+                        "Channel splice failed and cleanup also failed; "
+                        "manual recovery is required",
+                        channel_id=channel_id,
+                        txid=txid,
+                        locked_outpoints=tuple(
+                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                        ),
                     ),
-                ),
-            )
+                )
+            finally:
+                recovery_journal.release_lifetime()
 
         if txid is None:
             raise RuntimeError("Splice completed without a transaction id")

@@ -75,7 +75,7 @@ class OpenChannelOperation:
         policy = PolicyEngine()
         planner = Planner()
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
-        recovery_id = recovery_journal.create(
+        recovery_id = recovery_journal.begin(
             "open_channel",
             {"peer_id": peer_id},
         )
@@ -600,43 +600,47 @@ class OpenChannelOperation:
             raise
 
         finally:
-            await lifecycle.cleanup(
-                locked=locked,
-                adapter=jmadapter,
-                close_message="Failed to close JoinMarket wallet after funding",
-                unlock_message="Failed to unlock",
-            )
-
-            if lifecycle.cleanup_errors and operation_error is None:
-                if lifecycle.phase is not LifecyclePhase.BROADCAST:
-                    raise OpenChannelRecoveryRequiredError(
-                        "Channel funding cleanup failed; manual recovery is required",
-                        peer_id=peer_id,
-                        txid=txid,
-                    ) from lifecycle.cleanup_errors[0]
-
-                logger.warning(
-                    "Funding transaction {} was broadcast successfully, "
-                    "but JoinMarket cleanup failed",
-                    txid,
+            try:
+                await lifecycle.cleanup(
+                    locked=locked,
+                    adapter=jmadapter,
+                    close_message="Failed to close JoinMarket wallet after funding",
+                    unlock_message="Failed to unlock",
                 )
 
-            lifecycle.resolve_if_clean(
-                recovery_journal,
-                recovery_id,
-                terminal_phase=LifecyclePhase.BROADCAST,
-            )
+                if lifecycle.cleanup_errors and operation_error is None:
+                    if lifecycle.phase is not LifecyclePhase.BROADCAST:
+                        raise OpenChannelRecoveryRequiredError(
+                            "Channel funding cleanup failed; "
+                            "manual recovery is required",
+                            peer_id=peer_id,
+                            txid=txid,
+                        ) from lifecycle.cleanup_errors[0]
 
-            lifecycle.raise_recovery_if_needed(
-                operation_error,
-                OpenChannelRecoveryRequiredError,
-                lambda error: OpenChannelRecoveryRequiredError(
-                    "Channel funding failed and cleanup also failed; "
-                    "manual recovery is required",
-                    peer_id=peer_id,
-                    txid=txid,
-                ),
-            )
+                    logger.warning(
+                        "Funding transaction {} was broadcast successfully, "
+                        "but JoinMarket cleanup failed",
+                        txid,
+                    )
+
+                lifecycle.resolve_if_clean(
+                    recovery_journal,
+                    recovery_id,
+                    terminal_phase=LifecyclePhase.BROADCAST,
+                )
+
+                lifecycle.raise_recovery_if_needed(
+                    operation_error,
+                    OpenChannelRecoveryRequiredError,
+                    lambda error: OpenChannelRecoveryRequiredError(
+                        "Channel funding failed and cleanup also failed; "
+                        "manual recovery is required",
+                        peer_id=peer_id,
+                        txid=txid,
+                    ),
+                )
+            finally:
+                recovery_journal.release_lifetime()
 
 
 def confirm_open_channel(

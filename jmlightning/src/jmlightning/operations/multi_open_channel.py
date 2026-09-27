@@ -68,7 +68,7 @@ class MultiOpenChannelOperation:
         policy = PolicyEngine()
         planner = Planner()
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
-        recovery_id = recovery_journal.create(
+        recovery_id = recovery_journal.begin(
             "multi_open_channel",
             {"peers": peer_ids},
         )
@@ -432,44 +432,47 @@ class MultiOpenChannelOperation:
             logger.error("Ah jaysus, failed to fund channels: {}", exc)
             raise
         finally:
-            await lifecycle.cleanup(
-                locked=locked,
-                adapter=jmadapter,
-                close_message="Failed to close JoinMarket wallet after funding",
-                unlock_message="Failed to unlock",
-            )
+            try:
+                await lifecycle.cleanup(
+                    locked=locked,
+                    adapter=jmadapter,
+                    close_message="Failed to close JoinMarket wallet after funding",
+                    unlock_message="Failed to unlock",
+                )
 
-            if lifecycle.cleanup_errors and operation_error is None:
-                if lifecycle.phase is not LifecyclePhase.BROADCAST:
-                    raise MultiOpenChannelRecoveryRequiredError(
-                        "Multi-channel funding cleanup failed; "
+                if lifecycle.cleanup_errors and operation_error is None:
+                    if lifecycle.phase is not LifecyclePhase.BROADCAST:
+                        raise MultiOpenChannelRecoveryRequiredError(
+                            "Multi-channel funding cleanup failed; "
+                            "manual recovery is required",
+                            peers=started,
+                            txid=txid,
+                        ) from lifecycle.cleanup_errors[0]
+
+                    logger.warning(
+                        "Funding transaction {} was broadcast successfully, "
+                        "but JoinMarket cleanup failed",
+                        txid,
+                    )
+
+                lifecycle.resolve_if_clean(
+                    recovery_journal,
+                    recovery_id,
+                    terminal_phase=LifecyclePhase.BROADCAST,
+                )
+
+                lifecycle.raise_recovery_if_needed(
+                    operation_error,
+                    MultiOpenChannelRecoveryRequiredError,
+                    lambda error: MultiOpenChannelRecoveryRequiredError(
+                        "Multi-channel funding failed and cleanup also failed; "
                         "manual recovery is required",
                         peers=started,
                         txid=txid,
-                    ) from lifecycle.cleanup_errors[0]
-
-                logger.warning(
-                    "Funding transaction {} was broadcast successfully, "
-                    "but JoinMarket cleanup failed",
-                    txid,
+                    ),
                 )
-
-            lifecycle.resolve_if_clean(
-                recovery_journal,
-                recovery_id,
-                terminal_phase=LifecyclePhase.BROADCAST,
-            )
-
-            lifecycle.raise_recovery_if_needed(
-                operation_error,
-                MultiOpenChannelRecoveryRequiredError,
-                lambda error: MultiOpenChannelRecoveryRequiredError(
-                    "Multi-channel funding failed and cleanup also failed; "
-                    "manual recovery is required",
-                    peers=started,
-                    txid=txid,
-                ),
-            )
+            finally:
+                recovery_journal.release_lifetime()
 
     @staticmethod
     def _cancel_started_channels(cln: CLNBackend, peers: list[str]) -> list[Exception]:

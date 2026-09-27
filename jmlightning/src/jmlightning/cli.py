@@ -40,7 +40,7 @@ from jmlightning.operations.splice import (
     SpliceOperation,
     confirm_splice_in,
 )
-from jmlightning.recovery import RecoveryManager
+from jmlightning.recovery import RecoveryJournalBusyError, RecoveryManager
 
 __all__ = ["app"]
 
@@ -455,9 +455,13 @@ def recover(
         amount=0,
         mixdepth=0,
     )
-    resolved_ids = asyncio.run(
-        RecoveryManager(config=config, cln_socket=cln_socket).reconcile_all()
-    )
+    try:
+        resolved_ids = asyncio.run(
+            RecoveryManager(config=config, cln_socket=cln_socket).reconcile_all()
+        )
+    except RecoveryJournalBusyError as exc:
+        logger.error("Cannot recover while a jm-lightning operation is active: {}", exc)
+        raise typer.Exit(1) from exc
     typer.echo(f"Resolved {len(resolved_ids)} recovery record(s).")
 
 

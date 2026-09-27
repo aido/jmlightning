@@ -23,6 +23,10 @@ if TYPE_CHECKING:
 JOURNAL_NAME = "recovery.json"
 
 
+class RecoveryJournalBusyError(RuntimeError):
+    """Raised when the recovery journal is owned by a live operation."""
+
+
 @dataclass
 class RecoveryRecord:
     id: str
@@ -84,9 +88,14 @@ class RecoveryJournal:
         self.path = data_dir / JOURNAL_NAME
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock_path = self.path.with_suffix(".lock")
+        self._lifetime_fd: int | None = None
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
+        if self._lifetime_fd is not None:
+            yield
+            return
+
         fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             os.fchmod(fd, 0o600)
@@ -94,6 +103,39 @@ class RecoveryJournal:
             yield
         finally:
             fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    def acquire_lifetime(self, *, nonblocking: bool = False) -> None:
+        """Own the journal lock for a complete recoverable lifecycle."""
+        if self._lifetime_fd is not None:
+            raise RuntimeError("Recovery journal lifetime lock is already held")
+
+        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            flags = fcntl.LOCK_EX
+            if nonblocking:
+                flags |= fcntl.LOCK_NB
+            try:
+                fcntl.flock(fd, flags)
+            except BlockingIOError as exc:
+                raise RecoveryJournalBusyError(
+                    "Recovery journal is owned by a live operation"
+                ) from exc
+            self._lifetime_fd = fd
+        except Exception:
+            os.close(fd)
+            raise
+
+    def release_lifetime(self) -> None:
+        """Release a lifetime journal lock owned by this journal instance."""
+        fd = self._lifetime_fd
+        if fd is None:
+            return
+        self._lifetime_fd = None
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
             os.close(fd)
 
     def _load(self) -> list[RecoveryRecord]:
@@ -131,6 +173,15 @@ class RecoveryJournal:
         finally:
             if os.path.exists(name):
                 os.unlink(name)
+
+    def begin(self, operation: str, identity: dict[str, Any]) -> str:
+        """Create a recovery record while taking lifetime ownership."""
+        self.acquire_lifetime()
+        try:
+            return self.create(operation, identity)
+        except Exception:
+            self.release_lifetime()
+            raise
 
     def create(self, operation: str, identity: dict[str, Any]) -> str:
         record = RecoveryRecord(
@@ -240,22 +291,26 @@ class RecoveryManager:
         self.cln = CLNBackend(str(cln_socket))
 
     async def reconcile_all(self) -> list[str]:
-        records = self.journal.records()
-        if not records:
-            return []
-        await self.adapter.connect()
-        resolved: list[str] = []
+        self.journal.acquire_lifetime(nonblocking=True)
         try:
-            for record in records:
-                if record.status == "resolved":
-                    self.journal.resolve(record.id)
-                    continue
-                if await self._reconcile(record):
-                    self.journal.resolve(record.id)
-                    resolved.append(record.id)
+            records = self.journal.records()
+            if not records:
+                return []
+            await self.adapter.connect()
+            resolved: list[str] = []
+            try:
+                for record in records:
+                    if record.status == "resolved":
+                        self.journal.resolve(record.id)
+                        continue
+                    if await self._reconcile(record):
+                        self.journal.resolve(record.id)
+                        resolved.append(record.id)
+            finally:
+                await self.adapter.close()
+            return resolved
         finally:
-            await self.adapter.close()
-        return resolved
+            self.journal.release_lifetime()
 
     async def _bitcoin_has_transaction(self, txid: str) -> bool:
         transaction = await self.adapter.require_wallet().backend.get_transaction(txid)
