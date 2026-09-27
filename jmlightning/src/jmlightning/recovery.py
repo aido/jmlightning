@@ -365,7 +365,9 @@ class RecoveryManager:
                 phase=record.phase,
                 locked_outpoints=record.locked_outpoints,
                 owner_tokens={
-                    (txid_text, int(vout_text)): owner,
+                    (owner_txid, int(owner_vout)): owner_token
+                    for owner_key, owner_token in record.owner_tokens.items()
+                    for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
                 },
                 psbt=(
                     base64.b64decode(record.psbt) if record.psbt is not None else None

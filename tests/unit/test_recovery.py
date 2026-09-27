@@ -153,6 +153,52 @@ async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
 
 
 @pytest.mark.anyio
+async def test_recovery_keeps_all_owner_tokens_across_partial_release(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    first = "aa" * 32
+    second = "bb" * 32
+    journal.update(
+        record_id,
+        locked_outpoints=[(first, 0), (second, 1)],
+        owner_tokens={
+            f"{first}:0": "owner-a",
+            f"{second}:1": "owner-b",
+        },
+        txid="cc" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path)
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    setattr(
+        adapter,
+        "require_wallet",
+        Mock(
+            return_value=SimpleNamespace(
+                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+            )
+        ),
+    )
+    adapter.recover_release = Mock(side_effect=[None, RuntimeError("release failed")])
+    cln = cast(Any, manager.cln)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.ABSENT)
+
+    with pytest.raises(RuntimeError, match="release failed"):
+        await manager.reconcile_all()
+
+    record = journal.records()[0]
+    assert record.owner_tokens == {
+        f"{first}:0": "owner-a",
+        f"{second}:1": "owner-b",
+    }
+
+
+@pytest.mark.anyio
 async def test_recovery_does_not_cancel_unidentified_withheld_funding(
     tmp_path: Path,
 ) -> None:
