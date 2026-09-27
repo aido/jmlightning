@@ -18,16 +18,26 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_FALLBACK_LOCKTIME,
+    PSBT_GLOBAL_INPUT_COUNT,
+    PSBT_GLOBAL_OUTPUT_COUNT,
+    PSBT_GLOBAL_TX_MODIFIABLE,
+    PSBT_GLOBAL_TX_VERSION,
     PSBT_GLOBAL_UNSIGNED_TX,
     PSBT_GLOBAL_VERSION,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTWITNESS,
     PSBT_IN_NON_WITNESS_UTXO,
+    PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PREVIOUS_TXID,
     PSBT_IN_PROPRIETARY,
+    PSBT_IN_SEQUENCE,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
     PSBT_MAGIC,
+    PSBT_OUT_AMOUNT,
+    PSBT_OUT_SCRIPT,
     ParsedPSBT,
     PSBTKeyValue,
     PSBTMap,
@@ -37,19 +47,8 @@ from jmwallet.wallet.signing import sign_p2wpkh_input
 
 from jmlightning.lightning.cln import (
     CLN_PSBT_SERIAL_ID_KEY,
-    PSBT_GLOBAL_FALLBACK_LOCKTIME,
-    PSBT_GLOBAL_INPUT_COUNT,
-    PSBT_GLOBAL_OUTPUT_COUNT,
-    PSBT_GLOBAL_TX_MODIFIABLE,
-    PSBT_GLOBAL_TX_VERSION,
-    PSBT_IN_OUTPUT_INDEX,
-    PSBT_IN_PREVIOUS_TXID,
-    PSBT_IN_SEQUENCE,
-    PSBT_OUT_AMOUNT,
-    PSBT_OUT_SCRIPT,
     _input_weight,
     new_serial_id,
-    normalise_psbt_v2_to_v0,
 )
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.planner import ExecutionPlan, FundingOutput, Planner
@@ -170,7 +169,12 @@ def _build_cln_splice_psbt_v2() -> bytes:
     )
     input_map = psbt_map(
         [
-            (bytes([PSBT_IN_PREVIOUS_TXID]), bytes.fromhex("11" * 32)),
+            (
+                bytes([PSBT_IN_PREVIOUS_TXID]),
+                bytes.fromhex(
+                    "ffeeddccbbaa99887766554433221100ffeeddccbbaa99887766554433221100"
+                ),
+            ),
             (bytes([PSBT_IN_OUTPUT_INDEX]), (1).to_bytes(4, "little")),
             (bytes([PSBT_IN_SEQUENCE]), (0xFFFFFFFE).to_bytes(4, "little")),
             (
@@ -399,49 +403,39 @@ def test_cln_input_weight_rejects_non_witness_utxo_with_missing_output() -> None
         _input_weight(parsed, 0)
 
 
-def test_normalise_cln_psbt_v2_to_v0_preserves_metadata() -> None:
-    normalised = normalise_psbt_v2_to_v0(_build_cln_splice_psbt_v2())
-    parsed = parse_psbt(normalised)
+def test_parse_cln_psbt_v2_preserves_metadata_and_txid_endianness() -> None:
+    parsed = parse_psbt(_build_cln_splice_psbt_v2())
 
-    assert parsed.transaction.version == 2
-    assert parsed.transaction.locktime == 0
-    assert len(parsed.transaction.inputs) == 1
-    assert parsed.transaction.inputs[0].txid == "11" * 32
-    assert parsed.transaction.inputs[0].vout == 1
-    assert parsed.transaction.inputs[0].sequence == 0xFFFFFFFE
-    assert len(parsed.transaction.outputs) == 1
-    assert parsed.transaction.outputs[0].value == 199_847
-    assert parsed.transaction.outputs[0].script == b"\x00\x14" + b"\x33" * 20
-
+    assert parsed.version == 2
+    assert parsed.transaction.inputs[0].txid == (
+        "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+    )
     assert any(
         record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-global"
         and record.value == b"splice metadata"
         for record in parsed.global_map.records
     )
-    assert any(
-        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-input"
-        and record.value == b"input metadata"
-        for record in parsed.input_maps[0].records
-    )
-    assert any(
-        record.key == bytes([PSBT_IN_PROPRIETARY]) + b"cln-output"
-        and record.value == b"output metadata"
-        for record in parsed.output_maps[0].records
-    )
-    assert not any(
-        record.key == bytes([PSBT_GLOBAL_TX_MODIFIABLE])
-        for record in parsed.global_map.records
-    )
-    assert not any(
-        record.key == bytes([PSBT_GLOBAL_VERSION])
-        for record in parsed.global_map.records
-    )
 
 
-def test_normalise_psbt_v0_is_unchanged() -> None:
-    psbt = _build_splice_psbt()
+def test_txid_is_returned_in_big_endian_display_order() -> None:
+    builder = TxBuilder()
+    tx = ParsedTransaction(
+        version=2,
+        inputs=[
+            TxInput.from_hex(
+                txid="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                vout=0,
+                sequence=0xFFFFFFFF,
+            )
+        ],
+        outputs=[TxOutput(value=1_000, script=b"\x00\x14" + b"\x11" * 20)],
+        witnesses=[[]],
+        locktime=0,
+        has_witness=False,
+    )
 
-    assert normalise_psbt_v2_to_v0(psbt) == psbt
+    txid = builder._txid(tx)
+    assert txid == "9fdb136fcd039066632f8380ff533febcd6b7efb81cfce7083030b567b3426bb"
 
 
 def test_estimate_splice_fee_matches_cln_weight_for_channel_psbt() -> None:

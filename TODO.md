@@ -13,5 +13,5 @@
 - [x] Consolidate duplicated operation lifecycle code where practical.
 - [x] Simplify the `TxBuilder` compatibility layer where supported.
 - [ ] Release engineering hardening.
-- [ ] Remove workaround for lack of PSBTv2 (BIP370) support in jmwallet (see joinmarket-ng/joinmarket-ng#634).
+- [x] Remove workaround for lack of PSBTv2 (BIP370) support in jmwallet (see joinmarket-ng/joinmarket-ng#634).
 - [x] Remove workaround for jmwallet interpreting every P2WSH input as a JoinMarket fidelity bond (see joinmarket-ng/joinmarket-ng#635).

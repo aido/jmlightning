@@ -18,14 +18,24 @@ from jmcore.bitcoin import (
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
+    PSBT_GLOBAL_INPUT_COUNT,
+    PSBT_GLOBAL_OUTPUT_COUNT,
+    PSBT_GLOBAL_TX_MODIFIABLE,
     PSBT_GLOBAL_UNSIGNED_TX,
     PSBT_IN_BIP32_DERIVATION,
     PSBT_IN_FINAL_SCRIPTSIG,
     PSBT_IN_FINAL_SCRIPTWITNESS,
     PSBT_IN_NON_WITNESS_UTXO,
+    PSBT_IN_OUTPUT_INDEX,
     PSBT_IN_PARTIAL_SIG,
+    PSBT_IN_PREVIOUS_TXID,
+    PSBT_IN_SEQUENCE,
     PSBT_IN_SIGHASH_TYPE,
     PSBT_IN_WITNESS_UTXO,
+    PSBT_OUT_AMOUNT,
+    PSBT_OUT_SCRIPT,
+    TX_MODIFIABLE_INPUTS,
+    TX_MODIFIABLE_OUTPUTS,
     ParsedPSBT,
     PSBTError,
     PSBTKeyValue,
@@ -344,7 +354,6 @@ class TxBuilder:
             raise ValueError("Splice-in plan does not match the selected input")
 
         try:
-            psbt = cln_compat.normalise_psbt_v2_to_v0(psbt)
             parsed = parse_psbt(psbt)
             previous_transaction = parse_transaction_bytes(prev_tx)
         except (PSBTError, ValueError) as exc:
@@ -473,6 +482,21 @@ class TxBuilder:
             + actual_script
         )
         new_input_map = PSBTMap()
+        if parsed.version == 2:
+            # BIP370 stores the prevout txid in wire-order (little-endian).
+            # ClassifiedUTXO.txid is the RPC/display big-endian form.
+            new_input_map.append(
+                bytes([PSBT_IN_PREVIOUS_TXID]),
+                bytes.fromhex(coin.utxo.txid)[::-1],
+            )
+            new_input_map.append(
+                bytes([PSBT_IN_OUTPUT_INDEX]),
+                coin.utxo.vout.to_bytes(4, "little"),
+            )
+            new_input_map.append(
+                bytes([PSBT_IN_SEQUENCE]),
+                (0xFFFFFFFF).to_bytes(4, "little"),
+            )
         new_input_map.append(
             bytes([PSBT_IN_NON_WITNESS_UTXO]),
             prev_tx,
@@ -501,27 +525,53 @@ class TxBuilder:
         if change_output is not None:
             assert change_serial_id is not None
             change_map = PSBTMap()
+            if parsed.version == 2:
+                change_map.append(
+                    bytes([PSBT_OUT_AMOUNT]),
+                    change_output.value.to_bytes(8, "little"),
+                )
+                change_map.append(
+                    bytes([PSBT_OUT_SCRIPT]),
+                    change_output.script,
+                )
             change_map.append(
                 cln_compat.CLN_PSBT_SERIAL_ID_KEY,
                 change_serial_id.to_bytes(8, "big"),
             )
             parsed.output_maps.append(change_map)
 
-        unsigned_tx = serialize_transaction(
-            parsed.transaction.version,
-            parsed.transaction.inputs,
-            parsed.transaction.outputs,
-            parsed.transaction.locktime,
-        )
-        for index, record in enumerate(parsed.global_map.records):
-            if record.key == bytes([PSBT_GLOBAL_UNSIGNED_TX]):
-                parsed.global_map.records[index] = PSBTKeyValue(
-                    key=record.key,
-                    value=unsigned_tx,
-                )
-                break
+        if parsed.version == 2:
+            for global_key, value in (
+                (PSBT_GLOBAL_INPUT_COUNT, encode_varint(len(parsed.input_maps))),
+                (PSBT_GLOBAL_OUTPUT_COUNT, encode_varint(len(parsed.output_maps))),
+            ):
+                for index, record in enumerate(parsed.global_map.records):
+                    if record.key == bytes([global_key]):
+                        parsed.global_map.records[index] = PSBTKeyValue(
+                            key=record.key,
+                            value=value,
+                        )
+                        break
+                else:
+                    raise RuntimeError(
+                        f"Splice PSBT is missing PSBT_GLOBAL key 0x{global_key:02x}"
+                    )
         else:
-            raise RuntimeError("Splice PSBT is missing the unsigned transaction")
+            unsigned_tx = serialize_transaction(
+                parsed.transaction.version,
+                parsed.transaction.inputs,
+                parsed.transaction.outputs,
+                parsed.transaction.locktime,
+            )
+            for index, record in enumerate(parsed.global_map.records):
+                if record.key == bytes([PSBT_GLOBAL_UNSIGNED_TX]):
+                    parsed.global_map.records[index] = PSBTKeyValue(
+                        key=record.key,
+                        value=unsigned_tx,
+                    )
+                    break
+            else:
+                raise RuntimeError("Splice PSBT is missing the unsigned transaction")
 
         contribution = SpliceContribution(
             jm_outpoint=coin_outpoint,
@@ -569,7 +619,7 @@ class TxBuilder:
     ) -> None:
         """Validate immutable splice economics before JoinMarket signing."""
         try:
-            parsed = parse_psbt(cln_compat.normalise_psbt_v2_to_v0(psbt))
+            parsed = parse_psbt(psbt)
         except (PSBTError, ValueError) as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
 
@@ -727,7 +777,7 @@ class TxBuilder:
     ) -> int:
         """Find the approved JoinMarket input in a negotiated splice PSBT."""
         try:
-            parsed_psbt = parse_psbt(cln_compat.normalise_psbt_v2_to_v0(psbt))
+            parsed_psbt = parse_psbt(psbt)
         except PSBTError as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
 
@@ -765,7 +815,6 @@ class TxBuilder:
         metadata and signatures on non-JM inputs are preserved.
         """
         try:
-            psbt = cln_compat.normalise_psbt_v2_to_v0(psbt)
             parsed_psbt = parse_psbt(psbt)
         except PSBTError as exc:
             raise RuntimeError("Invalid splice PSBT") from exc
@@ -921,18 +970,51 @@ class TxBuilder:
                 "JoinMarket wallet returned a PSBT for a different transaction"
             )
 
-        # sign_psbt() is allowed to add partial signatures, but no other
-        # PSBT data may change after the transaction was reviewed. This keeps
-        # the wallet signing boundary tied to the exact inputs and outputs
-        # that were presented to it.
+        # sign_psbt() is allowed to add partial signatures. For BIP370 PSBTs,
+        # the wallet is also required to clear the input/output modification
+        # flags after producing SIGHASH_ALL signatures. No other PSBT data may
+        # change after the transaction was reviewed.
         source_parsed_psbt = parse_psbt(unsigned_psbt)
-        if (
-            signed_parsed_psbt.global_map.records
-            != source_parsed_psbt.global_map.records
-        ):
-            raise RuntimeError(
-                "JoinMarket wallet changed PSBT global metadata while signing"
-            )
+        source_global = source_parsed_psbt.global_map.records
+        signed_global = signed_parsed_psbt.global_map.records
+        if source_global != signed_global:
+            if signed_parsed_psbt.version != 2:
+                raise RuntimeError(
+                    "JoinMarket wallet changed PSBT global metadata while signing"
+                )
+
+            if len(source_global) != len(signed_global):
+                raise RuntimeError(
+                    "JoinMarket wallet changed PSBT global metadata while signing"
+                )
+
+            for source_record, signed_record in zip(
+                source_global,
+                signed_global,
+                strict=True,
+            ):
+                if source_record.key != signed_record.key:
+                    raise RuntimeError(
+                        "JoinMarket wallet changed PSBT global metadata while signing"
+                    )
+                if source_record.key != bytes([PSBT_GLOBAL_TX_MODIFIABLE]):
+                    if source_record.value != signed_record.value:
+                        raise RuntimeError(
+                            "JoinMarket wallet changed PSBT "
+                            "global metadata while signing"
+                        )
+                    continue
+
+                if (
+                    len(source_record.value) != 1
+                    or len(signed_record.value) != 1
+                    or signed_record.value[0]
+                    != source_record.value[0]
+                    & ~(TX_MODIFIABLE_INPUTS | TX_MODIFIABLE_OUTPUTS)
+                ):
+                    raise RuntimeError(
+                        "JoinMarket wallet changed PSBT global metadata while signing"
+                    )
         if signed_parsed_psbt.output_maps != source_parsed_psbt.output_maps:
             raise RuntimeError(
                 "JoinMarket wallet changed PSBT output metadata while signing"
