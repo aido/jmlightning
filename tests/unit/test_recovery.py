@@ -199,6 +199,56 @@ async def test_recovery_keeps_all_owner_tokens_across_partial_release(
 
 
 @pytest.mark.anyio
+async def test_multi_open_recovery_only_cancels_withheld_recorded_funding(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("multi_open_channel", {"peers": ["peer-a", "peer-b"]})
+    txid = "bb" * 32
+    journal.update(
+        record_id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid=txid,
+    )
+
+    config = Mock(data_dir=tmp_path)
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    setattr(
+        adapter,
+        "require_wallet",
+        Mock(
+            return_value=SimpleNamespace(
+                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+            )
+        ),
+    )
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    statuses = {
+        "peer-a": ChannelFundingStatus.WITHHELD,
+        "peer-b": ChannelFundingStatus.ABSENT,
+    }
+    cln.get_channel_funding_status = Mock(
+        side_effect=lambda peer_id, _txid: statuses[peer_id]
+    )
+
+    def cancel(peer_id: str) -> None:
+        statuses[peer_id] = ChannelFundingStatus.ABSENT
+
+    cln.cancel_channel_funding = Mock(side_effect=cancel)
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == [record_id]
+    cln.cancel_channel_funding.assert_called_once_with("peer-a")
+    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+
+
+@pytest.mark.anyio
 async def test_recovery_does_not_cancel_unidentified_withheld_funding(
     tmp_path: Path,
 ) -> None:

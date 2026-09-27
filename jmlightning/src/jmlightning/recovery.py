@@ -340,7 +340,15 @@ class RecoveryManager:
             if txid is None:
                 return False
 
-            await self._cancel(record)
+            statuses = await self._peer_statuses(record)
+            await self._cancel(
+                record,
+                [
+                    peer_id
+                    for peer_id, peer_status in statuses.items()
+                    if peer_status is ChannelFundingStatus.WITHHELD
+                ],
+            )
             status = await self._cln_status(record)
             if status is not ChannelFundingStatus.ABSENT:
                 return False
@@ -377,6 +385,25 @@ class RecoveryManager:
             self.adapter.recover_release((txid_text, int(vout_text)), owner)
         return True
 
+    async def _peer_statuses(
+        self, record: RecoveryRecord
+    ) -> dict[str, ChannelFundingStatus]:
+        identity = record.identity
+        peers = identity.get("peers")
+        if peers is None:
+            peer_id = identity.get("peer_id")
+            peers = [peer_id] if isinstance(peer_id, str) else []
+        if not isinstance(peers, list) or not all(isinstance(p, str) for p in peers):
+            raise RuntimeError("Recovery record has invalid peer ids")
+        if record.txid is not None:
+            return {
+                peer_id: self.cln.get_channel_funding_status(peer_id, record.txid)
+                for peer_id in peers
+            }
+        return {
+            peer_id: self.cln.get_funding_start_status(peer_id) for peer_id in peers
+        }
+
     async def _cln_status(self, record: RecoveryRecord) -> ChannelFundingStatus:
         from jmlightning.lightning.backend import ChannelFundingStatus
 
@@ -389,32 +416,14 @@ class RecoveryManager:
                 return self.cln.get_splice_funding_status(channel_id)
             return self.cln.get_channel_funding_status(channel_id, record.txid)
 
-        peers = identity.get("peers")
-        if peers is None:
-            peer_id = identity.get("peer_id")
-            peers = [peer_id] if isinstance(peer_id, str) else []
-        if not isinstance(peers, list) or not all(isinstance(p, str) for p in peers):
-            raise RuntimeError("Recovery record has invalid peer ids")
-        statuses = (
-            [
-                self.cln.get_channel_funding_status(peer_id, record.txid)
-                for peer_id in peers
-            ]
-            if record.txid is not None
-            else [self.cln.get_funding_start_status(peer_id) for peer_id in peers]
-        )
+        statuses = (await self._peer_statuses(record)).values()
         if any(status is ChannelFundingStatus.BROADCAST for status in statuses):
             return ChannelFundingStatus.BROADCAST
         if any(status is ChannelFundingStatus.WITHHELD for status in statuses):
             return ChannelFundingStatus.WITHHELD
         return ChannelFundingStatus.ABSENT
 
-    async def _cancel(self, record: RecoveryRecord) -> None:
-        identity = record.identity
-        peers = identity.get("peers")
-        if peers is None:
-            peer_id = identity.get("peer_id")
-            peers = [peer_id] if isinstance(peer_id, str) else []
+    async def _cancel(self, record: RecoveryRecord, peers: list[str]) -> None:
         for peer_id in peers:
             if not isinstance(peer_id, str):
                 raise RuntimeError("Recovery record has invalid peer ids")
