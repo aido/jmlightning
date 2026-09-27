@@ -1,6 +1,6 @@
 from collections import Counter
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from jmcore.bitcoin import (
     BIP32Derivation,
@@ -10,7 +10,6 @@ from jmcore.bitcoin import (
     TxOutput,
     create_p2wpkh_script_code,
     create_psbt,
-    decode_varint,
     encode_varint,
     hash256,
     parse_derivation_path,
@@ -797,19 +796,7 @@ class TxBuilder:
                 parsed_psbt, index, signing_inputs[index]
             )
 
-        # jmwallet's PSBT signer validates every P2WSH input as a JoinMarket
-        # fidelity bond. A splice PSBT also contains CLN's channel funding
-        # input, which is a P2WSH 2-of-2 output and is not a JoinMarket input.
-        #
-        # Sign against a temporary PSBT where non-JM P2WSH witness_utxos are
-        # represented as unowned P2WPKH outputs. The BIP143 sighash for the JM
-        # P2WPKH input does not commit to the other inputs' prevout scripts or
-        # amounts. The original PSBT is retained and only the returned JM
-        # partial signatures are merged back into it.
-        signing_psbt = self._sanitise_splice_signing_psbt(
-            parsed_psbt,
-            signing_inputs,
-        )
+        signing_psbt = parsed_psbt.serialize()
 
         _signed_tx, txid, signed_signing_psbt = self._sign_psbt(
             unsigned_psbt=signing_psbt,
@@ -843,53 +830,6 @@ class TxBuilder:
 
         signed_psbt = parsed_psbt.serialize()
         return parsed_psbt.transaction, txid, signed_psbt
-
-    def _sanitise_splice_signing_psbt(
-        self,
-        parsed_psbt: ParsedPSBT,
-        signing_inputs: Mapping[int, ClassifiedUTXO],
-    ) -> bytes:
-        """Build the restricted PSBT presented to jmwallet for signing.
-
-        jmwallet validates every P2WSH input as a fidelity bond during
-        PSBT review. A CLN splice necessarily contains the channel's P2WSH
-        funding input, so that input must not be interpreted as a JoinMarket
-        fidelity bond. Only the approved JoinMarket inputs are allowed to
-        retain their real UTXO metadata in the signing PSBT.
-        """
-        signing_psbt = parse_psbt(parsed_psbt.serialize())
-
-        dummy_script = b"\x00\x14" + b"\x00" * 20
-        for index, input_map in enumerate(signing_psbt.input_maps):
-            if index in signing_inputs:
-                continue
-
-            for record_index, record in enumerate(input_map.records):
-                if record.key[:1] != bytes([PSBT_IN_WITNESS_UTXO]):
-                    continue
-
-                if len(record.value) < 9:
-                    raise RuntimeError(
-                        f"Splice signing input {index} has an invalid witness UTXO"
-                    )
-                script_length, offset = decode_varint(record.value, 8)
-                if offset + script_length != len(record.value):
-                    raise RuntimeError(
-                        f"Splice signing input {index} has an invalid witness UTXO"
-                    )
-
-                script = record.value[offset:]
-                if not script.startswith(b"\x00\x20"):
-                    break
-
-                value = record.value[:8]
-                input_map.records[record_index] = replace(
-                    record,
-                    value=value + bytes([len(dummy_script)]) + dummy_script,
-                )
-                break
-
-        return signing_psbt.serialize()
 
     def _build_and_sign_tx(
         self,
