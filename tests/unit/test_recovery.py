@@ -25,6 +25,32 @@ def test_recovery_journal_is_atomic_and_mode_0600(tmp_path: Path) -> None:
     assert data[0]["id"] == record_id
 
 
+def test_recovery_journal_rejects_non_object_record(tmp_path: Path) -> None:
+    journal = RecoveryJournal(tmp_path)
+    journal.path.write_text(json.dumps(["not-a-record"]))
+
+    with pytest.raises(RuntimeError, match="Recovery journal .* is invalid"):
+        journal.records()
+
+
+def test_recovery_journal_rejects_malformed_outpoint(tmp_path: Path) -> None:
+    journal = RecoveryJournal(tmp_path)
+    journal.path.write_text(
+        json.dumps(
+            [
+                {
+                    "id": "record",
+                    "operation": "open_channel",
+                    "locked_outpoints": [["aa" * 32]],
+                }
+            ]
+        )
+    )
+
+    with pytest.raises(RuntimeError, match="Recovery journal .* is invalid"):
+        journal.records()
+
+
 def test_recovery_journal_preserves_txid_after_successful_mutation(
     tmp_path: Path,
 ) -> None:

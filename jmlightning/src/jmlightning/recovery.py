@@ -59,24 +59,52 @@ class RecoveryRecord:
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> RecoveryRecord:
         raw_outpoints = value.get("locked_outpoints", [])
-        outpoints = [
-            (str(item[0]), int(item[1]))
-            for item in raw_outpoints
-            if isinstance(item, list) and len(item) == 2
-        ]
+        if not isinstance(raw_outpoints, list):
+            raise ValueError("locked_outpoints must be a list")
+
+        outpoints: list[tuple[str, int]] = []
+        for item in raw_outpoints:
+            if (
+                not isinstance(item, list)
+                or len(item) != 2
+                or not isinstance(item[0], str)
+                or not isinstance(item[1], int)
+                or isinstance(item[1], bool)
+            ):
+                raise ValueError("invalid locked_outpoints entry")
+            outpoints.append((item[0], item[1]))
+
+        identity = value.get("identity", {})
+        if not isinstance(identity, dict):
+            raise ValueError("identity must be an object")
+
+        owner_tokens = value.get("owner_tokens", {})
+        if not isinstance(owner_tokens, dict):
+            raise ValueError("owner_tokens must be an object")
+
+        action = value.get("action")
+        if action is not None and not isinstance(action, str):
+            raise ValueError("action must be a string or null")
+
+        psbt = value.get("psbt")
+        if psbt is not None and not isinstance(psbt, str):
+            raise ValueError("psbt must be a string or null")
+
+        txid = value.get("txid")
+        if txid is not None and not isinstance(txid, str):
+            raise ValueError("txid must be a string or null")
+
         return cls(
             id=str(value["id"]),
             operation=str(value["operation"]),
-            identity=dict(value.get("identity", {})),
+            identity=identity,
             phase=str(value.get("phase", "unknown")),
-            action=value.get("action"),
+            action=action,
             status=str(value.get("status", "pending")),
             locked_outpoints=outpoints,
-            owner_tokens={
-                str(k): str(v) for k, v in value.get("owner_tokens", {}).items()
-            },
-            psbt=value.get("psbt"),
-            txid=value.get("txid"),
+            owner_tokens={str(k): str(v) for k, v in owner_tokens.items()},
+            psbt=psbt,
+            txid=txid,
             updated_at=str(value.get("updated_at", "")),
         )
 
@@ -145,11 +173,12 @@ class RecoveryJournal:
             raw = json.loads(self.path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
             raise RuntimeError(f"Unable to read recovery journal {self.path}") from exc
-        if not isinstance(raw, list):
+        if not isinstance(raw, list) or not all(isinstance(item, dict) for item in raw):
             raise RuntimeError(f"Recovery journal {self.path} is invalid")
-        return [
-            RecoveryRecord.from_dict(item) for item in raw if isinstance(item, dict)
-        ]
+        try:
+            return [RecoveryRecord.from_dict(item) for item in raw]
+        except (KeyError, TypeError, ValueError) as exc:
+            raise RuntimeError(f"Recovery journal {self.path} is invalid") from exc
 
     def _write(self, records: list[RecoveryRecord]) -> None:
         payload = json.dumps(
