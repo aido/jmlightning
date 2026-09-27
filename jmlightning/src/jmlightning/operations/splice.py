@@ -659,6 +659,18 @@ class SpliceOperation:
                     ),
                 )
 
+            if returned_txid != txid:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_signed returned a transaction id that does not "
+                    "match the signed JoinMarket transaction; "
+                    "JoinMarket UTXO remains locked for recovery",
+                    channel_id=channel_id,
+                    txid=txid,
+                    locked_outpoints=tuple(
+                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                    ),
+                )
+
             txid = returned_txid
 
             try:

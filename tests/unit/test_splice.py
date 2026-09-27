@@ -69,7 +69,7 @@ def _build_splice_test_doubles() -> tuple[
     }
     cln.splice_signed.return_value = {
         "tx": "02000000",
-        "txid": "22" * 32,
+        "txid": "33" * 32,
         "psbt": "c2lnbmVkLXBzYnQ=",
     }
 
@@ -351,7 +351,7 @@ async def test_confirmation_happens_before_splice_signed() -> None:
         return {
             "psbt": "c2lnbmVkLXBzYnQ=",
             "tx": "02000000",
-            "txid": "22" * 32,
+            "txid": "33" * 32,
         }
 
     cln.splice_signed.side_effect = splice_signed
@@ -531,6 +531,33 @@ async def test_splice_signed_failure_requires_recovery() -> None:
 
 
 @pytest.mark.anyio
+async def test_splice_signed_mismatched_txid_requires_recovery() -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+    cln.splice_signed.return_value = {
+        "tx": "02000000",
+        "txid": "44" * 32,
+        "psbt": "c2lnbmVkLXBzYnQ=",
+    }
+
+    patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
+    with patches[0], patches[1], patches[2], patches[3]:
+        operation = SpliceOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+
+        with pytest.raises(
+            SpliceRecoveryRequiredError,
+            match="transaction id that does not match",
+        ) as exc_info:
+            await operation.execute("22" * 32)
+
+    assert exc_info.value.txid == "33" * 32
+    jmadapter.unlock.assert_not_called()
+    jmadapter.close.assert_awaited_once()
+
+
+@pytest.mark.anyio
 async def test_splice_signed_invalid_transaction_requires_recovery() -> None:
     config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
     cln.splice_signed.return_value = {
@@ -548,7 +575,8 @@ async def test_splice_signed_invalid_transaction_requires_recovery() -> None:
 
         with pytest.raises(
             SpliceRecoveryRequiredError,
-            match="invalid transaction encoding",
+            match="CLN splice_signed returned a transaction id that "
+            "does not match the signed JoinMarket transaction",
         ):
             await operation.execute("22" * 32)
 
