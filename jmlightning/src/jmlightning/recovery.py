@@ -404,9 +404,58 @@ class RecoveryManager:
 
         return False
 
+    async def _bitcoin_transaction_confirmed(self, txid: str) -> bool | None:
+        if self.adapter.config.backend_type == "neutrino":
+            return None
+        transaction = await self.adapter.require_wallet().backend.get_transaction(txid)
+        if transaction is None:
+            return None
+        status = getattr(transaction, "status", None)
+        confirmed = getattr(status, "confirmed", None)
+        return confirmed if isinstance(confirmed, bool) else None
+
     async def _reconcile(self, record: RecoveryRecord) -> bool:
         txid = record.txid
-        if txid is not None:
+        if record.operation == "peerswap":
+            # A txsend call which has not reached after_mutation is inherently
+            # ambiguous: a broadcast RPC failure or process crash cannot prove
+            # that no transaction reached the network. Never release that
+            # reservation automatically.
+            if record.action is not None or record.phase != "broadcast" or txid is None:
+                return False
+            confirmed = await self._bitcoin_transaction_confirmed(txid)
+            if confirmed is not True:
+                return False
+
+            if set(record.owner_tokens) != {
+                f"{out_txid}:{vout}" for out_txid, vout in record.locked_outpoints
+            }:
+                raise RuntimeError(
+                    "Recovery record is missing an owner token for a locked outpoint"
+                )
+            for key, owner in record.owner_tokens.items():
+                out_txid, vout_text = key.rsplit(":", 1)
+                self.journal.before_mutation(
+                    record.id,
+                    action="recovery_release",
+                    phase=record.phase,
+                    locked_outpoints=record.locked_outpoints,
+                    owner_tokens={
+                        (owner_txid, int(owner_vout)): owner_token
+                        for owner_key, owner_token in record.owner_tokens.items()
+                        for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
+                    },
+                    psbt=(
+                        base64.b64decode(record.psbt)
+                        if record.psbt is not None
+                        else None
+                    ),
+                    txid=record.txid,
+                )
+                self.adapter.recover_release((out_txid, int(vout_text)), owner)
+            return True
+
+        if txid is not None and record.operation != "peerswap":
             bitcoin_has_transaction = await self._bitcoin_has_transaction(record, txid)
             if bitcoin_has_transaction is not False:
                 # A Bitcoin backend observation is either evidence that the

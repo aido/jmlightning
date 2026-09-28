@@ -398,6 +398,79 @@ async def test_recovery_keeps_all_owner_tokens_across_partial_release(
 
 
 @pytest.mark.anyio
+async def test_peerswap_recovery_never_auto_releases_pending_txsend(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("peerswap", {"txid": "bb" * 32})
+    journal.update(
+        record_id,
+        action="txsend",
+        phase="prepared",
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="descriptor_wallet")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    adapter.recover_release = Mock()
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == []
+    adapter.recover_release.assert_not_called()
+    assert journal.records()[0].id == record_id
+
+
+@pytest.mark.anyio
+async def test_peerswap_recovery_releases_after_broadcast_is_observed(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("peerswap", {"txid": "bb" * 32})
+    journal.update(
+        record_id,
+        phase="broadcast",
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="descriptor_wallet")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    adapter.recover_release = Mock()
+    setattr(
+        adapter,
+        "require_wallet",
+        Mock(
+            return_value=SimpleNamespace(
+                backend=SimpleNamespace(
+                    get_transaction=AsyncMock(
+                        return_value=SimpleNamespace(
+                            status=SimpleNamespace(confirmed=True)
+                        )
+                    ),
+                    get_mempool_spender=AsyncMock(),
+                )
+            )
+        ),
+    )
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == [record_id]
+    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+    assert journal.records() == []
+
+
+@pytest.mark.anyio
 async def test_multi_open_recovery_leaves_withheld_funding_pending(
     tmp_path: Path,
 ) -> None:

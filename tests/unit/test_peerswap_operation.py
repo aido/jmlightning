@@ -14,6 +14,7 @@ from jmlightning.operations.peerswap import (
     PeerSwapPrepareTxRequest,
     PreparedPeerSwapTransaction,
 )
+from jmlightning.recovery import RecoveryJournal
 
 PEERSWAP_OUTPUT_ADDRESS = "bcrt1qqqgjyv6y24n80zye42aueh0wluqpzg3n9tg8m2"
 PEERSWAP_CHANGE_ADDRESS = "bcrt1qxvenxvenxvenxvenxvenxvenxvenxvenztev8a"
@@ -311,7 +312,9 @@ async def test_prepared_transaction_legacy_construction_derives_reservations() -
 
 
 @pytest.mark.anyio
-async def test_send_broadcasts_prepared_transaction_and_retains_reservations() -> None:
+async def test_send_broadcasts_prepared_transaction_and_retains_reservations(
+    tmp_path: Path,
+) -> None:
     request = _request()
     coin = _coin()
 
@@ -338,7 +341,7 @@ async def test_send_broadcasts_prepared_transaction_and_retains_reservations() -
         b"signed-psbt",
     )
 
-    config = Mock(mixdepth=0)
+    config = Mock(mixdepth=0, data_dir=tmp_path)
 
     with (
         patch(
@@ -370,10 +373,13 @@ async def test_send_broadcasts_prepared_transaction_and_retains_reservations() -
     adapter.close.assert_awaited_once()
     assert operation._prepared == {}
     assert prepared.phase is PeerSwapPhase.BROADCAST
+    assert RecoveryJournal(tmp_path).records() == []
 
 
 @pytest.mark.anyio
-async def test_send_keeps_prepared_transaction_when_broadcast_fails() -> None:
+async def test_send_keeps_prepared_transaction_when_broadcast_fails(
+    tmp_path: Path,
+) -> None:
     request = _request()
     coin = _coin()
 
@@ -410,7 +416,7 @@ async def test_send_keeps_prepared_transaction_when_broadcast_fails() -> None:
         patch("jmlightning.operations.peerswap.TxBuilder", return_value=tx_builder),
     ):
         operation = PeerSwapPrepareTxOperation(
-            config=Mock(mixdepth=0),
+            config=Mock(mixdepth=0, data_dir=tmp_path),
             cln_socket=Path("/tmp/lightning-rpc"),
         )
         prepared = await operation.execute(request)
@@ -421,6 +427,10 @@ async def test_send_keeps_prepared_transaction_when_broadcast_fails() -> None:
     adapter.unlock.assert_not_called()
     adapter.close.assert_not_awaited()
     assert operation._prepared[prepared.txid] is prepared
+    records = RecoveryJournal(tmp_path).records()
+    assert len(records) == 1
+    assert records[0].action == "txsend"
+    assert records[0].txid == prepared.txid
 
 
 @pytest.mark.anyio
@@ -521,14 +531,14 @@ def test_txprepare_rejects_invalid_sat_amount() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_rejects_unexpected_broadcast_txid() -> None:
+async def test_send_rejects_unexpected_broadcast_txid(tmp_path: Path) -> None:
     coin = _coin()
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="33" * 32)
     adapter.close = AsyncMock()
 
     operation = PeerSwapPrepareTxOperation(
-        config=Mock(mixdepth=0),
+        config=Mock(mixdepth=0, data_dir=tmp_path),
         cln_socket=Path("/tmp/lightning-rpc"),
     )
     prepared = PreparedPeerSwapTransaction(
@@ -550,14 +560,14 @@ async def test_send_rejects_unexpected_broadcast_txid() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_completes_broadcast_even_when_cleanup_fails() -> None:
+async def test_send_completes_broadcast_even_when_cleanup_fails(tmp_path: Path) -> None:
     coin = _coin()
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
     adapter.close = AsyncMock(side_effect=RuntimeError("close failed"))
 
     operation = PeerSwapPrepareTxOperation(
-        config=Mock(mixdepth=0),
+        config=Mock(mixdepth=0, data_dir=tmp_path),
         cln_socket=Path("/tmp/lightning-rpc"),
     )
     prepared = PreparedPeerSwapTransaction(
@@ -974,8 +984,10 @@ def test_txprepare_rejects_boolean_minconf() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_rejects_broadcast_transaction_id_mismatch() -> None:
-    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+async def test_send_rejects_broadcast_transaction_id_mismatch(tmp_path: Path) -> None:
+    operation = PeerSwapPrepareTxOperation(
+        Mock(mixdepth=0, data_dir=tmp_path), Path("/tmp/lightning-rpc")
+    )
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="33" * 32)
     adapter.close = AsyncMock()
@@ -999,8 +1011,10 @@ async def test_send_rejects_broadcast_transaction_id_mismatch() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_removes_state_after_successful_broadcast() -> None:
-    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+async def test_send_removes_state_after_successful_broadcast(tmp_path: Path) -> None:
+    operation = PeerSwapPrepareTxOperation(
+        Mock(mixdepth=0, data_dir=tmp_path), Path("/tmp/lightning-rpc")
+    )
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
     adapter.close = AsyncMock()
@@ -1028,8 +1042,12 @@ async def test_send_removes_state_after_successful_broadcast() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_retains_state_when_broadcast_adapter_close_fails() -> None:
-    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+async def test_send_retains_state_when_broadcast_adapter_close_fails(
+    tmp_path: Path,
+) -> None:
+    operation = PeerSwapPrepareTxOperation(
+        Mock(mixdepth=0, data_dir=tmp_path), Path("/tmp/lightning-rpc")
+    )
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
     adapter.close = AsyncMock(side_effect=[RuntimeError("close failed"), None])
@@ -1062,8 +1080,12 @@ async def test_send_retains_state_when_broadcast_adapter_close_fails() -> None:
 
 
 @pytest.mark.anyio
-async def test_discard_retains_broadcast_state_when_adapter_close_fails() -> None:
-    operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
+async def test_discard_retains_broadcast_state_when_adapter_close_fails(
+    tmp_path: Path,
+) -> None:
+    operation = PeerSwapPrepareTxOperation(
+        Mock(mixdepth=0, data_dir=tmp_path), Path("/tmp/lightning-rpc")
+    )
     adapter = Mock()
     adapter.close = AsyncMock(side_effect=[RuntimeError("close failed"), None])
     coin = _coin()

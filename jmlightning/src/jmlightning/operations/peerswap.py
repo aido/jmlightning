@@ -7,7 +7,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass, field
 from math import ceil
 from pathlib import Path
-from typing import TypeAlias
+from typing import TypeAlias, cast
 
 from jmcore.bitcoin import (
     ParsedTransaction,
@@ -28,6 +28,7 @@ from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.lifecycle import LifecyclePhase
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
+from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
 PeerSwapPhase: TypeAlias = LifecyclePhase
@@ -412,6 +413,29 @@ class PeerSwapPrepareTxOperation:
             self.cln_socket,
             txid,
         )
+
+        # Persist the transaction and reservation ownership before invoking
+        # the externally visible broadcast. Unlike the in-memory prepared
+        # state, this record survives a process crash between the broadcast
+        # and its response. The journal lifetime lock also prevents the manual
+        # recovery command from racing this short broadcast window.
+        recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
+        recovery_id = recovery_journal.begin(
+            "peerswap",
+            {"txid": txid},
+        )
+        recovery_journal.before_mutation(
+            recovery_id,
+            action="txsend",
+            phase=PeerSwapPhase.PREPARED.value,
+            locked_outpoints=[
+                (coin.utxo.txid, coin.utxo.vout) for coin in prepared.reservations
+            ],
+            owner_tokens=prepared.adapter._owner_tokens(),
+            psbt=prepared.psbt,
+            txid=txid,
+        )
+
         # A broadcast is an externally visible side effect. If the rendezvous
         # cancellation races with this await, cancelling the coroutine must not
         # make us guess whether the transaction was broadcast. Let the backend
@@ -419,43 +443,53 @@ class PeerSwapPrepareTxOperation:
         # state.
         broadcast_task = asyncio.create_task(prepared.adapter.broadcast(prepared.tx))
         try:
-            broadcast_txid = await asyncio.shield(broadcast_task)
-        except asyncio.CancelledError:
-            broadcast_txid = await broadcast_task
-        self._validate_txid(broadcast_txid, "JoinMarket broadcast transaction id")
-        broadcast_txid = broadcast_txid.lower()
-        if broadcast_txid != txid:
-            raise RuntimeError(
-                "JoinMarket broadcast returned an unexpected transaction id: "
-                f"expected {txid}, got {broadcast_txid}"
+            try:
+                broadcast_txid = await asyncio.shield(broadcast_task)
+            except asyncio.CancelledError:
+                broadcast_txid = await broadcast_task
+            self._validate_txid(broadcast_txid, "JoinMarket broadcast transaction id")
+            broadcast_txid = broadcast_txid.lower()
+            if broadcast_txid != txid:
+                raise RuntimeError(
+                    "JoinMarket broadcast returned an unexpected transaction id: "
+                    f"expected {txid}, got {broadcast_txid}"
+                )
+
+            recovery_journal.after_mutation(
+                recovery_id,
+                phase=PeerSwapPhase.BROADCAST.value,
+                txid=txid,
             )
 
-        # A broadcast transaction must keep its JoinMarket inputs reserved
-        # until the reservation lease expires. A backend may not expose the
-        # transaction immediately, so releasing the inputs here could allow
-        # another process to spend them while the broadcast transaction is
-        # still in flight. Stop renewal and close the wallet, but deliberately
-        # leave the persisted reservations in place.
-        prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST)
-        try:
-            await self._close_broadcast(prepared)
-        except RuntimeError as exc:
-            logger.warning(
-                "PeerSwap transaction {} was broadcast but adapter cleanup "
-                "failed; retaining state and JoinMarket reservations until "
-                "their lease expires: {}",
+            # A broadcast transaction must keep its JoinMarket inputs reserved
+            # until the reservation lease expires. A backend may not expose the
+            # transaction immediately, so releasing the inputs here could allow
+            # another process to spend them while the broadcast transaction is
+            # still in flight. Stop renewal and close the wallet, but deliberately
+            # leave the persisted reservations in place.
+            prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST)
+            try:
+                await self._close_broadcast(prepared)
+            except RuntimeError as exc:
+                logger.warning(
+                    "PeerSwap transaction {} was broadcast but adapter cleanup "
+                    "failed; retaining state and JoinMarket reservations until "
+                    "their lease expires: {}",
+                    txid,
+                    exc,
+                )
+            else:
+                self._prepared.pop(txid, None)
+                recovery_journal.resolve(recovery_id)
+
+            logger.info(
+                "PeerSwap JM operation txsend complete socket={} txid={}",
+                self.cln_socket,
                 txid,
-                exc,
             )
-        else:
-            self._prepared.pop(txid, None)
-
-        logger.info(
-            "PeerSwap JM operation txsend complete socket={} txid={}",
-            self.cln_socket,
-            txid,
-        )
-        return self._send_result(prepared)
+            return self._send_result(prepared)
+        finally:
+            recovery_journal.release_lifetime()
 
     @staticmethod
     def _validate_txid(txid: str, field: str = "transaction id") -> None:
