@@ -199,6 +199,19 @@ jm-lightning open-channel \
   --cln-socket /run/lightningd/lightning-rpc
 ```
 
+An optional `--close-to` address can request a specific upfront shutdown address for the channel:
+
+```bash
+jm-lightning open-channel \
+  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+  --amount 1000000 \
+  --close-to bcrt1qexamplecloseaddress \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+`close_to` is the address supplied to CLN's `fundchannel_start` for the channel's upfront shutdown script. If `--close-to` is requested, `jmlightning` requires CLN to confirm that the address was negotiated; it does not silently continue without the requested setting. This affects the agreed upfront shutdown script for a future mutual close and is not a close-time command.
+
 The important part of this command is not simply the requested amount.
 
 The application will:
@@ -245,17 +258,21 @@ for the options supported by the installed version.
 
 A multi-channel funding operation opens multiple CLN channels using **one shared Bitcoin transaction**. It requests the same `OPEN_CHANNEL` capability as a single channel open, so every JoinMarket input must independently satisfy the existing channel-funding policy.
 
-Each destination is supplied as a repeatable `--destination` option containing a peer ID and channel amount:
+Each destination is supplied as a repeatable `--destination` option containing a peer ID and channel amount. An optional third field specifies that channel's upfront shutdown address:
+
+```text
+PEER_ID:AMOUNT_SATS[:CLOSE_TO]
+```
 
 ```bash
 jm-lightning multi-open-channel \
   --destination 02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890:1000000 \
-  --destination 03def4567890abcdef1234567890abcdef1234567890abcdef1234567890:1500000 \
+  --destination 03def4567890abcdef1234567890abcdef1234567890abcdef1234567890:1500000:bcrt1qexamplecloseaddress \
   --mixdepth 1 \
   --cln-socket /run/lightningd/lightning-rpc
 ```
 
-The amounts are the individual channel funding amounts. The JoinMarket planner selects enough policy-approved UTXOs to fund their combined value, the transaction fee and any required change.
+The amounts are the individual channel funding amounts. `close_to` is optional and is specified independently for each destination. Existing `PEER_ID:AMOUNT_SATS` destinations remain valid without it. If a `close_to` address is supplied, CLN must confirm that it was negotiated for that channel. The JoinMarket planner selects enough policy-approved UTXOs to fund their combined value, the transaction fee and any required change.
 
 The application will:
 
@@ -557,8 +574,8 @@ sequenceDiagram
     OP->>PL: Build funding plan
     PL-->>OP: Inputs, amount, fee, change
     OP->>JM: Atomically reserve and freeze inputs
-    OP->>CLN: fundchannel_start(peer, amount)
-    CLN-->>OP: Funding address
+    OP->>CLN: fundchannel_start(peer, amount, close_to?)
+    CLN-->>OP: Funding address + negotiated close_to
     OP->>TX: Build and sign funding transaction
     TX->>JM: Sign PSBT
     JM-->>TX: Signed PSBT
@@ -604,8 +621,8 @@ sequenceDiagram
     PL-->>OP: Inputs, amounts, fee, change
     OP->>JM: Atomically reserve and freeze inputs
     loop For each destination
-        OP->>CLN: fundchannel_start(peer, amount)
-        CLN-->>OP: Funding address
+        OP->>CLN: fundchannel_start(peer, amount, close_to?)
+        CLN-->>OP: Funding address + negotiated close_to
     end
     OP->>TX: Build one shared funding transaction
     TX->>JM: Sign PSBT
@@ -621,7 +638,7 @@ sequenceDiagram
     OP->>OP: Retain JoinMarket freezes
 ```
 
-The important property is that **all channel funding outputs are created in the same Bitcoin transaction**. CLN remains responsible for each channel's funding state while `jmlightning` constructs and signs the shared transaction from JoinMarket-approved inputs.
+The important property is that **all channel funding outputs are created in the same Bitcoin transaction**. CLN remains responsible for each channel's funding state while `jmlightning` constructs and signs the shared transaction from JoinMarket-approved inputs. The optional `close_to` setting is negotiated separately for each channel and does not become an output in the shared Bitcoin transaction.
 
 If an RPC outcome is ambiguous, the operation deliberately prefers retaining the JoinMarket locks and requiring recovery rather than assuming the shared transaction was harmlessly abandoned.
 
