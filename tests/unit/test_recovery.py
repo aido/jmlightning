@@ -74,6 +74,28 @@ def test_recovery_journal_preserves_txid_after_successful_mutation(
     assert record.txid == txid
 
 
+def test_recovery_journal_after_mutation_preserves_existing_txid(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    txid = "cc" * 32
+
+    journal.update(record_id, txid=txid, psbt="cHNiZA==")
+    journal.before_mutation(
+        record_id,
+        action="renew_coinjoin_inputs",
+        phase="locked",
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={("aa" * 32, 0): "owner"},
+    )
+    journal.after_mutation(record_id, phase="locked")
+
+    record = journal.records()[0]
+    assert record.txid == txid
+    assert record.psbt == "cHNiZA=="
+
+
 def test_recovery_journal_keeps_pending_mutation_after_failure(tmp_path: Path) -> None:
     journal = RecoveryJournal(tmp_path)
     record_id = journal.create("splice", {"channel_id": "channel"})

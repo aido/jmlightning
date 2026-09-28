@@ -5,6 +5,7 @@ import fcntl
 import json
 import os
 import tempfile
+import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -117,21 +118,27 @@ class RecoveryJournal:
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         self._lock_path = self.path.with_suffix(".lock")
         self._lifetime_fd: int | None = None
+        # Serialise journal access between threads in this process. The
+        # lifetime file lock only provides inter-process exclusion; without a
+        # process-local lock, the renewal worker can race an operation update
+        # and overwrite a newer recovery record with an older snapshot.
+        self._thread_lock = threading.RLock()
 
     @contextmanager
     def _locked(self) -> Iterator[None]:
-        if self._lifetime_fd is not None:
-            yield
-            return
+        with self._thread_lock:
+            if self._lifetime_fd is not None:
+                yield
+                return
 
-        fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
-        try:
-            os.fchmod(fd, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
-        finally:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-            os.close(fd)
+            fd = os.open(self._lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                os.fchmod(fd, 0o600)
+                fcntl.flock(fd, fcntl.LOCK_EX)
+                yield
+            finally:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+                os.close(fd)
 
     def acquire_lifetime(self, *, nonblocking: bool = False) -> None:
         """Own the journal lock for a complete recoverable lifecycle."""
@@ -255,21 +262,38 @@ class RecoveryJournal:
         encoded_owners = {
             f"{txid}:{vout}": owner for (txid, vout), owner in owners.items()
         }
-        self.update(
-            record_id,
-            phase=phase,
-            action=action,
-            status="pending",
-            locked_outpoints=locked_outpoints,
-            owner_tokens=encoded_owners,
-            psbt=base64.b64encode(psbt).decode("ascii") if psbt is not None else None,
-            txid=txid,
-        )
+        changes: dict[str, Any] = {
+            "phase": phase,
+            "action": action,
+            "status": "pending",
+            "locked_outpoints": locked_outpoints,
+            "owner_tokens": encoded_owners,
+        }
+        # Reservation renewals do not carry the transaction metadata from the
+        # surrounding operation. Preserve existing values instead of clearing
+        # the recovery identity for a transaction which may already have been
+        # handed to CLN.
+        if psbt is not None:
+            changes["psbt"] = base64.b64encode(psbt).decode("ascii")
+        if txid is not None:
+            changes["txid"] = txid
+        self.update(record_id, **changes)
 
     def after_mutation(
         self, record_id: str, *, phase: str, txid: str | None = None
     ) -> None:
-        self.update(record_id, phase=phase, action=None, status="pending", txid=txid)
+        changes: dict[str, Any] = {
+            "phase": phase,
+            "action": None,
+            "status": "pending",
+        }
+        # A reservation renewal does not know the operation's transaction id.
+        # Preserve an existing txid instead of clearing it, so a long-running
+        # operation remains recoverable even while its JoinMarket lease is
+        # being renewed.
+        if txid is not None:
+            changes["txid"] = txid
+        self.update(record_id, **changes)
 
     def resolve(self, record_id: str) -> None:
         with self._locked():
