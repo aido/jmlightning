@@ -1,5 +1,5 @@
 from pathlib import Path
-from unittest.mock import AsyncMock, Mock, call, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from jmcore.constants import MAX_MONEY
@@ -311,7 +311,7 @@ async def test_prepared_transaction_legacy_construction_derives_reservations() -
 
 
 @pytest.mark.anyio
-async def test_send_broadcasts_prepared_transaction_and_releases_locks() -> None:
+async def test_send_broadcasts_prepared_transaction_and_retains_reservations() -> None:
     request = _request()
     coin = _coin()
 
@@ -366,7 +366,7 @@ async def test_send_broadcasts_prepared_transaction_and_releases_locks() -> None
     assert result["txid"] == "22" * 32
     assert result["psbt"] == "c2lnbmVkLXBzYnQ="
     adapter.broadcast.assert_awaited_once_with(prepared.tx)
-    adapter.unlock.assert_called_once_with(coin)
+    adapter.unlock.assert_not_called()
     adapter.close.assert_awaited_once()
     assert operation._prepared == {}
     assert prepared.phase is PeerSwapPhase.BROADCAST
@@ -449,10 +449,9 @@ async def test_send_rejects_non_prepared_phase() -> None:
 
 
 @pytest.mark.anyio
-async def test_discard_retries_cleanup_for_broadcast_transaction() -> None:
+async def test_discard_does_not_release_broadcast_transaction_reservations() -> None:
     coin = _coin()
     adapter = Mock()
-    adapter.unlock.side_effect = RuntimeError("unlock failed")
     adapter.close = AsyncMock()
 
     operation = PeerSwapPrepareTxOperation(
@@ -469,19 +468,16 @@ async def test_discard_retries_cleanup_for_broadcast_transaction() -> None:
     )
     operation._prepared[prepared.txid] = prepared
 
-    with pytest.raises(RuntimeError, match="Failed to fully clean up"):
-        await operation.discard(prepared.txid)
-    assert operation._prepared[prepared.txid] is prepared
-    assert prepared.phase is PeerSwapPhase.BROADCAST
-    adapter.close.assert_not_awaited()
+    with patch(
+        "jmlightning.operations.peerswap.PeerSwapPrepareTxOperation._unsigned_tx",
+        return_value="02000000",
+    ):
+        result = await operation.discard(prepared.txid)
 
-    adapter.unlock.side_effect = None
-    await operation.discard(prepared.txid)
-
+    assert result == {"unsigned_tx": "02000000", "txid": prepared.txid}
     assert operation._prepared == {}
     assert prepared.phase is PeerSwapPhase.BROADCAST
-    adapter.unlock.assert_has_calls([call(coin), call(coin)])
-    assert adapter.unlock.call_count == 2
+    adapter.unlock.assert_not_called()
     adapter.close.assert_awaited_once()
 
 
@@ -558,7 +554,6 @@ async def test_send_completes_broadcast_even_when_cleanup_fails() -> None:
     coin = _coin()
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
-    adapter.unlock.side_effect = RuntimeError("unlock failed")
     adapter.close = AsyncMock(side_effect=RuntimeError("close failed"))
 
     operation = PeerSwapPrepareTxOperation(
@@ -584,15 +579,14 @@ async def test_send_completes_broadcast_even_when_cleanup_fails() -> None:
     assert result["txid"] == "22" * 32
     assert prepared.phase is PeerSwapPhase.BROADCAST
     assert operation._prepared[prepared.txid] is prepared
-    adapter.unlock.assert_called_once_with(coin)
-    adapter.close.assert_not_awaited()
+    adapter.unlock.assert_not_called()
+    adapter.close.assert_awaited_once()
 
-    adapter.unlock.side_effect = None
     adapter.close.side_effect = None
     await operation.close()
     assert operation._prepared == {}
-    assert adapter.unlock.call_count == 2
-    assert adapter.close.await_count == 1
+    adapter.unlock.assert_not_called()
+    assert adapter.close.await_count == 2
 
 
 def test_txprepare_rejects_invalid_output_address() -> None:
@@ -1005,12 +999,11 @@ async def test_send_rejects_broadcast_transaction_id_mismatch() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_retains_state_when_unlock_fails() -> None:
+async def test_send_removes_state_after_successful_broadcast() -> None:
     operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
     adapter.close = AsyncMock()
-    adapter.unlock.side_effect = RuntimeError("unlock failed")
     coin = _coin()
     prepared = PreparedPeerSwapTransaction(
         tx=Mock(),
@@ -1028,20 +1021,14 @@ async def test_send_retains_state_when_unlock_fails() -> None:
         result = await operation.send(prepared.txid)
 
     assert result["txid"] == prepared.txid
-    assert prepared.txid in operation._prepared
+    assert prepared.txid not in operation._prepared
     assert prepared.phase is PeerSwapPhase.BROADCAST
-    adapter.unlock.assert_called_once_with(coin)
-    adapter.close.assert_not_awaited()
-
-    adapter.unlock.side_effect = None
-    await operation.close()
-    assert operation._prepared == {}
-    assert adapter.unlock.call_count == 2
-    assert adapter.close.await_count == 1
+    adapter.unlock.assert_not_called()
+    adapter.close.assert_awaited_once()
 
 
 @pytest.mark.anyio
-async def test_send_retains_state_when_close_fails_after_broadcast() -> None:
+async def test_send_retains_state_when_broadcast_adapter_close_fails() -> None:
     operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
     adapter = Mock()
     adapter.broadcast = AsyncMock(return_value="22" * 32)
@@ -1065,36 +1052,39 @@ async def test_send_retains_state_when_close_fails_after_broadcast() -> None:
     assert result["txid"] == prepared.txid
     assert prepared.txid in operation._prepared
     assert prepared.phase is PeerSwapPhase.BROADCAST
-    adapter.unlock.assert_called_once_with(coin)
+    adapter.unlock.assert_not_called()
     adapter.close.assert_awaited_once()
 
     await operation.close()
     assert operation._prepared == {}
-    assert adapter.unlock.call_count == 1
+    adapter.unlock.assert_not_called()
     assert adapter.close.await_count == 2
 
 
 @pytest.mark.anyio
-async def test_discard_retains_state_when_close_fails() -> None:
+async def test_discard_retains_broadcast_state_when_adapter_close_fails() -> None:
     operation = PeerSwapPrepareTxOperation(Mock(mixdepth=0), Path("/tmp/lightning-rpc"))
     adapter = Mock()
     adapter.close = AsyncMock(side_effect=[RuntimeError("close failed"), None])
     coin = _coin()
     prepared = PreparedPeerSwapTransaction(
-        tx=Mock(),
+        tx=Mock(version=2, inputs=[], outputs=[], locktime=0),
         txid="22" * 32,
         locked=[coin],
         adapter=adapter,
         psbt=b"psbt",
+        phase=PeerSwapPhase.BROADCAST,
     )
     operation._prepared[prepared.txid] = prepared
 
-    with pytest.raises(RuntimeError, match="Failed to fully clean up"):
+    with pytest.raises(
+        RuntimeError, match="Failed to close PeerSwap broadcast transaction"
+    ):
         await operation.discard(prepared.txid)
 
-    assert prepared.txid in operation._prepared
-    assert prepared.phase is PeerSwapPhase.PREPARED
-    adapter.unlock.assert_called_once_with(coin)
+    assert operation._prepared[prepared.txid] is prepared
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.unlock.assert_not_called()
     adapter.close.assert_awaited_once()
 
     with patch(
@@ -1104,7 +1094,7 @@ async def test_discard_retains_state_when_close_fails() -> None:
         result = await operation.discard(prepared.txid)
 
     assert result == {"unsigned_tx": "02000000", "txid": prepared.txid}
-    assert prepared.txid not in operation._prepared
-    assert prepared.phase.value == PeerSwapPhase.DISCARDED.value
-    assert adapter.unlock.call_count == 1
+    assert operation._prepared == {}
+    assert prepared.phase is PeerSwapPhase.BROADCAST
+    adapter.unlock.assert_not_called()
     assert adapter.close.await_count == 2

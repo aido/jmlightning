@@ -396,7 +396,7 @@ class PeerSwapPrepareTxOperation:
         return self._prepare_result(prepared)
 
     async def send(self, txid: str) -> dict[str, str]:
-        """Broadcast a prepared PeerSwap transaction and release its inputs."""
+        """Broadcast a prepared PeerSwap transaction and retain its inputs."""
         prepared = self._prepared.get(txid)
         if prepared is None:
             raise ValueError(f"PeerSwap transaction {txid} is not prepared")
@@ -430,17 +430,20 @@ class PeerSwapPrepareTxOperation:
                 f"expected {txid}, got {broadcast_txid}"
             )
 
-        # Broadcasting is the terminal transaction state. Keep the state
-        # retained until JoinMarket cleanup succeeds so a failed unlock/close
-        # cannot strand an input until its lease expires. The BROADCAST phase
-        # also prevents a retry from broadcasting the transaction twice.
+        # A broadcast transaction must keep its JoinMarket inputs reserved
+        # until the reservation lease expires. A backend may not expose the
+        # transaction immediately, so releasing the inputs here could allow
+        # another process to spend them while the broadcast transaction is
+        # still in flight. Stop renewal and close the wallet, but deliberately
+        # leave the persisted reservations in place.
         prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST)
         try:
-            await self._cleanup_prepared(prepared)
+            await self._close_broadcast(prepared)
         except RuntimeError as exc:
             logger.warning(
-                "PeerSwap transaction {} was broadcast but cleanup failed; "
-                "retaining state for retry: {}",
+                "PeerSwap transaction {} was broadcast but adapter cleanup "
+                "failed; retaining state and JoinMarket reservations until "
+                "their lease expires: {}",
                 txid,
                 exc,
             )
@@ -504,14 +507,36 @@ class PeerSwapPrepareTxOperation:
             "psbt": psbt_to_base64(prepared.psbt),
         }
 
+    async def _close_broadcast(self, prepared: PreparedPeerSwapTransaction) -> None:
+        """Stop renewal and close a broadcast transaction's adapter.
+
+        Broadcast transactions deliberately retain their persisted JoinMarket
+        reservations until the normal lease expiry. Closing the adapter stops
+        renewal without releasing those reservations.
+        """
+        prepared.require_phase(PeerSwapPhase.BROADCAST)
+        try:
+            await prepared.adapter.close()
+        except Exception as exc:
+            logger.error(
+                "Failed to close PeerSwap JoinMarket adapter for broadcast "
+                "transaction {}: {}",
+                prepared.txid,
+                exc,
+            )
+            raise RuntimeError(
+                f"Failed to close PeerSwap broadcast transaction {prepared.txid}"
+            ) from exc
+
     async def _cleanup_prepared(self, prepared: PreparedPeerSwapTransaction) -> None:
         """Release a prepared transaction's JoinMarket resources.
 
-        The adapter remains open when an unlock fails because its owner token
-        and wallet handle are required for a safe retry. Likewise, state is
-        only removed by the caller after both unlocking and adapter close have
-        succeeded.
+        This method is only valid for the PREPARED phase. Broadcast
+        transactions use :meth:`_close_broadcast` instead so their persisted
+        JoinMarket reservations can expire naturally rather than being
+        released while the broadcast transaction may still be unconfirmed.
         """
+        prepared.require_phase(PeerSwapPhase.PREPARED)
         cleanup_errors: list[Exception] = []
         for coin in reversed(prepared.reservations):
             outpoint = (coin.utxo.txid, coin.utxo.vout)
@@ -558,7 +583,20 @@ class PeerSwapPrepareTxOperation:
     async def close(self) -> None:
         """Release all prepared transactions and any pre-connected wallet."""
         for txid, prepared in list(self._prepared.items()):
-            if prepared.phase not in {PeerSwapPhase.PREPARED, PeerSwapPhase.BROADCAST}:
+            if prepared.phase is PeerSwapPhase.BROADCAST:
+                try:
+                    await self._close_broadcast(prepared)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to close broadcast PeerSwap transaction {}: {}",
+                        txid,
+                        exc,
+                    )
+                    continue
+                self._prepared.pop(txid, None)
+                continue
+
+            if prepared.phase is not PeerSwapPhase.PREPARED:
                 continue
             try:
                 await self._cleanup_prepared(prepared)
@@ -570,8 +608,7 @@ class PeerSwapPrepareTxOperation:
                 )
                 continue
             self._prepared.pop(txid, None)
-            if prepared.phase is PeerSwapPhase.PREPARED:
-                prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
+            prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
 
         adapter = self._connected_adapter
         self._connected_adapter = None
@@ -588,15 +625,17 @@ class PeerSwapPrepareTxOperation:
                 f"PeerSwap transaction {txid} is in {prepared.phase} state"
             )
 
-        # Keep state until every cleanup step succeeds. A BROADCAST transaction
-        # may reach this path when txsend completed but resource cleanup failed;
-        # retrying txdiscard must only release resources and must never broadcast
-        # the transaction again.
-        phase = prepared.phase
-        await self._cleanup_prepared(prepared)
-        if phase is PeerSwapPhase.PREPARED:
+        if prepared.phase is PeerSwapPhase.BROADCAST:
+            # txdiscard is also allowed to finish local adapter cleanup after a
+            # successful broadcast, but it must never release the persisted
+            # JoinMarket reservation. The reservation remains quarantined until
+            # its normal lease expiry.
+            await self._close_broadcast(prepared)
+            self._prepared.pop(txid, None)
+        else:
+            await self._cleanup_prepared(prepared)
             prepared.transition(PeerSwapPhase.PREPARED, PeerSwapPhase.DISCARDED)
-        self._prepared.pop(txid, None)
+            self._prepared.pop(txid, None)
 
         return {
             "unsigned_tx": self._unsigned_tx(prepared),
