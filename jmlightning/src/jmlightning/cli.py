@@ -204,7 +204,7 @@ def multi_open_channel(
         typer.Option(
             "--destination",
             "-p",
-            help="Channel destination as PEER_ID:AMOUNT_SATS (repeatable)",
+            help="Channel destination as PEER_ID:AMOUNT_SATS[:CLOSE_TO] (repeatable)",
         ),
     ],
     cln_socket: Annotated[
@@ -260,19 +260,25 @@ def multi_open_channel(
     if not destination:
         raise typer.BadParameter("At least one --destination is required")
 
-    destinations: list[tuple[str, int]] = []
+    destinations: list[tuple[str, int, str | None]] = []
     for value in destination:
+        parts = value.split(":", 2)
+        if len(parts) not in (2, 3):
+            raise typer.BadParameter(
+                "Destination must be PEER_ID:AMOUNT_SATS[:CLOSE_TO]"
+            )
+        peer_id, amount_text = parts[:2]
+        close_to = parts[2] if len(parts) == 3 else None
         try:
-            peer_id, amount_text = value.rsplit(":", 1)
             amount = int(amount_text)
         except ValueError as exc:
-            raise typer.BadParameter("Destination must be PEER_ID:AMOUNT_SATS") from exc
+            raise typer.BadParameter("Destination amount must be an integer") from exc
 
-        if not peer_id or amount <= 0:
+        if not peer_id or amount <= 0 or close_to == "":
             raise typer.BadParameter(
-                "Destination must contain a peer ID and positive amount"
+                "Destination must contain a peer ID, positive amount and valid close_to"
             )
-        destinations.append((peer_id, amount))
+        destinations.append((peer_id, amount, close_to))
 
     settings = setup_cli(
         data_dir=data_dir,
@@ -291,7 +297,7 @@ def multi_open_channel(
     config = build_cln_config(
         settings=settings,
         resolved_mnemonic=resolved,
-        amount=sum(amount for _, amount in destinations),
+        amount=sum(amount for _, amount, _ in destinations),
         mixdepth=mixdepth,
     )
 

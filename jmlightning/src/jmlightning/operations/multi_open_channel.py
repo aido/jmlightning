@@ -21,7 +21,7 @@ from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
 MultiOpenChannelConfirmationCallback = Callable[
-    [list[tuple[str, int]], ExecutionPlan, ParsedTransaction, str],
+    [list[tuple[str, int, str | None]], ExecutionPlan, ParsedTransaction, str],
     bool,
 ]
 
@@ -53,16 +53,16 @@ class MultiOpenChannelOperation:
 
     async def execute(
         self,
-        destinations: list[tuple[str, int]],
+        destinations: list[tuple[str, int, str | None]],
         confirm: MultiOpenChannelConfirmationCallback | None = None,
     ) -> None:
         if not destinations:
             raise ValueError("At least one channel destination is required")
 
-        peer_ids = [peer_id for peer_id, _ in destinations]
+        peer_ids = [peer_id for peer_id, _, _ in destinations]
         if len(peer_ids) != len(set(peer_ids)):
             raise ValueError("Channel destinations must be unique")
-        if any(amount <= 0 for _, amount in destinations):
+        if any(amount <= 0 for _, amount, _ in destinations):
             raise ValueError("Channel funding amounts must be positive")
 
         policy = PolicyEngine()
@@ -70,7 +70,10 @@ class MultiOpenChannelOperation:
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
         recovery_id = recovery_journal.begin(
             "multi_open_channel",
-            {"peers": peer_ids},
+            {
+                "peers": peer_ids,
+                "close_to": [close_to for _, _, close_to in destinations],
+            },
         )
         jmadapter = JoinMarketAdapter(
             config=self.config,
@@ -126,7 +129,7 @@ class MultiOpenChannelOperation:
             # --------------------------------------------------------
 
             fee_rate = cln.get_fee_rate(self.config.fee_priority)
-            target_amounts = [amount for _, amount in destinations]
+            target_amounts = [amount for _, amount, _ in destinations]
 
             # --------------------------------------------------------
             # Selection and planning
@@ -225,7 +228,7 @@ class MultiOpenChannelOperation:
             # If any start fails, cancel every successful start before releasing
             # JoinMarket inputs.
             funding_addresses: list[str] = []
-            for peer_id, amount in destinations:
+            for peer_id, amount, close_to in destinations:
                 try:
                     funding_address = recovery_journal.call(
                         recovery_id,
@@ -235,6 +238,7 @@ class MultiOpenChannelOperation:
                             peer_id=peer_id,
                             amount=amount,
                             announce=self.config.announce,
+                            **({"close_to": close_to} if close_to is not None else {}),
                         ),
                         locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
@@ -499,7 +503,7 @@ class MultiOpenChannelOperation:
 
 
 def confirm_multi_open_channel(
-    destinations: list[tuple[str, int]],
+    destinations: list[tuple[str, int, str | None]],
     plan: ExecutionPlan,
     tx: ParsedTransaction,
     txid: str,
@@ -512,8 +516,9 @@ def confirm_multi_open_channel(
     typer.echo(f"Fee:            {plan.fee:,} sats")
     typer.echo("")
     typer.echo("Channels:")
-    for peer_id, amount in destinations:
-        typer.echo(f"  {peer_id}: {amount:,} sats")
+    for peer_id, amount, close_to in destinations:
+        suffix = f" (close_to: {close_to})" if close_to is not None else ""
+        typer.echo(f"  {peer_id}: {amount:,} sats{suffix}")
     typer.echo("")
     typer.echo("Inputs:")
     for coin in plan.inputs:

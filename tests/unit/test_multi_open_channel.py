@@ -33,7 +33,7 @@ async def test_execute_rejects_duplicate_destinations() -> None:
     operation = MultiOpenChannelOperation(Mock(), Path("/tmp/lightning-rpc"))
 
     with pytest.raises(ValueError, match="destinations must be unique"):
-        await operation.execute([(PEER_A, 100_000), (PEER_A, 200_000)])
+        await operation.execute([(PEER_A, 100_000, None), (PEER_A, 200_000, None)])
 
 
 @pytest.mark.anyio
@@ -41,13 +41,16 @@ async def test_execute_rejects_non_positive_amount() -> None:
     operation = MultiOpenChannelOperation(Mock(), Path("/tmp/lightning-rpc"))
 
     with pytest.raises(ValueError, match="amounts must be positive"):
-        await operation.execute([(PEER_A, 0)])
+        await operation.execute([(PEER_A, 0, None)])
 
 
 @pytest.mark.anyio
 async def test_execute_funds_multiple_channels_with_one_transaction() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
-    destinations = [(PEER_A, 100_000), (PEER_B, 150_000)]
+    destinations: list[tuple[str, int, str | None]] = [
+        (PEER_A, 100_000, None),
+        (PEER_B, 150_000, None),
+    ]
 
     with _patch_multi_open_channel_doubles(jmadapter, cln, tx_builder, plan):
         operation = MultiOpenChannelOperation(
@@ -89,6 +92,34 @@ async def test_execute_funds_multiple_channels_with_one_transaction() -> None:
 
 
 @pytest.mark.anyio
+async def test_execute_passes_per_channel_close_to_to_cln() -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
+    destinations = [
+        (PEER_A, 100_000, "bcrt1qclosea"),
+        (PEER_B, 150_000, None),
+    ]
+
+    with _patch_multi_open_channel_doubles(jmadapter, cln, tx_builder, plan):
+        operation = MultiOpenChannelOperation(
+            config=config,
+            cln_socket=Path("/tmp/lightning-rpc"),
+        )
+        await operation.execute(destinations)
+
+    cln.open_channel_start.assert_any_call(
+        peer_id=PEER_A,
+        amount=100_000,
+        announce=config.announce,
+        close_to="bcrt1qclosea",
+    )
+    cln.open_channel_start.assert_any_call(
+        peer_id=PEER_B,
+        amount=150_000,
+        announce=config.announce,
+    )
+
+
+@pytest.mark.anyio
 async def test_start_failure_is_ambiguous_and_keeps_utxos_locked() -> None:
     config, coin, jmadapter, cln, plan, tx_builder = _build_test_doubles()
     cln.open_channel_start.side_effect = ["bc1qfunding-a", RuntimeError("start failed")]
@@ -103,7 +134,7 @@ async def test_start_failure_is_ambiguous_and_keeps_utxos_locked() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="channel start failed.*ambiguous",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     cln.cancel_channel_funding.assert_called_once_with(PEER_A)
     tx_builder.build_and_sign_multifunding_tx.assert_not_called()
@@ -126,7 +157,7 @@ async def test_user_decline_cancels_all_channels_and_unlocks() -> None:
             match="cancelled by user",
         ):
             await operation.execute(
-                [(PEER_A, 100_000), (PEER_B, 150_000)],
+                [(PEER_A, 100_000, None), (PEER_B, 150_000, None)],
                 confirm=lambda *_: False,
             )
 
@@ -151,7 +182,7 @@ async def test_user_decline_with_cancel_failure_requires_recovery() -> None:
             match="Unable to cancel all CLN channel funding",
         ):
             await operation.execute(
-                [(PEER_A, 100_000), (PEER_B, 150_000)],
+                [(PEER_A, 100_000, None), (PEER_B, 150_000, None)],
                 confirm=lambda *_: False,
             )
 
@@ -173,7 +204,7 @@ async def test_transaction_preparation_failure_cancels_all_channels() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="Shared funding transaction preparation failed",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert cln.cancel_channel_funding.call_count == 2
     cln.cancel_channel_funding.assert_any_call(PEER_A)
@@ -200,7 +231,7 @@ async def test_send_failure_with_broadcast_state_keeps_utxos_locked() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="Unable to prove that CLN sendpsbt did not broadcast",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert cln.get_channel_funding_status.call_count == 2
     jmadapter.unlock.assert_not_called()
@@ -228,7 +259,7 @@ async def test_start_failure_with_cancel_failure_requires_recovery_keeps_locked(
             MultiOpenChannelRecoveryRequiredError,
             match="A channel start failed",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     jmadapter.unlock.assert_not_called()
     cln.cancel_channel_funding.assert_called_once_with(PEER_A)
@@ -248,7 +279,7 @@ async def test_completion_failure_cancels_started_channels_and_unlocks() -> None
         )
 
         with pytest.raises(RuntimeError, match="complete failed"):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert cln.get_channel_funding_status.call_count == 2
     assert cln.cancel_channel_funding.call_count == 2
@@ -273,7 +304,7 @@ async def test_completion_failure_with_cancel_failure_requires_recovery() -> Non
             MultiOpenChannelRecoveryRequiredError,
             match="Unable to cancel CLN channel funding",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     jmadapter.unlock.assert_not_called()
     assert cln.cancel_channel_funding.call_count == 2
@@ -295,7 +326,7 @@ async def test_completion_failure_with_status_error_requires_recovery() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="Multi-channel completion outcome is ambiguous",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     jmadapter.unlock.assert_not_called()
     cln.cancel_channel_funding.assert_not_called()
@@ -317,7 +348,7 @@ async def test_send_failure_with_absent_state_requires_recovery() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="Unable to prove that CLN sendpsbt did not broadcast",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert cln.get_channel_funding_status.call_count == 2
     cln.cancel_channel_funding.assert_not_called()
@@ -338,7 +369,7 @@ async def test_send_failure_with_withheld_state_cancels_and_unlocks() -> None:
         )
 
         with pytest.raises(RuntimeError, match="connection lost"):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert cln.get_channel_funding_status.call_count == 2
     assert cln.cancel_channel_funding.call_count == 2
@@ -361,7 +392,7 @@ async def test_operation_failure_with_cleanup_failure_requires_recovery() -> Non
             MultiOpenChannelRecoveryRequiredError,
             match="failed and cleanup also failed",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     jmadapter.unlock.assert_called_once_with(coin)
     jmadapter.close.assert_awaited_once()
@@ -384,7 +415,7 @@ async def test_send_failure_with_cancel_failure_requires_recovery() -> None:
             MultiOpenChannelRecoveryRequiredError,
             match="Unable to cancel withheld CLN channel funding",
         ):
-            await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+            await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     jmadapter.unlock.assert_not_called()
 
@@ -406,7 +437,7 @@ async def test_planner_reselection_retries_after_insufficient_funds() -> None:
             cln_socket=Path("/tmp/lightning-rpc"),
         )
 
-        await operation.execute([(PEER_A, 100_000), (PEER_B, 150_000)])
+        await operation.execute([(PEER_A, 100_000, None), (PEER_B, 150_000, None)])
 
     assert jmadapter.select_utxos.call_count == 2
     assert build_multi_plan.call_count == 2

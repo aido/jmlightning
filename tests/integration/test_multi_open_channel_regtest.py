@@ -29,7 +29,7 @@ def _run_cli(
     data_dir: Path,
     mnemonic_file: Path,
     cln_socket: str,
-    destinations: list[tuple[str, int]],
+    destinations: list[tuple[str, int, str | None]],
 ) -> subprocess.CompletedProcess[str]:
     env = os.environ.copy()
     for name in (
@@ -65,8 +65,11 @@ def _run_cli(
         "--mnemonic-file",
         str(mnemonic_file),
     ]
-    for peer_id, amount in destinations:
-        command.extend(["--destination", f"{peer_id}:{amount}"])
+    for peer_id, amount, close_to in destinations:
+        value = f"{peer_id}:{amount}"
+        if close_to is not None:
+            value += f":{close_to}"
+        command.extend(["--destination", value])
     command.append("--yes")
 
     return subprocess.run(
@@ -129,8 +132,8 @@ async def test_multi_open_channel_happy_path(tmp_path: Path) -> None:
     )
     await operation.execute(
         [
-            (context["peer_id"], 100_000),
-            (peer_b, 150_000),
+            (context["peer_id"], 100_000, None),
+            (peer_b, 150_000, None),
         ]
     )
 
@@ -156,6 +159,32 @@ async def test_multi_open_channel_happy_path(tmp_path: Path) -> None:
     assert txid_a == txid_b
 
 
+async def test_multi_open_channel_cli_with_per_channel_close_to(tmp_path: Path) -> None:
+    context = await prepare_regtest(tmp_path)
+    peer_b = _required_env(PEER_B)
+    close_to = str(lightning_rpc(context["peer_socket"]).newaddr()["bech32"])
+
+    result = _run_cli(
+        data_dir=context["data_dir"],
+        mnemonic_file=context["mnemonic_file"],
+        cln_socket=context["cln_socket"],
+        destinations=[
+            (context["peer_id"], 100_000, close_to),
+            (peer_b, 150_000, None),
+        ],
+    )
+    _assert_cli_success(result)
+
+    channels = lightning_rpc(context["cln_socket"]).listpeerchannels(
+        context["peer_id"]
+    )["channels"]
+    matching = [
+        channel for channel in channels if channel.get("peer_id") == context["peer_id"]
+    ]
+    assert matching
+    assert matching[-1]["close_to_addr"] == close_to
+
+
 async def test_multi_open_channel_cli_happy_path(tmp_path: Path) -> None:
     context = await prepare_regtest(tmp_path)
     peer_b = _required_env(PEER_B)
@@ -168,8 +197,8 @@ async def test_multi_open_channel_cli_happy_path(tmp_path: Path) -> None:
         mnemonic_file=context["mnemonic_file"],
         cln_socket=context["cln_socket"],
         destinations=[
-            (context["peer_id"], 100_000),
-            (peer_b, 150_000),
+            (context["peer_id"], 100_000, None),
+            (peer_b, 150_000, None),
         ],
     )
     _assert_cli_success(result)
