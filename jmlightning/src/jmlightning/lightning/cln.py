@@ -203,6 +203,7 @@ class CLNBackend(LightningBackend):
         peer_id: str,
         amount: int,
         announce: bool = False,
+        close_to: str | None = None,
     ) -> str:
         """Ask CLN for the 2-of-2 multisig address to fund the channel."""
         try:
@@ -210,12 +211,18 @@ class CLNBackend(LightningBackend):
                 peer_id,
                 amount,
                 announce=announce,
+                **({"close_to": close_to} if close_to is not None else {}),
             )
             funding_address = result.get("funding_address")
 
             if not isinstance(funding_address, str):
                 raise RuntimeError(
                     "CLN fundchannel_start response is missing funding_address"
+                )
+
+            if close_to is not None and not isinstance(result.get("close_to"), str):
+                raise RuntimeError(
+                    "CLN fundchannel_start did not negotiate the requested close_to"
                 )
 
             return funding_address

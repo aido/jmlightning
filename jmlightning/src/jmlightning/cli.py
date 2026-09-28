@@ -149,6 +149,13 @@ def open_channel(
             help="Skip interactive confirmation.",
         ),
     ] = False,
+    close_to: Annotated[
+        str | None,
+        typer.Option(
+            "--close-to",
+            help="Bitcoin address for the upfront shutdown script",
+        ),
+    ] = None,
 ) -> None:
     """
     Open a CLN channel using UTXOs strictly validated by the
@@ -174,6 +181,7 @@ def open_channel(
         resolved_mnemonic=resolved,
         amount=amount,
         mixdepth=mixdepth,
+        close_to=close_to,
     )
 
     confirm = None if yes else confirm_open_channel

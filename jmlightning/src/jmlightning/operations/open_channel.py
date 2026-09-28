@@ -306,6 +306,7 @@ class OpenChannelOperation:
                         peer_id=peer_id,
                         amount=plan.amount,
                         announce=self.config.announce,
+                        close_to=self.config.close_to,
                     ),
                     locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),

@@ -54,6 +54,58 @@ def test_open_channel_start_calls_fundchannel_start() -> None:
     assert result == "bc1qexample"
 
 
+def test_open_channel_start_passes_close_to_and_requires_negotiation() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.fundchannel_start.return_value = {
+        "funding_address": "bc1qexample",
+        "close_to": "0014" + "22" * 20,
+    }
+
+    result = backend.open_channel_start(
+        peer_id="02" + "11" * 32,
+        amount=150_000,
+        announce=False,
+        close_to="bcrt1qexample",
+    )
+
+    rpc.fundchannel_start.assert_called_once_with(
+        "02" + "11" * 32,
+        150_000,
+        announce=False,
+        close_to="bcrt1qexample",
+    )
+    assert result == "bc1qexample"
+
+
+def test_open_channel_start_rejects_unnegotiated_close_to() -> None:
+    rpc = Mock()
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    rpc.fundchannel_start.return_value = {
+        "funding_address": "bc1qexample",
+    }
+
+    with pytest.raises(RuntimeError, match="did not negotiate.*close_to"):
+        backend.open_channel_start(
+            peer_id="02" + "11" * 32,
+            amount=150_000,
+            announce=False,
+            close_to="bcrt1qexample",
+        )
+
+
 def test_open_channel_start_rejects_missing_funding_address() -> None:
     rpc = Mock()
 

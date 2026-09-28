@@ -24,6 +24,7 @@ class LightningBackend(ABC):
         peer_id: str,
         amount: int,
         announce: bool = False,
+        close_to: str | None = None,
     ) -> str:
         """
         Begin opening a channel and return the funding address.

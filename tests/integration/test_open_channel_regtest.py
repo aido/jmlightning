@@ -8,7 +8,7 @@ import pytest
 
 from jmlightning.operations.open_channel import OpenChannelOperation
 
-from .helpers import assert_channel_normal, prepare_regtest
+from .helpers import assert_channel_normal, lightning_rpc, prepare_regtest
 
 pytestmark = pytest.mark.anyio
 
@@ -96,6 +96,34 @@ async def test_open_channel_happy_path(tmp_path: Path) -> None:
         peer_socket=context["peer_socket"],
         peer_id=context["peer_id"],
     )
+
+
+async def test_open_channel_with_close_to(tmp_path: Path) -> None:
+    context = await prepare_regtest(tmp_path)
+    close_to = str(lightning_rpc(context["peer_socket"]).newaddr()["bech32"])
+    context["config"].close_to = close_to
+
+    operation = OpenChannelOperation(
+        config=context["config"],
+        cln_socket=Path(context["cln_socket"]),
+    )
+    await operation.execute(context["peer_id"])
+
+    assert_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+    )
+
+    channels = lightning_rpc(context["cln_socket"]).listpeerchannels(
+        context["peer_id"]
+    )["channels"]
+    matching = [
+        channel for channel in channels if channel.get("peer_id") == context["peer_id"]
+    ]
+    assert matching
+    assert matching[-1]["close_to_addr"] == close_to
 
 
 async def test_open_channel_cli_happy_path(tmp_path: Path) -> None:

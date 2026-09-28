@@ -235,6 +235,35 @@ def test_build_cln_config_defaults_bitcoin_network_to_none(
     assert captured["mixdepth"] == 3
 
 
+def test_build_cln_config_maps_close_to(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    backend = _backend()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        config,
+        "resolve_backend_settings",
+        lambda *args, **kwargs: backend,
+    )
+    monkeypatch.setattr(
+        config,
+        "CLNConfig",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+
+    config.build_cln_config(
+        settings=settings,
+        resolved_mnemonic=_resolved_mnemonic(),
+        amount=100_000,
+        mixdepth=2,
+        close_to="bcrt1qexample",
+    )
+
+    assert captured["close_to"] == "bcrt1qexample"
+
+
 def test_open_channel_exits_when_mnemonic_cannot_be_resolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -328,6 +357,45 @@ def test_open_channel_runs_operation_without_confirmation(
         "peer_id": "02" + "11" * 32,
         "confirm": None,
     }
+
+
+def test_open_channel_passes_close_to_to_config_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    build_calls: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: build_calls.update(kwargs) or object(),
+    )
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def execute(self, *, peer_id: str, confirm: object) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "OpenChannelOperation", FakeOperation)
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.open_channel(
+        peer_id="peer",
+        amount=100_000,
+        close_to="bcrt1qexample",
+        yes=True,
+    )
+
+    assert build_calls["close_to"] == "bcrt1qexample"
 
 
 def test_open_channel_passes_confirmation_callback_by_default(

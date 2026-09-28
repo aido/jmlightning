@@ -26,6 +26,7 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False
+    config.close_to = None
     config.fee_priority = FeePriority.NORMAL
 
     utxo = UTXOInfo(
@@ -103,6 +104,7 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
         peer_id=peer_id,
         amount=plan.amount,
         announce=config.announce,
+        close_to=config.close_to,
     )
 
     cln.open_channel_complete.assert_called_once_with(
@@ -170,6 +172,7 @@ def _build_open_channel_test_doubles() -> tuple[
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False
+    config.close_to = None
     config.fee_priority = FeePriority.NORMAL
 
     utxo = UTXOInfo(

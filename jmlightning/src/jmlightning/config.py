@@ -28,6 +28,9 @@ class CLNConfig(WalletConfig):
     announce: bool = Field(
         default=False, description="Announce the channel to the Lightning network"
     )
+    close_to: str | None = Field(
+        default=None, description="Bitcoin address for the upfront shutdown script"
+    )
     fee_priority: FeePriority = Field(
         default=FeePriority.NORMAL, description="Priority level for transaction fees"
     )
@@ -45,6 +48,7 @@ def build_cln_config(
     resolved_mnemonic: ResolvedMnemonic,
     amount: int = 0,
     mixdepth: int | None = None,
+    close_to: str | None = None,
 ) -> CLNConfig:
     """Build the JoinMarket Lightning configuration from common settings."""
     wallet = settings.wallet
@@ -88,4 +92,5 @@ def build_cln_config(
         reconstruct_history=wallet.reconstruct_history,
         amount=amount,
         mixdepth=0 if mixdepth is None else mixdepth,
+        close_to=close_to,
     )
