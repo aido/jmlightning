@@ -365,7 +365,9 @@ class RecoveryManager:
         finally:
             self.journal.release_lifetime()
 
-    async def _bitcoin_has_transaction(self, txid: str) -> bool | None:
+    async def _bitcoin_has_transaction(
+        self, record: RecoveryRecord, txid: str
+    ) -> bool | None:
         # Neutrino cannot establish transaction absence: its get_transaction()
         # lookup is limited to transactions observed in the watched mempool and
         # returns None for confirmed transactions as well as unknown ones.
@@ -374,15 +376,38 @@ class RecoveryManager:
         if self.adapter.config.backend_type == "neutrino":
             return None
 
-        transaction = await self.adapter.require_wallet().backend.get_transaction(txid)
-        # A transaction object is sufficient evidence that the selected input
-        # may already be spent; recovery therefore never releases it.
-        return transaction is not None
+        backend = self.adapter.require_wallet().backend
+        transaction = await backend.get_transaction(txid)
+        if transaction is not None:
+            # A transaction object is sufficient evidence that the selected input
+            # may already be spent; recovery therefore never releases it.
+            return True
+
+        # JoinMarket-NG's descriptor backend deliberately returns None for both
+        # an absent transaction and backend/RPC failures. Do not interpret that
+        # ambiguous result as proof that the transaction was never broadcast.
+        # Its authoritative mempool-spender lookup lets us instead inspect the
+        # recorded inputs directly. A current spender, including a confirmed
+        # spender reported by Bitcoin Core, proves that the reservation must be
+        # retained. A clean result for every recorded input proves that the
+        # recorded transaction cannot currently be spending any of them.
+        for input_txid, vout in record.locked_outpoints:
+            try:
+                spender = await backend.get_mempool_spender(input_txid, vout)
+            except Exception:
+                return None
+            if (
+                getattr(spender, "spending_txid", None) is not None
+                or getattr(spender, "blockhash", None) is not None
+            ):
+                return True
+
+        return False
 
     async def _reconcile(self, record: RecoveryRecord) -> bool:
         txid = record.txid
         if txid is not None:
-            bitcoin_has_transaction = await self._bitcoin_has_transaction(txid)
+            bitcoin_has_transaction = await self._bitcoin_has_transaction(record, txid)
             if bitcoin_has_transaction is not False:
                 # A Bitcoin backend observation is either evidence that the
                 # transaction exists or that its absence cannot be established.

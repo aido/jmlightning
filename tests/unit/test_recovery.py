@@ -160,6 +160,117 @@ async def test_recovery_does_not_release_when_bitcoin_backend_has_tx(
 
 
 @pytest.mark.anyio
+async def test_recovery_does_not_release_when_transaction_lookup_is_ambiguous(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    journal.update(
+        record_id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="descriptor_wallet")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    backend = SimpleNamespace(
+        get_transaction=AsyncMock(return_value=None),
+        get_mempool_spender=AsyncMock(side_effect=RuntimeError("RPC unavailable")),
+    )
+    setattr(
+        adapter, "require_wallet", Mock(return_value=SimpleNamespace(backend=backend))
+    )
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.ABSENT)
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == []
+    adapter.recover_release.assert_not_called()
+    assert journal.records()[0].id == record_id
+
+
+@pytest.mark.anyio
+async def test_recovery_uses_input_spender_lookup_after_ambiguous_transaction_lookup(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    journal.update(
+        record_id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="descriptor_wallet")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    backend = SimpleNamespace(
+        get_transaction=AsyncMock(return_value=None),
+        get_mempool_spender=AsyncMock(
+            return_value=SimpleNamespace(spending_txid=None, blockhash=None)
+        ),
+    )
+    setattr(
+        adapter, "require_wallet", Mock(return_value=SimpleNamespace(backend=backend))
+    )
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.ABSENT)
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == [record_id]
+    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+    backend.get_mempool_spender.assert_awaited_once_with("aa" * 32, 0)
+
+
+@pytest.mark.anyio
+async def test_recovery_does_not_release_when_recorded_input_is_spent(
+    tmp_path: Path,
+) -> None:
+    journal = RecoveryJournal(tmp_path)
+    record_id = journal.create("open_channel", {"peer_id": "peer"})
+    journal.update(
+        record_id,
+        locked_outpoints=[("aa" * 32, 0)],
+        owner_tokens={f"{'aa' * 32}:0": "owner"},
+        txid="bb" * 32,
+    )
+
+    config = Mock(data_dir=tmp_path, backend_type="descriptor_wallet")
+    manager = RecoveryManager(config, Path("/run/lightning-rpc"))
+    adapter = cast(Any, manager.adapter)
+    adapter.connect = AsyncMock()
+    adapter.close = AsyncMock()
+    backend = SimpleNamespace(
+        get_transaction=AsyncMock(return_value=None),
+        get_mempool_spender=AsyncMock(
+            return_value=SimpleNamespace(spending_txid="cc" * 32, blockhash=None)
+        ),
+    )
+    setattr(
+        adapter, "require_wallet", Mock(return_value=SimpleNamespace(backend=backend))
+    )
+    adapter.recover_release = Mock()
+    cln = cast(Any, manager.cln)
+    cln.get_channel_funding_status = Mock(return_value=ChannelFundingStatus.ABSENT)
+
+    resolved = await manager.reconcile_all()
+
+    assert resolved == []
+    adapter.recover_release.assert_not_called()
+
+
+@pytest.mark.anyio
 async def test_recovery_does_not_auto_release_with_neutrino_backend(
     tmp_path: Path,
 ) -> None:
@@ -212,7 +323,12 @@ async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
         "require_wallet",
         Mock(
             return_value=SimpleNamespace(
-                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+                backend=SimpleNamespace(
+                    get_transaction=AsyncMock(return_value=None),
+                    get_mempool_spender=AsyncMock(
+                        return_value=SimpleNamespace(spending_txid=None, blockhash=None)
+                    ),
+                )
             )
         ),
     )
@@ -258,7 +374,12 @@ async def test_recovery_keeps_all_owner_tokens_across_partial_release(
         "require_wallet",
         Mock(
             return_value=SimpleNamespace(
-                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+                backend=SimpleNamespace(
+                    get_transaction=AsyncMock(return_value=None),
+                    get_mempool_spender=AsyncMock(
+                        return_value=SimpleNamespace(spending_txid=None, blockhash=None)
+                    ),
+                )
             )
         ),
     )
@@ -300,7 +421,12 @@ async def test_multi_open_recovery_leaves_withheld_funding_pending(
         "require_wallet",
         Mock(
             return_value=SimpleNamespace(
-                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+                backend=SimpleNamespace(
+                    get_transaction=AsyncMock(return_value=None),
+                    get_mempool_spender=AsyncMock(
+                        return_value=SimpleNamespace(spending_txid=None, blockhash=None)
+                    ),
+                )
             )
         ),
     )
@@ -348,7 +474,12 @@ async def test_recovery_does_not_cancel_withheld_funding(
         "require_wallet",
         Mock(
             return_value=SimpleNamespace(
-                backend=SimpleNamespace(get_transaction=AsyncMock(return_value=None))
+                backend=SimpleNamespace(
+                    get_transaction=AsyncMock(return_value=None),
+                    get_mempool_spender=AsyncMock(
+                        return_value=SimpleNamespace(spending_txid=None, blockhash=None)
+                    ),
+                )
             )
         ),
     )
