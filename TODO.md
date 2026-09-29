@@ -3,8 +3,8 @@
 ## Lightning / JoinMarket integration
 
 - [x] Implement CLN `close_to` using a JoinMarket address.
+- [x] Implement splice-out
 - [ ] Implement splice sweep semantics (`amount=0`) end-to-end.
-- [ ] Implement splice-out
 - [ ] Support jmlightning-to-CLN RPC over a TCP socket.
 - [ ] Investigate Ring Change Channels and how they could fit into jmlightning (see #1).
 

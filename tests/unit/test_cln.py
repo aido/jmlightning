@@ -1111,3 +1111,25 @@ def test_get_fee_rate_rejects_invalid_explicit_cln_rate() -> None:
             priority=FeePriority.NORMAL,
             feerate="urgent",
         )
+
+
+def test_splice_out_fee_includes_new_channel_output_weight() -> None:
+    from types import SimpleNamespace
+
+    from jmlightning.lightning.cln import estimate_splice_out_fee
+
+    parsed = SimpleNamespace(
+        input_maps=[],
+        transaction=SimpleNamespace(
+            inputs=[],
+            outputs=[SimpleNamespace(script=b"\x00\x14" + b"\x00" * 20)],
+        ),
+    )
+
+    with patch("jmlightning.lightning.cln.parse_psbt", return_value=parsed):
+        fee, weight = estimate_splice_out_fee(b"psbt", 10_000)
+
+    # Existing payout (124 wu) + CLN's channel input (391 wu) +
+    # new P2WSH channel output (172 wu) + common tx fields (42 wu).
+    assert weight == 729
+    assert fee == 7_290

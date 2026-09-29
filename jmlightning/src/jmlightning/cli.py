@@ -37,8 +37,10 @@ from jmlightning.operations.open_channel import (
 )
 from jmlightning.operations.peerswap import PeerSwapPrepareTxOperation, PeerSwapRuntime
 from jmlightning.operations.splice import (
-    SpliceOperation,
+    SpliceInOperation,
+    SpliceOutOperation,
     confirm_splice_in,
+    confirm_splice_out,
 )
 from jmlightning.recovery import RecoveryJournalBusyError, RecoveryManager
 
@@ -411,11 +413,76 @@ def splice_in(
     confirm = None if yes else confirm_splice_in
 
     splice_txid = asyncio.run(
-        SpliceOperation(
+        SpliceInOperation(
             config=config,
             cln_socket=cln_socket,
         ).execute(
             channel_id=channel_id,
+            confirm=confirm,
+        )
+    )
+    typer.echo(f"Splice transaction: {splice_txid}")
+
+
+@app.command()
+def splice_out(
+    channel_id: Annotated[
+        str,
+        typer.Argument(help="The Lightning channel ID to splice out of"),
+    ],
+    amount: Annotated[
+        int,
+        typer.Option("--amount", "-a", help="Splice-out amount in sats"),
+    ],
+    cln_socket: Annotated[
+        Path,
+        typer.Option("--cln-socket", help="Path to CLN unix socket"),
+    ] = Path("/run/lightningd/lightning-rpc"),
+    mixdepth: Annotated[
+        int | None,
+        typer.Option("--mixdepth", "-m", help="Destination mixdepth (default 0)"),
+    ] = None,
+    data_dir: Annotated[
+        Path | None,
+        typer.Option("--data-dir", "-d", envvar="JOINMARKET_DATA_DIR"),
+    ] = None,
+    config_file: Annotated[
+        Path | None,
+        typer.Option("--config-file", envvar="JOINMARKET_CONFIG_FILE"),
+    ] = None,
+    mnemonic_file: Annotated[
+        Path | None,
+        typer.Option("--mnemonic-file", "-f", help="Path to mnemonic file"),
+    ] = None,
+    yes: Annotated[
+        bool,
+        typer.Option("--yes", "-y", help="Skip interactive confirmation."),
+    ] = False,
+) -> None:
+    """Splice funds out of an existing CLN channel into JoinMarket."""
+    if amount <= 0:
+        raise typer.BadParameter(
+            "splice-out amount must be greater than zero",
+            param_hint="--amount",
+        )
+
+    settings = setup_cli(data_dir=data_dir, config_file=config_file)
+    resolved = resolve_mnemonic(settings, mnemonic_file=mnemonic_file)
+    if not resolved:
+        logger.error("Could not resolve JoinMarket mnemonic.")
+        raise typer.Exit(1)
+
+    config = build_cln_config(
+        settings=settings,
+        resolved_mnemonic=resolved,
+        amount=amount,
+        mixdepth=mixdepth,
+    )
+    confirm = None if yes else confirm_splice_out
+    splice_txid = asyncio.run(
+        SpliceOutOperation(config=config, cln_socket=cln_socket).execute(
+            channel_id=channel_id,
+            amount=amount,
             confirm=confirm,
         )
     )

@@ -12,7 +12,7 @@ import pytest
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.operations.open_channel import OpenChannelOperation
-from jmlightning.operations.splice import SpliceOperation
+from jmlightning.operations.splice import SpliceInOperation, SpliceOutOperation
 
 from .helpers import (
     assert_channel_normal,
@@ -196,7 +196,27 @@ def _assert_joinmarket_input(
     ), f"splice transaction {txid} does not spend {source_txid}:{source_vout}"
 
 
-async def _open_channel(context: dict[str, Any]) -> str:
+def _assert_joinmarket_output(
+    *,
+    wallet: Any,
+    txid: str,
+    amount: int,
+) -> None:
+    utxos = [
+        utxo
+        for mixdepth in range(wallet.mixdepth_count)
+        for utxo in wallet.utxo_cache.get(mixdepth, [])
+    ]
+    assert any(utxo.txid == txid and utxo.value == amount for utxo in utxos), (
+        f"JoinMarket wallet does not contain {amount} sats from {txid}"
+    )
+
+
+async def _open_channel(
+    context: dict[str, Any],
+    *,
+    amount: int | None = None,
+) -> str:
     rpc = lightning_rpc(context["cln_socket"])
     channels = rpc.listpeerchannels(context["peer_id"]).get("channels", [])
     previous_channel_ids = {
@@ -205,8 +225,13 @@ async def _open_channel(context: dict[str, Any]) -> str:
         if isinstance(channel, dict) and isinstance(channel.get("channel_id"), str)
     }
 
+    config = (
+        context["config"].model_copy(update={"amount": amount})
+        if amount is not None
+        else context["config"]
+    )
     operation = OpenChannelOperation(
-        config=context["config"],
+        config=config,
         cln_socket=Path(context["cln_socket"]),
     )
     await operation.execute(context["peer_id"])
@@ -281,9 +306,68 @@ def _run_cli(
     )
 
 
+def _run_splice_out_cli(
+    *,
+    data_dir: Path,
+    mnemonic_file: Path,
+    cln_socket: str,
+    channel_id: str,
+    amount: int,
+    rpc_url: str,
+    confirm: bool = False,
+) -> CompletedProcess[str]:
+    env = os.environ.copy()
+    for name in (
+        "JOINMARKET_CONFIG_FILE",
+        "MNEMONIC",
+        "MNEMONIC_FILE",
+        "MNEMONIC_PASSWORD",
+    ):
+        env.pop(name, None)
+    env.update(
+        {
+            "NETWORK_CONFIG__NETWORK": "regtest",
+            "NETWORK_CONFIG__BITCOIN_NETWORK": "regtest",
+            "BITCOIN__BACKEND_TYPE": "descriptor_wallet",
+            "BITCOIN__RPC_URL": rpc_url,
+            "BITCOIN__RPC_USER": "test",
+            "BITCOIN__RPC_PASSWORD": "test",
+            "WALLET__MIXDEPTH_COUNT": "5",
+            "WALLET__GAP_LIMIT": "6",
+            "WALLET__SCAN_RANGE": "100",
+            "WALLET__MAX_SATS_FREEZE_REUSE": "-1",
+            "WALLET__RECONSTRUCT_HISTORY": "false",
+        }
+    )
+    command = [
+        "jm-lightning",
+        "splice-out",
+        channel_id,
+        "--amount",
+        str(amount),
+        "--cln-socket",
+        cln_socket,
+        "--data-dir",
+        str(data_dir),
+        "--mnemonic-file",
+        str(mnemonic_file),
+    ]
+    if not confirm:
+        command.append("--yes")
+    return subprocess.run(
+        command,
+        input="y\n" if confirm else None,
+        check=False,
+        capture_output=True,
+        text=True,
+        env=env,
+        timeout=180,
+    )
+
+
 def _assert_cli_success(result: CompletedProcess[str]) -> None:
     assert result.returncode == 0, (
-        f"jm-lightning splice-in failed:\n"
+        f"jm-lightning splice command failed:\n"
         f"stdout:\n{result.stdout}\n"
         f"stderr:\n{result.stderr}"
     )
@@ -304,7 +388,7 @@ async def test_splice_in_happy_path(tmp_path: Path) -> None:
     channel_id = await _open_channel(context)
     await _prepare_splice_utxo(context)
 
-    operation = SpliceOperation(
+    operation = SpliceInOperation(
         config=context["config"],
         cln_socket=Path(context["cln_socket"]),
     )
@@ -354,6 +438,126 @@ async def test_splice_in_cli_happy_path(tmp_path: Path) -> None:
         txid=funding_txid,
         source_txid=context["splice_source_txid"],
         source_vout=context["splice_source_vout"],
+    )
+
+
+async def test_splice_out_happy_path(tmp_path: Path) -> None:
+    context = await _prepare_splice_regtest(tmp_path)
+    channel_id = await _open_channel(context, amount=250_000)
+
+    operation = SpliceOutOperation(
+        config=context["config"],
+        cln_socket=Path(context["cln_socket"]),
+    )
+    splice_txid = await operation.execute(channel_id, 100_000)
+
+    _assert_splice_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+        channel_id=channel_id,
+        splice_txid=splice_txid,
+    )
+
+    tx = bitcoin_cli(
+        context["bitcoin_datadir"],
+        "getrawtransaction",
+        splice_txid,
+        "true",
+    )
+    assert any(
+        isinstance(output, dict)
+        and int(round(float(output["value"]) * 100_000_000)) == 100_000
+        for output in tx["vout"]
+    )
+
+    adapter = JoinMarketAdapter(context["config"])
+    await adapter.connect()
+    try:
+        wallet = adapter.require_wallet()
+        await wallet.sync_all()
+        _assert_joinmarket_output(
+            wallet=wallet,
+            txid=splice_txid,
+            amount=100_000,
+        )
+    finally:
+        await adapter.close()
+
+
+async def test_splice_out_cli_happy_path(tmp_path: Path) -> None:
+    context = await _prepare_splice_regtest(tmp_path)
+    channel_id = await _open_channel(context, amount=250_000)
+    result = _run_splice_out_cli(
+        data_dir=context["data_dir"],
+        mnemonic_file=context["mnemonic_file"],
+        cln_socket=context["cln_socket"],
+        channel_id=channel_id,
+        amount=50_000,
+        rpc_url=context["rpc_url"],
+    )
+    _assert_cli_success(result)
+    splice_txid = _splice_txid_from_cli(result)
+
+    _assert_splice_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+        channel_id=channel_id,
+        splice_txid=splice_txid,
+    )
+
+    tx = bitcoin_cli(
+        context["bitcoin_datadir"],
+        "getrawtransaction",
+        splice_txid,
+        "true",
+    )
+    assert any(
+        isinstance(output, dict)
+        and int(round(float(output["value"]) * 100_000_000)) == 50_000
+        for output in tx["vout"]
+    )
+
+    adapter = JoinMarketAdapter(context["config"])
+    await adapter.connect()
+    try:
+        wallet = adapter.require_wallet()
+        await wallet.sync_all()
+        _assert_joinmarket_output(
+            wallet=wallet,
+            txid=splice_txid,
+            amount=50_000,
+        )
+    finally:
+        await adapter.close()
+
+
+async def test_splice_out_cli_happy_path_with_confirmation(tmp_path: Path) -> None:
+    context = await _prepare_splice_regtest(tmp_path)
+    channel_id = await _open_channel(context, amount=250_000)
+    result = _run_splice_out_cli(
+        data_dir=context["data_dir"],
+        mnemonic_file=context["mnemonic_file"],
+        cln_socket=context["cln_socket"],
+        channel_id=channel_id,
+        amount=50_000,
+        rpc_url=context["rpc_url"],
+        confirm=True,
+    )
+    _assert_cli_success(result)
+    assert "Channel splice-out" in result.stdout
+    assert "Proceed with channel splice-out?" in result.stdout
+    splice_txid = _splice_txid_from_cli(result)
+    _assert_splice_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+        channel_id=channel_id,
+        splice_txid=splice_txid,
     )
 
 

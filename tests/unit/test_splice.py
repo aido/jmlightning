@@ -10,7 +10,8 @@ from jmwallet.wallet.models import UTXOInfo
 from jmlightning.lightning.backend import FeePriority
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.splice import (
-    SpliceOperation,
+    SpliceInOperation,
+    SpliceOutOperation,
     SpliceRecoveryRequiredError,
     confirm_splice_in,
 )
@@ -96,6 +97,132 @@ def _build_splice_test_doubles() -> tuple[
     return config, coin, jmadapter, cln, plan, tx_builder
 
 
+def _build_splice_out_test_doubles() -> tuple[Mock, Mock, Mock]:
+    config = Mock()
+    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-splice-out-test-"))
+    config.mixdepth = 0
+
+    wallet = Mock()
+    wallet.get_new_address_verified = AsyncMock(
+        return_value="bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+    )
+
+    jmadapter = Mock()
+    jmadapter.connect = AsyncMock()
+    jmadapter.close = AsyncMock()
+    jmadapter.require_wallet.return_value = wallet
+
+    cln = Mock()
+    cln.get_splice_feerate_per_kw.return_value = 10_000
+    cln.add_psbt_output.return_value = {"psbt": "b3V0cHV0LXBzYnQ="}
+    cln.splice_init.return_value = {"psbt": "aW5pdC1wc2J0"}
+    cln.splice_update.return_value = {
+        "psbt": "dXBkYXRlZC1wc2J0",
+        "commitments_secured": True,
+    }
+    cln.splice_signed.return_value = {
+        "tx": "02000000",
+        "txid": "44" * 32,
+        "psbt": "c2lnbmVkLXBzYnQ=",
+    }
+    return config, jmadapter, cln
+
+
+@pytest.mark.anyio
+async def test_splice_out_uses_cln_output_and_pays_initiator_fee() -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles()
+
+    with (
+        patch(
+            "jmlightning.operations.splice.JoinMarketAdapter",
+            return_value=jmadapter,
+        ),
+        patch("jmlightning.operations.splice.CLNBackend", return_value=cln),
+        patch(
+            "jmlightning.operations.splice.estimate_splice_out_fee",
+            return_value=(321, 579),
+        ),
+        patch.object(
+            SpliceOutOperation,
+            "_validate_splice_out_output",
+            return_value=None,
+        ),
+    ):
+        operation = SpliceOutOperation(config, Path("/tmp/lightning-rpc"))
+        txid = await operation.execute("22" * 32, 100_000)
+
+    assert txid == "44" * 32
+    cln.add_psbt_output.assert_called_once_with(
+        100_000, "bc1qxy2kgdygjrsqtzq2n0yrf2493p83kkfjhx0wlh"
+    )
+    cln.splice_init.assert_called_once_with(
+        channel_id="22" * 32,
+        amount=-100_321,
+        initial_psbt=b"output-psbt",
+        feerate_per_kw=10_000,
+    )
+    cln.splice_update.assert_called_once()
+    cln.splice_signed.assert_called_once()
+
+
+@pytest.mark.anyio
+async def test_splice_out_confirmation_decline_does_not_sign() -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles()
+
+    with (
+        patch(
+            "jmlightning.operations.splice.JoinMarketAdapter",
+            return_value=jmadapter,
+        ),
+        patch("jmlightning.operations.splice.CLNBackend", return_value=cln),
+        patch(
+            "jmlightning.operations.splice.estimate_splice_out_fee",
+            return_value=(321, 579),
+        ),
+        patch.object(
+            SpliceOutOperation,
+            "_validate_splice_out_output",
+            return_value=None,
+        ),
+    ):
+        operation = SpliceOutOperation(config, Path("/tmp/lightning-rpc"))
+        with pytest.raises(SpliceRecoveryRequiredError, match="declined"):
+            await operation.execute(
+                "22" * 32,
+                100_000,
+                confirm=lambda *_args: False,
+            )
+
+    cln.splice_signed.assert_not_called()
+
+
+@pytest.mark.anyio
+async def test_splice_out_init_failure_requires_recovery() -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles()
+    cln.splice_init.side_effect = RuntimeError("connection lost")
+
+    with (
+        patch(
+            "jmlightning.operations.splice.JoinMarketAdapter",
+            return_value=jmadapter,
+        ),
+        patch("jmlightning.operations.splice.CLNBackend", return_value=cln),
+        patch(
+            "jmlightning.operations.splice.estimate_splice_out_fee",
+            return_value=(321, 579),
+        ),
+    ):
+        operation = SpliceOutOperation(config, Path("/tmp/lightning-rpc"))
+        with pytest.raises(
+            SpliceRecoveryRequiredError,
+            match="splice_init outcome is unknown",
+        ):
+            await operation.execute("22" * 32, 100_000)
+
+    cln.splice_update.assert_not_called()
+    cln.splice_signed.assert_not_called()
+
+
 def _patch_splice_doubles(
     jmadapter: Mock,
     cln: Mock,
@@ -127,7 +254,7 @@ async def test_zero_amount_is_rejected_before_starting_splice() -> None:
     config, _coin, jmadapter, _cln, _plan, _tx_builder = _build_splice_test_doubles()
     config.amount = 0
 
-    operation = SpliceOperation(
+    operation = SpliceInOperation(
         config=config,
         cln_socket=Path("/tmp/lightning-rpc"),
     )
@@ -154,7 +281,7 @@ async def test_selection_requires_exactly_one_utxo() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -177,7 +304,7 @@ async def test_splice_init_failure_keeps_utxo_locked() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -199,7 +326,7 @@ async def test_splice_init_invalid_response_keeps_utxo_locked() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -221,7 +348,7 @@ async def test_local_failure_after_splice_init_keeps_utxo_locked() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -240,7 +367,7 @@ async def test_splice_update_failure_requires_recovery() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -274,7 +401,7 @@ async def test_splice_update_repeats_until_commitments_secured() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -311,7 +438,7 @@ async def test_tx_builder_failure_after_splice_init_keeps_utxo_locked() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -358,7 +485,7 @@ async def test_confirmation_happens_before_splice_signed() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -376,7 +503,7 @@ async def test_confirmation_rejection_prevents_splice_signed() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -404,7 +531,7 @@ async def test_confirmation_receives_actual_plan_and_psbt() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -428,7 +555,7 @@ async def test_splice_signing_failure_requires_recovery() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -451,7 +578,7 @@ async def test_successful_splice_keeps_inputs_locked() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -496,7 +623,7 @@ async def test_successful_splice_survives_close_failure() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -513,7 +640,7 @@ async def test_splice_signed_failure_requires_recovery() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -541,7 +668,7 @@ async def test_splice_signed_mismatched_txid_requires_recovery() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )
@@ -568,7 +695,7 @@ async def test_splice_signed_invalid_transaction_requires_recovery() -> None:
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with patches[0], patches[1], patches[2], patches[3]:
-        operation = SpliceOperation(
+        operation = SpliceInOperation(
             config=config,
             cln_socket=Path("/tmp/lightning-rpc"),
         )

@@ -329,7 +329,7 @@ The channel ID identifies the existing CLN channel to splice into. The requested
 
 The application will:
 
-1. Dispatch the command to `SpliceOperation`.
+1. Dispatch the command to `SpliceInOperation`.
 2. Connect to the JoinMarket wallet.
 3. Discover and classify available UTXOs.
 4. Ask the policy engine for UTXOs capable of `SPLICE`.
@@ -650,7 +650,7 @@ A splice-in follows the same policy-first approach as channel funding, but CLN o
 sequenceDiagram
     autonumber
     participant CLI
-    participant OP as SpliceOperation
+    participant OP as SpliceInOperation
     participant JM as JoinMarket-NG
     participant P as PolicyEngine
     participant PL as Planner
@@ -1111,7 +1111,7 @@ Implements the JoinMarket side of PeerSwap transaction preparation and the CLN r
 
 #### `operations/splice.py`
 
-Implements channel splice-in using a JoinMarket UTXO. `SpliceOperation` coordinates:
+Implements channel splice-in using a JoinMarket UTXO. `SpliceInOperation` coordinates:
 
 - JoinMarket wallet UTXO discovery
 - UTXO classification and `SPLICE` capability validation

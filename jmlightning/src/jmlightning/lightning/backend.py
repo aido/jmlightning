@@ -69,6 +69,19 @@ class LightningBackend(ABC):
         """
 
     @abstractmethod
+    def add_psbt_output(
+        self,
+        amount: int,
+        destination: str,
+        initial_psbt: bytes | None = None,
+    ) -> RPCResponse:
+        """Add a destination output to a PSBT using CLN's wallet.
+
+        The output is created by CLN so its splice PSBT metadata, including
+        the interactive transaction serial ID, remains authoritative.
+        """
+
+    @abstractmethod
     def splice_update(
         self,
         channel_id: str,

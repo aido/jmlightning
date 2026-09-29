@@ -9,12 +9,13 @@ from pathlib import Path
 from typing import TypeAlias, cast
 
 import typer
-from jmcore.bitcoin import estimate_vsize
+from jmcore.bitcoin import address_to_scriptpubkey, estimate_vsize
+from jmwallet.wallet.psbt import PSBTError, parse_psbt
 from loguru import logger
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
-from jmlightning.lightning.cln import CLNBackend
+from jmlightning.lightning.cln import CLNBackend, estimate_splice_out_fee
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
@@ -22,10 +23,8 @@ from jmlightning.policy import Capability, PolicyEngine
 from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
-SpliceConfirmationCallback = Callable[
-    [str, ExecutionPlan, bytes],
-    bool,
-]
+SpliceConfirmationCallback = Callable[[str, ExecutionPlan, bytes], bool]
+SpliceOutConfirmationCallback = Callable[[str, int, int, bytes], bool]
 
 
 SplicePhase: TypeAlias = LifecyclePhase
@@ -48,7 +47,7 @@ class SpliceRecoveryRequiredError(RuntimeError):
         self.locked_outpoints = locked_outpoints
 
 
-class SpliceOperation:
+class SpliceInOperation:
     """
     Execute a CLN channel splice-in using JoinMarket UTXOs.
 
@@ -772,6 +771,296 @@ class SpliceOperation:
         return txid
 
 
+class SpliceOutOperation:
+    """Execute a CLN channel splice-out into a fresh JoinMarket address."""
+
+    def __init__(self, config: CLNConfig, cln_socket: Path) -> None:
+        self.config = config
+        self.cln_socket = cln_socket
+
+    async def execute(
+        self,
+        channel_id: str,
+        amount: int,
+        confirm: SpliceOutConfirmationCallback | None = None,
+    ) -> str:
+        if amount <= 0:
+            raise ValueError("Splice-out amount must be greater than zero")
+
+        recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
+        recovery_id = recovery_journal.begin(
+            "splice",
+            {"channel_id": channel_id, "amount": amount, "direction": "out"},
+        )
+        jmadapter = JoinMarketAdapter(
+            config=self.config,
+            recovery_journal=recovery_journal,
+            recovery_id=recovery_id,
+        )
+        cln = CLNBackend(str(self.cln_socket))
+        lifecycle = OperationLifecycle()
+        txid: str | None = None
+        operation_error: Exception | None = None
+
+        try:
+            logger.info("Connecting to JoinMarket wallet...")
+            await jmadapter.connect()
+            wallet = jmadapter.require_wallet()
+
+            destination = await wallet.get_new_address_verified(self.config.mixdepth)
+            destination_script = address_to_scriptpubkey(destination)
+            feerate_per_kw = cln.get_splice_feerate_per_kw()
+
+            # CLN must create the output so the interactive transaction serial
+            # ID is correct. The resulting PSBT is also the basis for the
+            # initiator fee calculation: one channel input is added by CLN.
+            output_result = recovery_journal.call(
+                recovery_id,
+                action="splice_out_output",
+                phase=LifecyclePhase.STARTED.value,
+                fn=lambda: cln.add_psbt_output(amount, destination),
+                locked_outpoints=[],
+                owner_tokens={},
+            )
+            output_psbt_b64 = output_result.get("psbt")
+            if not isinstance(output_psbt_b64, str) or not output_psbt_b64:
+                raise SpliceRecoveryRequiredError(
+                    "CLN addpsbtoutput returned an invalid PSBT",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+
+            try:
+                output_psbt = base64.b64decode(output_psbt_b64, validate=True)
+                fee, weight = estimate_splice_out_fee(
+                    psbt=output_psbt,
+                    feerate_per_kw=feerate_per_kw,
+                )
+            except (ValueError, binascii.Error, PSBTError, RuntimeError) as exc:
+                raise SpliceRecoveryRequiredError(
+                    "Unable to calculate the splice-out fee from the CLN PSBT",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                ) from exc
+
+            # A splice-out removes both the payout and the initiator fee from
+            # this node's channel balance. This is the CLN convention for a
+            # negative relative_amount.
+            relative_amount = -(amount + fee)
+            logger.info(
+                "Splice-out amount: {} sats, fee: {} sats, weight: {} wu",
+                amount,
+                fee,
+                weight,
+            )
+
+            try:
+                result = recovery_journal.call(
+                    recovery_id,
+                    action="splice_init",
+                    phase=LifecyclePhase.STARTED.value,
+                    fn=lambda: cln.splice_init(
+                        channel_id=channel_id,
+                        amount=relative_amount,
+                        initial_psbt=output_psbt,
+                        feerate_per_kw=feerate_per_kw,
+                    ),
+                    locked_outpoints=[],
+                    owner_tokens={},
+                    psbt=output_psbt,
+                )
+            except Exception as exc:
+                lifecycle.release_locks = False
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_init outcome is unknown; splice-out requires recovery",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                ) from exc
+            returned_psbt = result.get("psbt")
+            if not isinstance(returned_psbt, str) or not returned_psbt:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_init returned an invalid PSBT",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+            try:
+                splice_psbt = base64.b64decode(returned_psbt, validate=True)
+            except (ValueError, binascii.Error) as exc:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_init returned an invalid PSBT encoding",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                ) from exc
+
+            lifecycle.transition(LifecyclePhase.STARTED)
+            lifecycle.release_locks = False
+            self._validate_splice_out_output(splice_psbt, amount, destination_script)
+
+            commitments_secured = False
+            while not commitments_secured:
+                update_result = recovery_journal.call(
+                    recovery_id,
+                    action="splice_update",
+                    phase=lifecycle.phase.value,
+                    fn=lambda: cln.splice_update(
+                        channel_id=channel_id,
+                        psbt=splice_psbt,
+                    ),
+                    locked_outpoints=[],
+                    owner_tokens={},
+                    psbt=splice_psbt,
+                )
+                returned_psbt = update_result.get("psbt")
+                if not isinstance(returned_psbt, str) or not returned_psbt:
+                    raise SpliceRecoveryRequiredError(
+                        "CLN splice_update returned an invalid PSBT",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=(),
+                    )
+                try:
+                    splice_psbt = base64.b64decode(returned_psbt, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise SpliceRecoveryRequiredError(
+                        "CLN splice_update returned an invalid PSBT encoding",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=(),
+                    ) from exc
+                self._validate_splice_out_output(
+                    splice_psbt,
+                    amount,
+                    destination_script,
+                )
+                secured = update_result.get("commitments_secured")
+                if not isinstance(secured, bool):
+                    raise SpliceRecoveryRequiredError(
+                        "CLN splice_update returned invalid commitments_secured",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=(),
+                    )
+                commitments_secured = secured
+                lifecycle.transition(
+                    LifecyclePhase.UPDATED if secured else LifecyclePhase.STARTED
+                )
+
+            if confirm is not None and not confirm(
+                channel_id, amount, fee, splice_psbt
+            ):
+                raise SpliceRecoveryRequiredError(
+                    "Channel splice-out declined by user",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+
+            signed_result = recovery_journal.call(
+                recovery_id,
+                action="splice_signed",
+                phase=lifecycle.phase.value,
+                fn=lambda: cln.splice_signed(
+                    channel_id=channel_id,
+                    psbt=splice_psbt,
+                ),
+                locked_outpoints=[],
+                owner_tokens={},
+                psbt=splice_psbt,
+            )
+            returned_txid = signed_result.get("txid")
+            returned_tx = signed_result.get("tx")
+            returned_psbt = signed_result.get("psbt")
+            if not isinstance(returned_txid, str) or not returned_txid:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_signed returned an invalid transaction id",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+            if not isinstance(returned_tx, str) or not returned_tx:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_signed returned an invalid transaction",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+            if not isinstance(returned_psbt, str) or not returned_psbt:
+                raise SpliceRecoveryRequiredError(
+                    "CLN splice_signed returned an invalid PSBT",
+                    channel_id=channel_id,
+                    txid=None,
+                    locked_outpoints=(),
+                )
+            txid = returned_txid
+            recovery_journal.update(
+                recovery_id,
+                txid=txid,
+                psbt=returned_psbt,
+            )
+            lifecycle.transition(LifecyclePhase.SIGNED)
+            logger.info("CLN accepted splice-out transaction {}.", txid)
+        except SpliceRecoveryRequiredError as exc:
+            operation_error = exc
+            raise
+        except Exception as exc:
+            operation_error = exc
+            raise
+        finally:
+            try:
+                await lifecycle.cleanup(
+                    locked=[],
+                    adapter=jmadapter,
+                    close_message="Failed to close JoinMarket wallet after splice-out",
+                    unlock_message="Failed to unlock",
+                )
+                lifecycle.resolve_if_clean(
+                    recovery_journal,
+                    recovery_id,
+                    terminal_phase=LifecyclePhase.SIGNED,
+                )
+                lifecycle.raise_recovery_if_needed(
+                    operation_error,
+                    SpliceRecoveryRequiredError,
+                    lambda error: SpliceRecoveryRequiredError(
+                        "Channel splice-out failed and cleanup also failed; "
+                        "manual recovery is required",
+                        channel_id=channel_id,
+                        txid=txid,
+                        locked_outpoints=(),
+                    ),
+                )
+            finally:
+                recovery_journal.release_lifetime()
+
+        if txid is None:
+            raise RuntimeError("Splice-out completed without a transaction id")
+        return txid
+
+    @staticmethod
+    def _validate_splice_out_output(
+        psbt: bytes,
+        amount: int,
+        destination_script: bytes,
+    ) -> None:
+        try:
+            parsed = parse_psbt(psbt)
+        except PSBTError as exc:
+            raise ValueError("Splice-out PSBT is invalid") from exc
+        if not any(
+            output.value == amount and output.script == destination_script
+            for output in parsed.transaction.outputs
+        ):
+            raise ValueError(
+                "Negotiated splice PSBT no longer contains the approved "
+                "JoinMarket destination"
+            )
+
+
 def confirm_splice_in(
     channel_id: str,
     plan: ExecutionPlan,
@@ -812,3 +1101,22 @@ def confirm_splice_in(
         "Proceed with channel splice-in?",
         default=False,
     )
+
+
+def confirm_splice_out(
+    channel_id: str,
+    amount: int,
+    fee: int,
+    psbt: bytes,
+) -> bool:
+    """Confirm a negotiated splice-out before submitting it to CLN."""
+    typer.echo("")
+    typer.echo("Channel splice-out")
+    typer.echo("==================")
+    typer.echo(f"Channel ID:       {channel_id}")
+    typer.echo(f"Splice-out amount: {amount:,} sats")
+    typer.echo(f"Fee:               {fee:,} sats")
+    typer.echo(f"Channel reduction: {amount + fee:,} sats")
+    typer.echo(f"Negotiated PSBT:   {len(psbt)} bytes")
+    typer.echo("")
+    return typer.confirm("Proceed with channel splice-out?", default=False)

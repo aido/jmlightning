@@ -41,7 +41,10 @@ class OperationLifecycle:
         self, phase: LifecyclePhase, *, release_locks: bool | None = None
     ) -> None:
         allowed = {
-            LifecyclePhase.PRESTART: {LifecyclePhase.LOCKED},
+            LifecyclePhase.PRESTART: {
+                LifecyclePhase.LOCKED,
+                LifecyclePhase.STARTED,
+            },
             LifecyclePhase.LOCKED: {
                 LifecyclePhase.LOCKED,
                 LifecyclePhase.STARTED,

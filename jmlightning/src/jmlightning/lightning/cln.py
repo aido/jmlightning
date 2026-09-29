@@ -108,6 +108,50 @@ def _core_weight(num_inputs: int, num_outputs: int) -> int:
     ) * 4 + 2
 
 
+def estimate_splice_out_fee(
+    psbt: bytes,
+    feerate_per_kw: int,
+) -> tuple[int, int]:
+    """Estimate the initiator fee for a channel-only splice-out.
+
+    The splice-out PSBT contains the payout output but no inputs before
+    ``splice_init``. CLN subsequently adds the existing 2-of-2 channel input
+    and the new 2-of-2 channel funding output. The BOLT #3 channel input is
+    387 wu and the P2WSH funding output is 172 wu. Both are paid for by the
+    splice initiator together with the common transaction fields.
+    """
+    if feerate_per_kw <= 0:
+        raise ValueError("Fee rate must be positive")
+    try:
+        parsed_psbt = parse_psbt(psbt)
+    except PSBTError as exc:
+        raise ValueError("Invalid splice-out PSBT") from exc
+
+    input_weight = sum(
+        _input_weight(parsed_psbt, index)
+        for index in range(len(parsed_psbt.input_maps))
+    )
+    output_weight = sum(
+        _output_weight(output.script) for output in parsed_psbt.transaction.outputs
+    )
+    # CLN's BOLT #3 2-of-2 channel input weighs 391 wu at the
+    # maximum 73-byte signature size used by psbt_input_get_weight().
+    channel_input_weight = 391
+    channel_output_weight = _output_weight(b"\x00\x20" + b"\x00" * 32)
+    output_count = len(parsed_psbt.transaction.outputs) + 1
+    weight = (
+        input_weight
+        + channel_input_weight
+        + output_weight
+        + channel_output_weight
+        + _core_weight(
+            len(parsed_psbt.transaction.inputs) + 1,
+            output_count,
+        )
+    )
+    return (feerate_per_kw * weight) // 1000, weight
+
+
 def estimate_splice_fee(
     psbt: bytes,
     feerate_per_kw: int,
@@ -291,6 +335,41 @@ class CLNBackend(LightningBackend):
             raise
         except Exception as exc:
             raise RuntimeError(f"Failed to initiate channel splice: {exc}") from exc
+
+    def add_psbt_output(
+        self,
+        amount: int,
+        destination: str,
+        initial_psbt: bytes | None = None,
+    ) -> dict[str, object]:
+        """Add a single output to a PSBT using CLN's wallet.
+
+        ``addpsbtoutput`` is used for splice-out because CLN must assign the
+        output its interactive transaction serial ID.
+        """
+        if amount <= 0:
+            raise ValueError("PSBT output amount must be positive")
+        if not destination:
+            raise ValueError("PSBT output destination must not be empty")
+
+        try:
+            result = self.rpc.addpsbtoutput(
+                satoshi=amount,
+                initialpsbt=(
+                    psbt_to_base64(initial_psbt) if initial_psbt is not None else None
+                ),
+                destination=destination,
+            )
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN addpsbtoutput returned an invalid response")
+            psbt = result.get("psbt")
+            if not isinstance(psbt, str) or not psbt:
+                raise RuntimeError("CLN addpsbtoutput response is missing psbt")
+            return dict(result)
+        except (RuntimeError, ValueError):
+            raise
+        except Exception as exc:
+            raise RuntimeError(f"Failed to add splice output: {exc}") from exc
 
     def splice_update(
         self,

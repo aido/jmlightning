@@ -515,7 +515,7 @@ def test_splice_in_runs_operation_without_confirmation(
 
     monkeypatch.setattr(
         cli,
-        "SpliceOperation",
+        "SpliceInOperation",
         FakeOperation,
     )
     monkeypatch.setattr(
@@ -602,7 +602,7 @@ def test_splice_in_passes_confirmation_callback_by_default(
 
     monkeypatch.setattr(
         cli,
-        "SpliceOperation",
+        "SpliceInOperation",
         FakeOperation,
     )
     monkeypatch.setattr(
@@ -656,7 +656,7 @@ def test_splice_in_skips_confirmation_with_yes(
 
     monkeypatch.setattr(
         cli,
-        "SpliceOperation",
+        "SpliceInOperation",
         FakeOperation,
     )
     monkeypatch.setattr(
