@@ -1,6 +1,6 @@
 # ⚡ jmlightning
 
-**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels, channel splice-in operations and PeerSwap transactions from JoinMarket-NG wallet UTXOs.
+**JoinMarket-NG to Lightning Network Bridge** - A privacy-conscious, policy-driven bridge for funding Lightning channels, channel splice-in and splice-out operations and PeerSwap transactions from JoinMarket-NG wallets.
 
 [![Licence: MIT](https://img.shields.io/badge/Licence-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python Version](https://img.shields.io/badge/python-3.11%2B-blue.svg)](https://www.python.org/)
@@ -40,7 +40,7 @@ The project separates three concerns:
 2. **The policy engine** determines what each classified UTXO is permitted to be used for.
 3. **Operations and execution components** perform the requested action only after the policy layer has approved it.
 
-The project supports Lightning channel funding, channel splice-in operations and PeerSwap through operation-specific paths that cannot bypass JoinMarket's UTXO policy.
+The project supports Lightning channel funding, channel splice-in and splice-out operations and PeerSwap through operation-specific paths that cannot bypass JoinMarket's UTXO policy.
 
 ### The Privacy Problem
 
@@ -360,6 +360,57 @@ Run:
 
 ```bash
 jm-lightning splice-in --help
+```
+
+for the options supported by the installed version.
+
+---
+
+### Splice Out to a JoinMarket Address
+
+A splice-out operation removes funds from an existing Lightning channel and sends them to a fresh JoinMarket wallet address without closing the channel. Unlike splice-in, no JoinMarket UTXO is selected or locked. The operation creates the payout output through CLN and lets CLN negotiate the complete splice transaction.
+
+For example:
+
+```bash
+jm-lightning splice-out \
+  1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef \
+  --amount 1000000 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+The channel ID identifies the existing CLN channel to splice out from. The requested amount is the amount sent to the new JoinMarket address. The channel balance is reduced by that amount plus the CLN initiator fee.
+
+The application will:
+
+1. Dispatch the command to `SpliceOutOperation`.
+2. Connect to the JoinMarket wallet.
+3. Generate and verify a fresh JoinMarket destination address in the requested mixdepth.
+4. Obtain CLN's recommended splice fee rate.
+5. Ask CLN to add the JoinMarket destination output to a PSBT.
+6. Calculate the exact initiator fee from the CLN PSBT using the splice transaction's channel input weight.
+7. Initialise the splice with a negative relative amount covering both the requested payout and the initiator fee.
+8. Exchange the PSBT with CLN until the splice commitments are secured.
+9. Verify that the requested JoinMarket output remains present throughout PSBT negotiation.
+10. Optionally ask the operator to confirm the negotiated splice transaction.
+11. Submit the negotiated PSBT to CLN with `splice_signed`.
+12. Leave the operation in recovery state if a CLN outcome is ambiguous rather than assuming the splice was abandoned.
+
+CLN remains the owner of the splice transaction. `jmlightning` does not select or sign a JoinMarket input for splice-out; the JoinMarket wallet only supplies the fresh destination address.
+
+The operation is implemented in:
+
+```text
+src/jmlightning/operations/splice.py
+```
+
+The CLI itself is responsible for parsing the command and dispatching the request to the operation.
+
+Run:
+
+```bash
+jm-lightning splice-out --help
 ```
 
 for the options supported by the installed version.
@@ -696,6 +747,45 @@ The important property is that **CLN remains the transaction authority for the s
 
 As with channel funding, an ambiguous RPC outcome deliberately leaves the JoinMarket input locked for recovery rather than assuming the splice was abandoned.
 
+## 🔀 Channel Splice-Out Flow
+
+A splice-out uses the same CLN-owned splice negotiation as splice-in, but the JoinMarket side contributes a fresh destination output rather than a wallet input. The output is created by CLN so its PSBT serial ID and transaction metadata remain consistent with the negotiated splice.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CLI
+    participant OP as SpliceOutOperation
+    participant JM as JoinMarket-NG
+    participant CLN as CLNBackend
+    participant TX as TxBuilder
+
+    CLI->>OP: Execute splice-out(channel_id, amount)
+    OP->>JM: Connect and synchronise
+    OP->>JM: Generate fresh destination
+    JM-->>OP: Verified JoinMarket address
+    OP->>CLN: Get splice fee rate
+    CLN-->>OP: Fee rate
+    OP->>CLN: addpsbtoutput(amount, destination)
+    CLN-->>OP: Initial PSBT with payout output
+    OP->>TX: Calculate exact CLN splice-out fee
+    TX-->>OP: Exact fee and weight
+    OP->>CLN: splice_init(channel_id, -(amount + fee), PSBT, feerate)
+    CLN-->>OP: Initial splice PSBT
+    loop Until commitments are secured
+        OP->>CLN: splice_update(PSBT)
+        CLN-->>OP: Updated PSBT and status
+        OP->>OP: Verify JoinMarket output
+    end
+    OP->>OP: Optional operator confirmation
+    OP->>CLN: splice_signed(PSBT)
+    CLN-->>OP: Accepted splice transaction
+```
+
+The important property is that **CLN remains the transaction authority for the splice**. The JoinMarket wallet provides only the destination address; CLN creates and negotiates the payout output, channel funding input and fee. `jmlightning` verifies that the requested JoinMarket output is preserved throughout negotiation before allowing the splice to complete.
+
+An ambiguous CLN outcome deliberately enters recovery rather than assuming the splice was abandoned. Since splice-out has no JoinMarket UTXO input, there is no JoinMarket input freeze to release or retain.
+
 ## 🤝 PeerSwap Flow
 
 PeerSwap uses a rendezvous layer between the CLN-side PeerSwap plugin and the JoinMarket operation. The bridge intercepts the transaction RPCs on the local PeerSwap RPC proxy, queues them in the rendezvous layer and exposes them to `jmlightning` through two CLN RPC methods: `jmpeerswap-request` and `jmpeerswap-response`. This is the actual transport used by the current implementation.
@@ -873,8 +963,8 @@ The repository test suite covers both independently installable packages and the
 - UTXO classification and policy enforcement
 - UTXO planning and selection
 - Bitcoin transaction construction
-- channel opening and splice-in operations
-- CLN/JoinMarket regtest workflows for channel funding and splice-in
+- channel opening and splice-in and splice-out operations
+- CLN/JoinMarket regtest workflows for channel funding, splice-in and splice-out
 - PeerSwap plugin, rendezvous and JoinMarket transaction lifecycle tests
 
 Run the complete test suite with:
@@ -1111,7 +1201,7 @@ Implements the JoinMarket side of PeerSwap transaction preparation and the CLN r
 
 #### `operations/splice.py`
 
-Implements channel splice-in using a JoinMarket UTXO. `SpliceInOperation` coordinates:
+Implements channel splice-in and splice-out. `SpliceInOperation` coordinates:
 
 - JoinMarket wallet UTXO discovery
 - UTXO classification and `SPLICE` capability validation
@@ -1121,7 +1211,15 @@ Implements channel splice-in using a JoinMarket UTXO. `SpliceInOperation` coordi
 - JoinMarket input construction and signing
 - CLN splice completion and recovery-safe cleanup
 
-CLN remains responsible for the existing channel and the negotiated splice transaction; the operation signs only the JoinMarket input.
+`SpliceOutOperation` coordinates:
+
+- JoinMarket fresh destination address generation
+- CLN splice fee retrieval and exact fee calculation
+- CLN payout-output creation and splice PSBT negotiation
+- Verification of the JoinMarket destination output throughout negotiation
+- CLN splice completion and recovery-safe handling of ambiguous outcomes
+
+CLN remains responsible for the existing channel and the negotiated splice transaction. Splice-in signs only the approved JoinMarket input while splice-out contributes only the JoinMarket destination output.
 
 #### `jmpeerswap/`
 
