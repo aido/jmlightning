@@ -327,6 +327,18 @@ jm-lightning splice-in \
 
 The channel ID identifies the existing CLN channel to splice into. The requested amount is the amount of new channel capacity contributed by the JoinMarket input; the CLN splice transaction also contains the existing channel funding input and the transaction fee.
 
+For a sweep, use `--amount 0`:
+
+```bash
+jm-lightning splice-in \
+  1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef \
+  --amount 0 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+A splice-in sweep consumes every UTXO in the requested mixdepth that passes the `SPLICE` capability policy. The complete policy-approved balance is added to the channel less the CLN splice fee, with no JoinMarket change output. The selected UTXOs are all locked for the duration of the splice and all are signed by the JoinMarket wallet.
+
 The application will:
 
 1. Dispatch the command to `SpliceInOperation`.
@@ -335,7 +347,7 @@ The application will:
 4. Ask the policy engine for UTXOs capable of `SPLICE`.
 5. Reject UTXOs that do not have that capability.
 6. Obtain CLN's recommended splice fee rate.
-7. Select exactly one policy-approved JoinMarket UTXO and build a conservative fee-aware plan.
+7. Select either exactly one policy-approved JoinMarket UTXO for a fixed amount or every policy-approved UTXO for a sweep, then build a fee-aware plan.
 8. Lock the selected UTXO before starting the CLN splice.
 9. Ask CLN to initialise the splice and obtain the negotiated PSBT.
 10. Calculate the exact initiator fee from the CLN splice PSBT.
@@ -370,6 +382,8 @@ for the options supported by the installed version.
 
 A splice-out operation removes funds from an existing Lightning channel and sends them to a fresh JoinMarket wallet address without closing the channel. Unlike splice-in, no JoinMarket UTXO is selected or locked. The operation creates the payout output through CLN and lets CLN negotiate the complete splice transaction.
 
+Passing `--amount 0` performs a splice sweep: the entire local channel balance is removed, less the CLN splice fee, and the resulting payout is sent to the fresh JoinMarket address. The channel remains open with the peer's remaining balance.
+
 For example:
 
 ```bash
@@ -381,6 +395,18 @@ jm-lightning splice-out \
 ```
 
 The channel ID identifies the existing CLN channel to splice out from. The requested amount is the amount sent to the new JoinMarket address. The channel balance is reduced by that amount plus the CLN initiator fee.
+
+For a sweep, use `--amount 0`:
+
+```bash
+jm-lightning splice-out \
+  1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef \
+  --amount 0 \
+  --mixdepth 1 \
+  --cln-socket /run/lightningd/lightning-rpc
+```
+
+A sweep reads the current local channel balance from CLN, calculates the splice fee and sends the remaining whole-satoshi balance to the fresh JoinMarket address. If the balance cannot cover the fee, the operation is rejected before `splice_init`.
 
 The application will:
 

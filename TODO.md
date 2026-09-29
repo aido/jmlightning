@@ -4,9 +4,9 @@
 
 - [x] Implement CLN `close_to` using a JoinMarket address.
 - [x] Implement splice-out
-- [ ] Implement splice sweep semantics (`amount=0`) end-to-end.
+- [x] Implement splice-in and splice-out sweep semantics (`amount=0`) end-to-end.
 - [ ] Support jmlightning-to-CLN RPC over a TCP socket.
-- [ ] Investigate Ring Change Channels and how they could fit into jmlightning (see #1).
+- [ ] Investigate Ring Change Channels and how they could fit into jmlightning (see discussion [here](https://github.com/aido/jmlightning/discussions/1)).
 
 ## Architecture / maintenance
 

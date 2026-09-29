@@ -15,7 +15,11 @@ from loguru import logger
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
-from jmlightning.lightning.cln import CLNBackend, estimate_splice_out_fee
+from jmlightning.lightning.cln import (
+    CLNBackend,
+    estimate_splice_in_fee,
+    estimate_splice_out_fee,
+)
 from jmlightning.models import ClassifiedUTXO
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
@@ -71,11 +75,10 @@ class SpliceInOperation:
         channel_id: str,
         confirm: SpliceConfirmationCallback | None = None,
     ) -> str:
-        if self.config.amount <= 0:
-            raise ValueError(
-                "Splice-in amount must be greater than zero; "
-                "splice sweep is not supported"
-            )
+        if self.config.amount < 0:
+            raise ValueError("Splice-in amount must not be negative")
+
+        sweep = self.config.amount == 0
 
         policy = PolicyEngine()
         planner = Planner()
@@ -172,88 +175,119 @@ class SpliceInOperation:
             # Selection and planning
             # --------------------------------------------------------
 
-            selection_target = self.config.amount
-            previous_outpoints: set[tuple[str, int]] | None = None
+            if sweep:
+                selected = list(allowed)
+                if not selected:
+                    raise RuntimeError(f"Unable to select UTXOs for {capability.name}")
 
-            while True:
-                selected_raw = jmadapter.select_utxos(
-                    mixdepth=self.config.mixdepth,
-                    target_amount=selection_target,
-                    allowed_outpoints=allowed_outpoints,
+                policy.validate(selected, capability)
+
+                input_types = [
+                    "p2wsh" if coin.utxo.is_p2wsh else "p2wpkh" for coin in selected
+                ]
+                splice_fee, splice_weight = estimate_splice_in_fee(
+                    input_types=input_types,
+                    feerate_per_kw=splice_feerate_per_kw,
+                    add_change_output=False,
                 )
+                total_value = sum(coin.utxo.value for coin in selected)
+                sweep_amount = total_value - splice_fee
+                if sweep_amount <= 0:
+                    raise ValueError("Insufficient funds after splice fees.")
 
-                try:
-                    selected = [
-                        classified_by_outpoint[(utxo.txid, utxo.vout)]
-                        for utxo in selected_raw
-                    ]
-                except KeyError as exc:
-                    raise RuntimeError(
-                        "JoinMarket selected a UTXO that was not "
-                        "present in the policy-approved selection pool"
-                    ) from exc
-
-                if len(selected) != 1:
-                    raise RuntimeError(
-                        "Splice-in requires exactly one policy-approved JoinMarket UTXO"
-                    )
-
-                policy.validate(
-                    selected,
-                    capability,
-                )
-
-                current_outpoints = {
-                    (coin.utxo.txid, coin.utxo.vout) for coin in selected
-                }
-
-                try:
-                    plan = planner.build_plan(
+                plan = replace(
+                    planner.build_plan(
                         selected_coins=selected,
-                        target_amount=self.config.amount,
+                        target_amount=0,
                         fee_rate=splice_feerate_per_kw / 250.0,
                         funding_output_type=cln.funding_output_type,
+                    ),
+                    amount=sweep_amount,
+                    fee=splice_fee,
+                    vsize=(splice_weight + 3) // 4,
+                    change=0,
+                )
+            else:
+                selection_target = self.config.amount
+                previous_outpoints: set[tuple[str, int]] | None = None
+
+                while True:
+                    selected_raw = jmadapter.select_utxos(
+                        mixdepth=self.config.mixdepth,
+                        target_amount=selection_target,
+                        allowed_outpoints=allowed_outpoints,
                     )
 
-                    # The normal planner does not know about the existing
-                    # channel 2-of-2 input that CLN charges to the initiator.
-                    # Reserve its CLN weight before committing to this UTXO.
-                    conservative_vsize = plan.vsize + 97
-                    conservative_fee = ceil(
-                        conservative_vsize * splice_feerate_per_kw / 250.0
-                    )
-                    if selected[0].utxo.value < self.config.amount + conservative_fee:
+                    try:
+                        selected = [
+                            classified_by_outpoint[(utxo.txid, utxo.vout)]
+                            for utxo in selected_raw
+                        ]
+                    except KeyError as exc:
+                        raise RuntimeError(
+                            "JoinMarket selected a UTXO that was not "
+                            "present in the policy-approved selection pool"
+                        ) from exc
+
+                    if len(selected) != 1:
+                        raise RuntimeError(
+                            "Splice-in requires exactly one policy-approved "
+                            "JoinMarket UTXO"
+                        )
+
+                    policy.validate(selected, capability)
+
+                    current_outpoints = {
+                        (coin.utxo.txid, coin.utxo.vout) for coin in selected
+                    }
+
+                    try:
+                        plan = planner.build_plan(
+                            selected_coins=selected,
+                            target_amount=self.config.amount,
+                            fee_rate=splice_feerate_per_kw / 250.0,
+                            funding_output_type=cln.funding_output_type,
+                        )
+
+                        conservative_vsize = plan.vsize + 97
+                        conservative_fee = ceil(
+                            conservative_vsize * splice_feerate_per_kw / 250.0
+                        )
+                        if (
+                            selected[0].utxo.value
+                            < self.config.amount + conservative_fee
+                        ):
+                            if previous_outpoints == current_outpoints:
+                                raise ValueError("Insufficient funds after fees.")
+                            previous_outpoints = current_outpoints
+                            selection_target = self.config.amount + conservative_fee
+                            continue
+
+                        break
+                    except ValueError as exc:
+                        if str(exc) != "Insufficient funds after fees.":
+                            raise
+
                         if previous_outpoints == current_outpoints:
-                            raise ValueError("Insufficient funds after fees.")
+                            raise
+
                         previous_outpoints = current_outpoints
-                        selection_target = self.config.amount + conservative_fee
-                        continue
 
-                    break
-                except ValueError as exc:
-                    if str(exc) != "Insufficient funds after fees.":
-                        raise
+                        input_types = [
+                            "p2wsh" if coin.utxo.is_p2wsh else "p2wpkh"
+                            for coin in selected
+                        ]
 
-                    if previous_outpoints == current_outpoints:
-                        raise
+                        vsize = estimate_vsize(
+                            input_types=input_types,
+                            output_types=[
+                                cln.funding_output_type,
+                                "p2wpkh",
+                            ],
+                        )
 
-                    previous_outpoints = current_outpoints
-
-                    input_types = [
-                        "p2wsh" if coin.utxo.is_p2wsh else "p2wpkh" for coin in selected
-                    ]
-
-                    vsize = estimate_vsize(
-                        input_types=input_types,
-                        output_types=[
-                            cln.funding_output_type,
-                            "p2wpkh",
-                        ],
-                    )
-
-                    estimated_fee = ceil(vsize * splice_feerate_per_kw / 250.0)
-
-                    selection_target = self.config.amount + estimated_fee
+                        estimated_fee = ceil(vsize * splice_feerate_per_kw / 250.0)
+                        selection_target = self.config.amount + estimated_fee
 
             for warning in plan.warnings:
                 logger.warning(warning)
@@ -355,15 +389,18 @@ class SpliceInOperation:
             # --------------------------------------------------------
 
             try:
-                splice_fee, splice_weight = tx_builder.estimate_splice_fee(
-                    psbt=initial_psbt,
+                input_types = [
+                    "p2wsh" if coin.utxo.is_p2wsh else "p2wpkh" for coin in selected
+                ]
+                splice_fee, splice_weight = estimate_splice_in_fee(
+                    input_types=input_types,
                     feerate_per_kw=splice_feerate_per_kw,
-                    add_change_output=self.config.amount != 0,
+                    add_change_output=not sweep,
                 )
             except (RuntimeError, ValueError) as exc:
                 lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
-                    "Unable to calculate the splice fee from the CLN PSBT; "
+                    "Unable to calculate the CLN splice fee; "
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
@@ -372,7 +409,9 @@ class SpliceInOperation:
                     ),
                 ) from exc
 
-            splice_change = selected[0].utxo.value - plan.amount - splice_fee
+            splice_change = (
+                0 if sweep else selected[0].utxo.value - plan.amount - splice_fee
+            )
             if splice_change < 0:
                 lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
@@ -404,24 +443,90 @@ class SpliceInOperation:
 
             jmadapter.renew_locks(locked)
 
-            change_address = jmadapter.get_change_address(
-                self.config.mixdepth,
-            )
-            previous_tx = await jmadapter.get_raw_transaction(
-                selected[0].utxo.txid,
-            )
-            splice_psbt, splice_contribution = tx_builder.add_splice_in_input(
-                psbt=initial_psbt,
-                coin=selected[0],
-                plan=splice_plan,
-                change_address=change_address,
-                wallet=jmadapter.require_wallet(),
-                prev_tx=previous_tx,
-            )
-            tx_builder.validate_splice_psbt(
-                psbt=splice_psbt,
-                contribution=splice_contribution,
-            )
+            wallet = jmadapter.require_wallet()
+            if sweep:
+                # Allocate the exact CLN initiator fee across the selected
+                # inputs. Each intermediate PSBT remains internally balanced
+                # and the final channel contribution is the complete sweep.
+                remaining_fee = splice_fee
+                sweep_coins = sorted(
+                    selected,
+                    key=lambda coin: coin.utxo.value,
+                    reverse=True,
+                )
+                splice_psbt = initial_psbt
+                splice_contribution = None
+
+                for index, coin in enumerate(sweep_coins):
+                    fee_for_input = min(remaining_fee, max(coin.utxo.value - 1, 0))
+                    remaining_fee -= fee_for_input
+                    input_plan = ExecutionPlan(
+                        inputs=[coin],
+                        amount=coin.utxo.value - fee_for_input,
+                        fee=fee_for_input,
+                        vsize=0,
+                        change=0,
+                        warnings=[],
+                        rationale="splice-in sweep input",
+                    )
+                    previous_tx = await jmadapter.get_raw_transaction(
+                        coin.utxo.txid,
+                    )
+                    splice_psbt, splice_contribution = tx_builder.add_splice_in_input(
+                        psbt=splice_psbt,
+                        coin=coin,
+                        plan=input_plan,
+                        change_address="",
+                        wallet=wallet,
+                        prev_tx=previous_tx,
+                    )
+                    tx_builder.validate_splice_psbt(
+                        psbt=splice_psbt,
+                        contribution=splice_contribution,
+                        required_inputs=selected,
+                    )
+
+                if remaining_fee != 0 or splice_contribution is None:
+                    raise SpliceRecoveryRequiredError(
+                        "Unable to allocate the splice sweep fee "
+                        "across JoinMarket inputs; "
+                        "JoinMarket UTXOs remain locked for recovery",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=tuple(
+                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
+                        ),
+                    )
+
+                # Each input is added with its share of the fee, but CLN sees
+                # the complete set of inputs and therefore applies their
+                # combined value less the fee to the channel output. Keep the
+                # contribution metadata aligned with that final aggregate.
+                splice_contribution = replace(
+                    splice_contribution,
+                    channel_contribution=plan.amount,
+                    max_fee=splice_fee,
+                )
+            else:
+                change_address = jmadapter.get_change_address(
+                    self.config.mixdepth,
+                )
+                previous_tx = await jmadapter.get_raw_transaction(
+                    selected[0].utxo.txid,
+                )
+                splice_psbt, splice_contribution = tx_builder.add_splice_in_input(
+                    psbt=initial_psbt,
+                    coin=selected[0],
+                    plan=splice_plan,
+                    change_address=change_address,
+                    wallet=wallet,
+                    prev_tx=previous_tx,
+                )
+                tx_builder.validate_splice_psbt(
+                    psbt=splice_psbt,
+                    contribution=splice_contribution,
+                    required_inputs=selected if sweep else None,
+                )
 
             # --------------------------------------------------------
             # Negotiate the splice PSBT with CLN
@@ -487,6 +592,7 @@ class SpliceInOperation:
                     tx_builder.validate_splice_psbt(
                         psbt=splice_psbt,
                         contribution=splice_contribution,
+                        required_inputs=selected if sweep else None,
                     )
                 except Exception as exc:
                     raise SpliceRecoveryRequiredError(
@@ -559,11 +665,20 @@ class SpliceInOperation:
             # PSBT rather than relying on input ordering. The peer may add
             # inputs during interactive negotiation.
             try:
-                jm_input_index = tx_builder.find_splice_input_index(
-                    psbt=splice_psbt,
-                    coin=plan.inputs[0],
-                )
-                signing_inputs = {jm_input_index: plan.inputs[0]}
+                if sweep:
+                    signing_inputs = {
+                        tx_builder.find_splice_input_index(
+                            psbt=splice_psbt,
+                            coin=coin,
+                        ): coin
+                        for coin in selected
+                    }
+                else:
+                    jm_input_index = tx_builder.find_splice_input_index(
+                        psbt=splice_psbt,
+                        coin=plan.inputs[0],
+                    )
+                    signing_inputs = {jm_input_index: plan.inputs[0]}
 
                 _signed_tx, _signed_txid, splice_psbt = tx_builder.sign_splice_psbt(
                     psbt=splice_psbt,
@@ -579,6 +694,7 @@ class SpliceInOperation:
                 tx_builder.validate_splice_psbt(
                     psbt=splice_psbt,
                     contribution=splice_contribution,
+                    required_inputs=selected if sweep else None,
                 )
             except Exception as exc:
                 raise SpliceRecoveryRequiredError(
@@ -784,8 +900,8 @@ class SpliceOutOperation:
         amount: int,
         confirm: SpliceOutConfirmationCallback | None = None,
     ) -> str:
-        if amount <= 0:
-            raise ValueError("Splice-out amount must be greater than zero")
+        if amount < 0:
+            raise ValueError("Splice-out amount must not be negative")
 
         recovery_journal = RecoveryJournal(cast(Path, self.config.data_dir))
         recovery_id = recovery_journal.begin(
@@ -811,6 +927,21 @@ class SpliceOutOperation:
             destination_script = address_to_scriptpubkey(destination)
             feerate_per_kw = cln.get_splice_feerate_per_kw()
 
+            sweep = amount == 0
+            if sweep:
+                local_balance = cln.get_channel_local_balance_sat(channel_id)
+                if local_balance <= 0:
+                    raise ValueError(
+                        "Cannot sweep splice-out: channel has no local balance"
+                    )
+                # The output amount does not affect transaction weight. Create a
+                # provisional output first so CLN can assign its interactive
+                # serial ID and so we can calculate the exact initiator fee.
+                provisional_amount = local_balance
+            else:
+                local_balance = None
+                provisional_amount = amount
+
             # CLN must create the output so the interactive transaction serial
             # ID is correct. The resulting PSBT is also the basis for the
             # initiator fee calculation: one channel input is added by CLN.
@@ -818,7 +949,7 @@ class SpliceOutOperation:
                 recovery_id,
                 action="splice_out_output",
                 phase=LifecyclePhase.STARTED.value,
-                fn=lambda: cln.add_psbt_output(amount, destination),
+                fn=lambda: cln.add_psbt_output(provisional_amount, destination),
                 locked_outpoints=[],
                 owner_tokens={},
             )
@@ -847,11 +978,50 @@ class SpliceOutOperation:
 
             # A splice-out removes both the payout and the initiator fee from
             # this node's channel balance. This is the CLN convention for a
-            # negative relative_amount.
+            # negative relative_amount. For amount=0, sweep the complete local
+            # channel balance after paying the initiator fee.
+            if sweep:
+                assert local_balance is not None
+                amount = local_balance - fee
+                if amount <= 0:
+                    raise ValueError(
+                        "Cannot sweep splice-out: channel balance is insufficient "
+                        "to pay the splice fee"
+                    )
+                # Recreate the output with the exact sweep amount. Output value
+                # is fixed-width in Bitcoin serialization, so the fee/weight is
+                # unchanged from the provisional PSBT.
+                output_result = recovery_journal.call(
+                    recovery_id,
+                    action="splice_out_output_sweep",
+                    phase=LifecyclePhase.STARTED.value,
+                    fn=lambda: cln.add_psbt_output(amount, destination),
+                    locked_outpoints=[],
+                    owner_tokens={},
+                )
+                output_psbt_b64 = output_result.get("psbt")
+                if not isinstance(output_psbt_b64, str) or not output_psbt_b64:
+                    raise SpliceRecoveryRequiredError(
+                        "CLN addpsbtoutput returned an invalid sweep PSBT",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=(),
+                    )
+                try:
+                    output_psbt = base64.b64decode(output_psbt_b64, validate=True)
+                except (ValueError, binascii.Error) as exc:
+                    raise SpliceRecoveryRequiredError(
+                        "CLN addpsbtoutput returned an invalid sweep PSBT encoding",
+                        channel_id=channel_id,
+                        txid=None,
+                        locked_outpoints=(),
+                    ) from exc
+
             relative_amount = -(amount + fee)
             logger.info(
-                "Splice-out amount: {} sats, fee: {} sats, weight: {} wu",
+                "Splice-out amount: {} sats{} fee: {} sats, weight: {} wu",
                 amount,
+                " (sweep)" if sweep else "",
                 fee,
                 weight,
             )

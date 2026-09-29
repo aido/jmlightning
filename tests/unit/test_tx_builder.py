@@ -448,21 +448,6 @@ def test_txid_is_returned_in_big_endian_display_order() -> None:
     assert txid == "9fdb136fcd039066632f8380ff533febcd6b7efb81cfce7083030b567b3426bb"
 
 
-def test_estimate_splice_fee_matches_cln_weight_for_channel_psbt() -> None:
-    builder = TxBuilder()
-
-    fee, weight = builder.estimate_splice_fee(
-        psbt=_build_cln_splice_psbt_v2(),
-        feerate_per_kw=258,
-    )
-
-    # The fixture has a P2WPKH input/output. CLN charges 271 wu for that
-    # input, plus 271 wu for the JM input, 124 wu for each output and 42 wu
-    # for the common transaction fields.
-    assert weight == 832
-    assert fee == 214
-
-
 def test_add_splice_in_input_accepts_cln_psbt_v2_and_preserves_metadata(
     classified_utxos: list[ClassifiedUTXO],
     splice_prev_tx: bytes,

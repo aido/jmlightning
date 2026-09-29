@@ -3,7 +3,7 @@ from unittest.mock import Mock, patch
 import pytest
 
 from jmlightning.lightning.backend import ChannelFundingStatus, FeePriority
-from jmlightning.lightning.cln import CLNBackend
+from jmlightning.lightning.cln import CLNBackend, estimate_splice_in_fee
 
 
 def test_cln_backend_creates_rpc_client() -> None:
@@ -1113,10 +1113,64 @@ def test_get_fee_rate_rejects_invalid_explicit_cln_rate() -> None:
         )
 
 
+def test_get_channel_local_balance_sat_uses_to_us_msat() -> None:
+    rpc = Mock()
+    rpc.listpeerchannels.return_value = {
+        "channels": [
+            {
+                "channel_id": "22" * 32,
+                "to_us_msat": 250_999,
+            }
+        ]
+    }
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    assert backend.get_channel_local_balance_sat("22" * 32) == 250
+    rpc.listpeerchannels.assert_called_once_with(channel_id="22" * 32)
+
+
+def test_get_channel_capacity_sat_uses_amount_msat() -> None:
+    rpc = Mock()
+    rpc.listpeerchannels.return_value = {
+        "channels": [
+            {"channel_id": "22" * 32, "amount_msat": 250_999},
+        ]
+    }
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    assert backend.get_channel_capacity_sat("22" * 32) == 250
+
+
+def test_get_channel_local_balance_sat_rejects_missing_channel() -> None:
+    rpc = Mock()
+    rpc.listpeerchannels.return_value = {"channels": []}
+
+    with patch(
+        "jmlightning.lightning.cln.LightningRpc",
+        return_value=rpc,
+    ):
+        backend = CLNBackend("/tmp/lightning-rpc")
+
+    with pytest.raises(RuntimeError, match="was not found"):
+        backend.get_channel_local_balance_sat("22" * 32)
+
+
 def test_splice_out_fee_includes_new_channel_output_weight() -> None:
     from types import SimpleNamespace
 
-    from jmlightning.lightning.cln import estimate_splice_out_fee
+    from jmlightning.lightning.cln import (
+        estimate_splice_out_fee,
+    )
 
     parsed = SimpleNamespace(
         input_maps=[],
@@ -1133,3 +1187,17 @@ def test_splice_out_fee_includes_new_channel_output_weight() -> None:
     # new P2WSH channel output (172 wu) + common tx fields (42 wu).
     assert weight == 729
     assert fee == 7_290
+
+
+def test_estimate_splice_in_fee_uses_all_joinmarket_inputs() -> None:
+    one_fee, one_weight = estimate_splice_in_fee(["p2wpkh"], 250, False)
+    two_fee, two_weight = estimate_splice_in_fee(["p2wpkh", "p2wsh"], 250, False)
+    two_change_fee, two_change_weight = estimate_splice_in_fee(
+        ["p2wpkh", "p2wsh"], 250, True
+    )
+
+    assert one_weight > 0
+    assert two_weight > one_weight
+    assert two_fee > one_fee
+    assert two_change_weight > two_weight
+    assert two_change_fee > two_fee

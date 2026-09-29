@@ -108,7 +108,7 @@ class TxBuilder:
         self,
         plan: ExecutionPlan,
         funding_address: str,
-        change_address: str,
+        change_address: str | None,
         wallet: WalletService,
         finalise_psbt: bool = False,
     ) -> tuple[ParsedTransaction, str, int, bytes]:
@@ -138,6 +138,8 @@ class TxBuilder:
         funding_vout = 0
 
         if plan.change > 0:
+            if change_address is None:
+                raise ValueError("Change address is required when change is non-zero")
             tx_outputs.append(
                 TxOutput.from_address(
                     change_address,
@@ -307,19 +309,6 @@ class TxBuilder:
             finalise_transaction=finalise_psbt,
         )
 
-    def estimate_splice_fee(
-        self,
-        psbt: bytes,
-        feerate_per_kw: int,
-        add_change_output: bool = True,
-    ) -> tuple[int, int]:
-        """Estimate the initiator fee using CLN compatibility rules."""
-        return cln_compat.estimate_splice_fee(
-            psbt=psbt,
-            feerate_per_kw=feerate_per_kw,
-            add_change_output=add_change_output,
-        )
-
     def add_splice_in_input(
         self,
         psbt: bytes,
@@ -453,7 +442,9 @@ class TxBuilder:
 
         change = plan.change
         change_output = (
-            TxOutput.from_address(change_address, change) if change > 0 else None
+            TxOutput.from_address(change_address, change)
+            if change > 0 and change_address is not None
+            else None
         )
 
         new_input = TxInput.from_hex(
@@ -616,6 +607,7 @@ class TxBuilder:
         self,
         psbt: bytes,
         contribution: SpliceContribution,
+        required_inputs: list[ClassifiedUTXO] | None = None,
     ) -> None:
         """Validate immutable splice economics before JoinMarket signing."""
         try:
@@ -641,6 +633,25 @@ class TxBuilder:
             )
         if self._psbt_input_value(parsed, matches[0]) != contribution.jm_value:
             raise RuntimeError("Splice PSBT JoinMarket input value was changed")
+
+        if required_inputs is not None:
+            for required in required_inputs:
+                required_matches = [
+                    index
+                    for index, tx_input in enumerate(parsed.transaction.inputs)
+                    if (tx_input.txid, tx_input.vout)
+                    == (required.utxo.txid, required.utxo.vout)
+                ]
+                if len(required_matches) != 1:
+                    raise RuntimeError(
+                        "Splice PSBT must contain each approved JoinMarket UTXO "
+                        "exactly once"
+                    )
+                if (
+                    self._psbt_input_value(parsed, required_matches[0])
+                    != required.utxo.value
+                ):
+                    raise RuntimeError("Splice PSBT JoinMarket input value was changed")
 
         actual = Counter((o.value, o.script) for o in parsed.transaction.outputs)
         expected_pre = Counter(contribution.baseline_outputs)

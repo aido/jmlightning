@@ -441,6 +441,42 @@ async def test_splice_in_cli_happy_path(tmp_path: Path) -> None:
     )
 
 
+async def test_splice_in_sweep_happy_path(tmp_path: Path) -> None:
+    context = await _prepare_splice_regtest(tmp_path)
+    channel_id = await _open_channel(context)
+    await _prepare_splice_utxo(context)
+
+    operation = SpliceInOperation(
+        config=context["config"].model_copy(update={"amount": 0}),
+        cln_socket=Path(context["cln_socket"]),
+    )
+    splice_txid = await operation.execute(channel_id)
+
+    funding_txid = _assert_splice_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+        channel_id=channel_id,
+        splice_txid=splice_txid,
+    )
+    _assert_joinmarket_input(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        txid=funding_txid,
+        source_txid=context["splice_source_txid"],
+        source_vout=context["splice_source_vout"],
+    )
+
+    channel = next(
+        channel
+        for channel in lightning_rpc(context["cln_socket"]).listpeerchannels(
+            channel_id=channel_id
+        )["channels"]
+        if channel.get("channel_id") == channel_id
+    )
+    assert channel["to_us_msat"] > 100_000_000
+
+
 async def test_splice_out_happy_path(tmp_path: Path) -> None:
     context = await _prepare_splice_regtest(tmp_path)
     channel_id = await _open_channel(context, amount=250_000)
@@ -484,6 +520,65 @@ async def test_splice_out_happy_path(tmp_path: Path) -> None:
         )
     finally:
         await adapter.close()
+
+
+async def _move_channel_balance_to_peer(
+    context: dict[str, Any],
+    amount_msat: int,
+) -> None:
+    peer_rpc = lightning_rpc(context["peer_socket"])
+    source_rpc = lightning_rpc(context["cln_socket"])
+    label = f"splice-sweep-{time.time_ns()}"
+    invoice = peer_rpc.invoice(
+        amount_msat=amount_msat,
+        label=label,
+        description="splice sweep test",
+    )
+    bolt11 = invoice.get("bolt11")
+    assert isinstance(bolt11, str) and bolt11
+    source_rpc.pay(bolt11)
+
+
+async def test_splice_out_sweep_happy_path(tmp_path: Path) -> None:
+    context = await _prepare_splice_regtest(tmp_path)
+    channel_id = await _open_channel(context, amount=250_000)
+    await _move_channel_balance_to_peer(context, 100_000_000)
+
+    operation = SpliceOutOperation(
+        config=context["config"],
+        cln_socket=Path(context["cln_socket"]),
+    )
+    splice_txid = await operation.execute(channel_id, 0)
+
+    _assert_splice_channel_normal(
+        bitcoin_datadir=context["bitcoin_datadir"],
+        cln_socket=context["cln_socket"],
+        peer_socket=context["peer_socket"],
+        peer_id=context["peer_id"],
+        channel_id=channel_id,
+        splice_txid=splice_txid,
+    )
+
+    tx = bitcoin_cli(
+        context["bitcoin_datadir"],
+        "getrawtransaction",
+        splice_txid,
+        "true",
+    )
+    payout_values = [
+        int(round(float(output["value"]) * 100_000_000))
+        for output in tx["vout"]
+        if isinstance(output, dict)
+    ]
+    assert any(0 < value < 250_000 for value in payout_values)
+
+    peer_rpc = lightning_rpc(context["cln_socket"])
+    channel = next(
+        channel
+        for channel in peer_rpc.listpeerchannels(channel_id=channel_id)["channels"]
+        if channel.get("channel_id") == channel_id
+    )
+    assert channel["to_us_msat"] == 0
 
 
 async def test_splice_out_cli_happy_path(tmp_path: Path) -> None:

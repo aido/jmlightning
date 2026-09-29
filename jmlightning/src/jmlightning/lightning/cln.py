@@ -152,34 +152,43 @@ def estimate_splice_out_fee(
     return (feerate_per_kw * weight) // 1000, weight
 
 
-def estimate_splice_fee(
-    psbt: bytes,
+def estimate_splice_in_fee(
+    input_types: list[str],
     feerate_per_kw: int,
     add_change_output: bool = True,
 ) -> tuple[int, int]:
-    """Estimate a CLN splice initiator fee using CLN's weight rules."""
+    """Estimate the CLN initiator fee for a splice-in transaction.
+
+    ``input_types`` describes the JoinMarket inputs contributed by this
+    node. CLN also charges the initiator for the existing 2-of-2 channel
+    input, the new P2WSH channel output and, when requested, the JoinMarket
+    change output. This covers both fixed-amount splice-ins and sweeps.
+    """
     if feerate_per_kw <= 0:
         raise ValueError("Fee rate must be positive")
+
+    input_weights = {
+        "p2wpkh": 271,
+        "p2wsh": 387,
+    }
     try:
-        parsed_psbt = parse_psbt(psbt)
-    except PSBTError as exc:
-        raise ValueError("Invalid splice PSBT") from exc
-    input_weight = sum(
-        _input_weight(parsed_psbt, index)
-        for index in range(len(parsed_psbt.input_maps))
-    )
-    output_weight = sum(
-        _output_weight(output.script) for output in parsed_psbt.transaction.outputs
-    )
-    input_weight += 271
-    output_count = len(parsed_psbt.transaction.outputs)
+        joinmarket_weight = sum(input_weights[input_type] for input_type in input_types)
+    except KeyError as exc:
+        raise ValueError(f"Unsupported splice input type: {exc.args[0]}") from exc
+
+    channel_input_weight = 391
+    channel_output_weight = _output_weight(b"\x00\x20" + b"\x00" * 32)
+    output_count = 1
+    output_weight = channel_output_weight
     if add_change_output:
         output_weight += 124
         output_count += 1
+
     weight = (
-        input_weight
+        channel_input_weight
+        + joinmarket_weight
         + output_weight
-        + _core_weight(len(parsed_psbt.transaction.inputs) + 1, output_count)
+        + _core_weight(len(input_types) + 1, output_count)
     )
     return (feerate_per_kw * weight) // 1000, weight
 
@@ -591,6 +600,66 @@ class CLNBackend(LightningBackend):
             raise RuntimeError(
                 f"Failed to send funding PSBT through CLN: {exc}"
             ) from exc
+
+    def get_channel_local_balance_sat(self, channel_id: str) -> int:
+        """Return the channel balance currently owed to this node in sats.
+
+        ``to_us_msat`` is CLN's authoritative channel balance field. A splice
+        amount is denominated in whole satoshis, so any sub-satoshi remainder
+        is deliberately rounded down.
+        """
+        try:
+            result = self.rpc.listpeerchannels(channel_id=channel_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to retrieve channel balance for {channel_id}: {exc}"
+            ) from exc
+
+        if not isinstance(result, dict):
+            raise RuntimeError("CLN listpeerchannels returned an invalid response")
+        channels = result.get("channels")
+        if not isinstance(channels, list):
+            raise RuntimeError("CLN listpeerchannels returned invalid channels data")
+
+        for channel in channels:
+            if not isinstance(channel, dict):
+                continue
+            if channel.get("channel_id") not in (None, channel_id):
+                continue
+            value = channel.get("to_us_msat")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    "CLN listpeerchannels returned an invalid to_us_msat value"
+                )
+            return value // 1000
+
+        raise RuntimeError(f"CLN channel {channel_id} was not found")
+
+    def get_channel_capacity_sat(self, channel_id: str) -> int:
+        """Return the channel capacity in sats."""
+        try:
+            result = self.rpc.listpeerchannels(channel_id=channel_id)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to retrieve channel capacity for {channel_id}: {exc}"
+            ) from exc
+
+        if not isinstance(result, dict) or not isinstance(result.get("channels"), list):
+            raise RuntimeError("CLN listpeerchannels returned invalid channel data")
+
+        for channel in result["channels"]:
+            if not isinstance(channel, dict):
+                continue
+            if channel.get("channel_id") not in (None, channel_id):
+                continue
+            value = channel.get("amount_msat")
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise RuntimeError(
+                    "CLN listpeerchannels returned an invalid amount_msat value"
+                )
+            return value // 1000
+
+        raise RuntimeError(f"CLN channel {channel_id} was not found")
 
     def get_splice_feerate_per_kw(self) -> int:
         """Return CLN's current splice feerate in sat/kw."""

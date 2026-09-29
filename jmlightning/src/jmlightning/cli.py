@@ -329,7 +329,7 @@ def splice_in(
         typer.Option(
             "--amount",
             "-a",
-            help="Splice-in amount in sats",
+            help="Splice-in amount in sats (0 for sweep)",
         ),
     ],
     cln_socket: Annotated[
@@ -383,9 +383,9 @@ def splice_in(
 ) -> None:
     """Splice a JoinMarket UTXO into an existing CLN channel."""
 
-    if amount <= 0:
+    if amount < 0:
         raise typer.BadParameter(
-            "splice-in amount must be greater than zero; splice sweep is not supported",
+            "splice-in amount must not be negative (0 for sweep)",
             param_hint="--amount",
         )
 
@@ -432,7 +432,7 @@ def splice_out(
     ],
     amount: Annotated[
         int,
-        typer.Option("--amount", "-a", help="Splice-out amount in sats"),
+        typer.Option("--amount", "-a", help="Splice-out amount in sats (0 for sweep)"),
     ],
     cln_socket: Annotated[
         Path,
@@ -460,9 +460,9 @@ def splice_out(
     ] = False,
 ) -> None:
     """Splice funds out of an existing CLN channel into JoinMarket."""
-    if amount <= 0:
+    if amount < 0:
         raise typer.BadParameter(
-            "splice-out amount must be greater than zero",
+            "splice-out amount must not be negative (0 for sweep)",
             param_hint="--amount",
         )
 
