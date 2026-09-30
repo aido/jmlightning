@@ -468,7 +468,8 @@ For example:
 ```bash
 jm-lightning peerswap-swap-in \
   <short-channel-id> \
-  1000000 \
+  --amount 1000000 \
+  --premium-limit-ppm 25 \
   --mixdepth 1 \
   --cln-socket /run/lightningd/lightning-rpc
 ```
@@ -491,7 +492,8 @@ Swap-out uses the same JoinMarket transaction boundary but invokes PeerSwap's `p
 ```bash
 jm-lightning peerswap-swap-out \
   <short-channel-id> \
-  1000000 \
+  --amount 1000000 \
+  --premium-rate-limit-ppm 25 \
   --mixdepth 1 \
   --cln-socket /run/lightningd/lightning-rpc
 ```

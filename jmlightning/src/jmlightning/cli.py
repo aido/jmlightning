@@ -160,7 +160,7 @@ def open_channel(
     ] = None,
 ) -> None:
     """
-    Open a CLN channel using UTXOs strictly validated by the
+    Open a Lightning channel using UTXOs strictly validated by the
     capability policy engine.
     """
 
@@ -258,7 +258,7 @@ def multi_open_channel(
         ),
     ] = False,
 ) -> None:
-    """Fund multiple CLN channels with one JoinMarket transaction."""
+    """Fund multiple Lightning channels with one JoinMarket transaction."""
     if not destination:
         raise typer.BadParameter("At least one --destination is required")
 
@@ -381,7 +381,7 @@ def splice_in(
         ),
     ] = False,
 ) -> None:
-    """Splice a JoinMarket UTXO into an existing CLN channel."""
+    """Splice a JoinMarket UTXO into an existing Lightning channel."""
 
     if amount < 0:
         raise typer.BadParameter(
@@ -459,7 +459,7 @@ def splice_out(
         typer.Option("--yes", "-y", help="Skip interactive confirmation."),
     ] = False,
 ) -> None:
-    """Splice funds out of an existing CLN channel into JoinMarket."""
+    """Splice funds out of an existing Lightning channel into JoinMarket."""
     if amount < 0:
         raise typer.BadParameter(
             "splice-out amount must not be negative (0 for sweep)",
@@ -592,10 +592,27 @@ def _run_peerswap_rpc(
 
 @app.command()
 def peerswap_swap_in(
-    short_channel_id: Annotated[str, typer.Argument()],
-    amt_sat: Annotated[int, typer.Argument()],
-    asset: Annotated[str, typer.Argument()],
-    premium_limit_ppm: Annotated[int, typer.Argument()],
+    short_channel_id: Annotated[
+        str,
+        typer.Argument(
+            help="The Lightning channel ID to swap into",
+        ),
+    ],
+    amount: Annotated[
+        int,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Swap amount in sats",
+        ),
+    ],
+    premium_limit_ppm: Annotated[
+        int,
+        typer.Option(
+            "--premium-limit-ppm",
+            help="Maximum premium in parts per million",
+        ),
+    ],
     force: Annotated[bool, typer.Option("--force")] = False,
     cln_socket: Annotated[
         Path,
@@ -620,15 +637,15 @@ def peerswap_swap_in(
         data_dir=data_dir,
         config_file=config_file,
         mnemonic_file=mnemonic_file,
-        amount=amt_sat,
+        amount=amount,
         mixdepth=mixdepth,
     )
     _run_peerswap_rpc(
         method="peerswap-swap-in",
         params={
             "short_channel_id": short_channel_id,
-            "amt_sat": amt_sat,
-            "asset": asset,
+            "amt_sat": amount,
+            "asset": "btc",
             "premium_limit_ppm": premium_limit_ppm,
             "force": force,
         },
@@ -639,10 +656,27 @@ def peerswap_swap_in(
 
 @app.command()
 def peerswap_swap_out(
-    short_channel_id: Annotated[str, typer.Argument()],
-    amt_sat: Annotated[int, typer.Argument()],
-    asset: Annotated[str, typer.Argument()],
-    premium_rate_limit_ppm: Annotated[int, typer.Argument()],
+    short_channel_id: Annotated[
+        str,
+        typer.Argument(
+            help="The Lightning channel ID to swap out of",
+        ),
+    ],
+    amount: Annotated[
+        int,
+        typer.Option(
+            "--amount",
+            "-a",
+            help="Swap amount in sats",
+        ),
+    ],
+    premium_rate_limit_ppm: Annotated[
+        int,
+        typer.Option(
+            "--premium-rate-limit-ppm",
+            help="Maximum premium rate in parts per million",
+        ),
+    ],
     force: Annotated[bool, typer.Option("--force")] = False,
     cln_socket: Annotated[
         Path,
@@ -667,15 +701,15 @@ def peerswap_swap_out(
         data_dir=data_dir,
         config_file=config_file,
         mnemonic_file=mnemonic_file,
-        amount=amt_sat,
+        amount=amount,
         mixdepth=mixdepth,
     )
     _run_peerswap_rpc(
         method="peerswap-swap-out",
         params={
             "short_channel_id": short_channel_id,
-            "amt_sat": amt_sat,
-            "asset": asset,
+            "amt_sat": amount,
+            "asset": "btc",
             "premium_rate_limit_ppm": premium_rate_limit_ppm,
             "force": force,
         },

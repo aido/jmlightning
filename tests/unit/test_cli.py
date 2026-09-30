@@ -694,8 +694,7 @@ def test_peerswap_swap_in_calls_matching_cln_rpc(
 
     cli.peerswap_swap_in(
         short_channel_id="1x2x3",
-        amt_sat=250_000,
-        asset="btc",
+        amount=250_000,
         premium_limit_ppm=25,
         force=True,
         cln_socket=Path("/tmp/lightning-rpc"),
@@ -730,8 +729,7 @@ def test_peerswap_swap_out_calls_matching_cln_rpc(
 
     cli.peerswap_swap_out(
         short_channel_id="1x2x3",
-        amt_sat=250_000,
-        asset="btc",
+        amount=250_000,
         premium_rate_limit_ppm=25,
         force=False,
         cln_socket=Path("/tmp/lightning-rpc"),
