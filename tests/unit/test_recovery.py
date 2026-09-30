@@ -20,6 +20,8 @@ def test_recovery_journal_is_atomic_and_mode_0600(tmp_path: Path) -> None:
     journal = RecoveryJournal(tmp_path)
     record_id = journal.create("splice", {"channel_id": "02" + "11" * 32})
 
+    assert journal.path.parent == tmp_path / "recovery"
+    assert journal.path.parent.stat().st_mode & 0o777 == 0o700
     assert journal.path.stat().st_mode & 0o777 == 0o600
     data = json.loads(journal.path.read_text())
     assert data[0]["id"] == record_id

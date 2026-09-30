@@ -21,6 +21,7 @@ T = TypeVar("T")
 if TYPE_CHECKING:
     from jmlightning.config import CLNConfig
 
+JOURNAL_DIR = "recovery"
 JOURNAL_NAME = "recovery.json"
 
 
@@ -114,8 +115,9 @@ class RecoveryJournal:
     """Small durable journal for operations whose external outcome is ambiguous."""
 
     def __init__(self, data_dir: Path) -> None:
-        self.path = data_dir / JOURNAL_NAME
+        self.path = data_dir / JOURNAL_DIR / JOURNAL_NAME
         self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(self.path.parent, 0o700)
         self._lock_path = self.path.with_suffix(".lock")
         self._lifetime_fd: int | None = None
         # Serialise journal access between threads in this process. The

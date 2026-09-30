@@ -1,4 +1,3 @@
-import tempfile
 from contextlib import AbstractContextManager
 from dataclasses import replace
 from pathlib import Path
@@ -18,11 +17,11 @@ from jmlightning.operations.open_channel import (
 
 
 @pytest.mark.anyio
-async def test_send_psbt_failure_cancels_withheld_channel() -> None:
+async def test_send_psbt_failure_cancels_withheld_channel(tmp_path: Path) -> None:
     peer_id = "02" + "11" * 32
 
     config = Mock()
-    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
+    config.data_dir = tmp_path
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False
@@ -130,8 +129,12 @@ async def test_send_psbt_failure_cancels_withheld_channel() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_psbt_failure_with_absent_state_requires_recovery() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_send_psbt_failure_with_absent_state_requires_recovery(
+    tmp_path: Path,
+) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.side_effect = RuntimeError("sendpsbt failed")
     cln.get_channel_funding_status.return_value = ChannelFundingStatus.ABSENT
@@ -164,11 +167,11 @@ async def test_send_psbt_failure_with_absent_state_requires_recovery() -> None:
     jmadapter.close.assert_awaited_once()
 
 
-def _build_open_channel_test_doubles() -> tuple[
-    Mock, ClassifiedUTXO, Mock, Mock, Mock, Mock
-]:
+def _build_open_channel_test_doubles(
+    tmp_path: Path,
+) -> tuple[Mock, ClassifiedUTXO, Mock, Mock, Mock, Mock]:
     config = Mock()
-    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
+    config.data_dir = tmp_path
     config.amount = 100_000
     config.mixdepth = 0
     config.announce = False
@@ -250,8 +253,11 @@ def _patch_open_channel_doubles(
 @pytest.mark.anyio
 async def test_partial_lock_failure_unlocks_only_successfully_locked_utxos(
     classified_utxos: list[ClassifiedUTXO],
+    tmp_path: Path,
 ) -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
     second_coin = replace(coin, utxo=replace(coin.utxo, txid="22" * 32, vout=1))
 
     jmadapter.get_utxos.return_value = [coin, second_coin]
@@ -284,8 +290,12 @@ async def test_partial_lock_failure_unlocks_only_successfully_locked_utxos(
 
 
 @pytest.mark.anyio
-async def test_send_psbt_ambiguous_failure_is_treated_as_broadcast() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_send_psbt_ambiguous_failure_is_treated_as_broadcast(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.side_effect = RuntimeError("connection lost")
     cln.get_channel_funding_status.return_value = ChannelFundingStatus.BROADCAST
@@ -311,8 +321,12 @@ async def test_send_psbt_ambiguous_failure_is_treated_as_broadcast() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_psbt_failure_with_unknown_state_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_send_psbt_failure_with_unknown_state_keeps_utxo_locked(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.side_effect = RuntimeError("connection lost")
     cln.get_channel_funding_status.side_effect = RuntimeError("status unavailable")
@@ -341,8 +355,10 @@ async def test_send_psbt_failure_with_unknown_state_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_send_psbt_txid_mismatch_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_send_psbt_txid_mismatch_keeps_utxo_locked(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.return_value = {"txid": "22" * 32}
 
@@ -370,8 +386,12 @@ async def test_send_psbt_txid_mismatch_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_fundchannel_start_unknown_outcome_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_fundchannel_start_unknown_outcome_keeps_utxo_locked(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.open_channel_start.side_effect = RuntimeError("connection lost")
 
@@ -400,8 +420,10 @@ async def test_fundchannel_start_unknown_outcome_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_cancel_failure_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_cancel_failure_keeps_utxo_locked(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.side_effect = RuntimeError("sendpsbt failed")
     cln.get_channel_funding_status.return_value = ChannelFundingStatus.WITHHELD
@@ -431,8 +453,12 @@ async def test_cancel_failure_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_fundchannel_complete_failure_with_absent_state_unlocks() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_fundchannel_complete_failure_with_absent_state_unlocks(
+    tmp_path: Path,
+) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.open_channel_complete.side_effect = RuntimeError("fundchannel_complete failed")
     cln.get_channel_funding_status.return_value = ChannelFundingStatus.ABSENT
@@ -463,8 +489,12 @@ async def test_fundchannel_complete_failure_with_absent_state_unlocks() -> None:
 
 
 @pytest.mark.anyio
-async def test_local_failure_after_fundchannel_start_cancels_and_unlocks() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_local_failure_after_fundchannel_start_cancels_and_unlocks(
+    tmp_path: Path,
+) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     jmadapter.get_change_address.side_effect = RuntimeError("change address failed")
 
@@ -485,8 +515,12 @@ async def test_local_failure_after_fundchannel_start_cancels_and_unlocks() -> No
 
 
 @pytest.mark.anyio
-async def test_tx_build_failure_after_fundchannel_start_cancels_and_unlocks() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_tx_build_failure_after_fundchannel_start_cancels_and_unlocks(
+    tmp_path: Path,
+) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     tx_builder.build_and_sign_funding_tx.side_effect = RuntimeError(
         "transaction build failed"
@@ -509,10 +543,12 @@ async def test_tx_build_failure_after_fundchannel_start_cancels_and_unlocks() ->
 
 
 @pytest.mark.anyio
-async def test_failure_after_fundchannel_start_cancel_failure_keeps_utxo_locked() -> (
-    None
-):
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_failure_after_fundchannel_start_cancel_failure_keeps_utxo_locked(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     tx_builder.build_and_sign_funding_tx.side_effect = RuntimeError(
         "transaction build failed"
@@ -539,8 +575,10 @@ async def test_failure_after_fundchannel_start_cancel_failure_keeps_utxo_locked(
 
 
 @pytest.mark.anyio
-async def test_successful_send_psbt_keeps_inputs_frozen() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_successful_send_psbt_keeps_inputs_frozen(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.return_value = {"txid": "txid"}
 
@@ -565,8 +603,10 @@ async def test_successful_send_psbt_keeps_inputs_frozen() -> None:
 
 
 @pytest.mark.anyio
-async def test_successful_broadcast_does_not_unlock_inputs() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_successful_broadcast_does_not_unlock_inputs(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.return_value = {"txid": "txid"}
 
@@ -591,8 +631,10 @@ async def test_successful_broadcast_does_not_unlock_inputs() -> None:
 
 
 @pytest.mark.anyio
-async def test_successful_broadcast_survives_close_failure() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_successful_broadcast_survives_close_failure(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     cln.send_psbt.return_value = {"txid": "txid"}
     jmadapter.close.side_effect = RuntimeError("close failed")
@@ -618,8 +660,10 @@ async def test_successful_broadcast_survives_close_failure() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_happens_before_cln_completion() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_confirmation_happens_before_cln_completion(tmp_path: Path) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     events: list[str] = []
 
@@ -663,8 +707,10 @@ async def test_confirmation_happens_before_cln_completion() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_rejection_prevents_funding() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_confirmation_rejection_prevents_funding(tmp_path: Path) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     def confirm(
         peer_id: str,
@@ -706,8 +752,10 @@ async def test_confirmation_rejection_prevents_funding() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_receives_actual_transaction() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles()
+async def test_confirmation_receives_actual_transaction(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_open_channel_test_doubles(
+        tmp_path
+    )
 
     captured: dict[str, object] = {}
 
@@ -755,9 +803,10 @@ async def test_confirmation_receives_actual_transaction() -> None:
 def test_confirm_open_channel_displays_transaction_and_accepts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
     _config, coin, _jmadapter, _cln, plan, _tx_builder = (
-        _build_open_channel_test_doubles()
+        _build_open_channel_test_doubles(tmp_path)
     )
     plan.inputs = [coin]
     plan.amount = 100_000

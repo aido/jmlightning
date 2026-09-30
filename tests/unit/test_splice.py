@@ -1,4 +1,3 @@
-import tempfile
 from dataclasses import replace
 from pathlib import Path
 from typing import Any
@@ -35,7 +34,9 @@ def _coin(txid: str = "11" * 32, vout: int = 0) -> ClassifiedUTXO:
     )
 
 
-def _build_splice_test_doubles() -> tuple[
+def _build_splice_test_doubles(
+    tmp_path: Path,
+) -> tuple[
     Mock,
     ClassifiedUTXO,
     Mock,
@@ -44,7 +45,7 @@ def _build_splice_test_doubles() -> tuple[
     Mock,
 ]:
     config = Mock()
-    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-recovery-test-"))
+    config.data_dir = tmp_path
     config.amount = 100_000
     config.mixdepth = 0
     config.fee_priority = FeePriority.NORMAL
@@ -98,8 +99,12 @@ def _build_splice_test_doubles() -> tuple[
 
 
 @pytest.mark.anyio
-async def test_splice_in_zero_amount_sweeps_all_policy_approved_utxos() -> None:
-    config, coin, jmadapter, cln, _plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_in_zero_amount_sweeps_all_policy_approved_utxos(
+    tmp_path: Path,
+) -> None:
+    config, coin, jmadapter, cln, _plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     config.amount = 0
     second_coin = replace(
         coin,
@@ -168,8 +173,10 @@ async def test_splice_in_zero_amount_sweeps_all_policy_approved_utxos() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_in_rejects_negative_amount() -> None:
-    config, _coin, jmadapter, cln, _plan, _tx_builder = _build_splice_test_doubles()
+async def test_splice_in_rejects_negative_amount(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, _plan, _tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     config.amount = -1
 
     operation = SpliceInOperation(
@@ -183,9 +190,9 @@ async def test_splice_in_rejects_negative_amount() -> None:
     cln.splice_init.assert_not_called()
 
 
-def _build_splice_out_test_doubles() -> tuple[Mock, Mock, Mock]:
+def _build_splice_out_test_doubles(tmp_path: Path) -> tuple[Mock, Mock, Mock]:
     config = Mock()
-    config.data_dir = Path(tempfile.mkdtemp(prefix="jmlightning-splice-out-test-"))
+    config.data_dir = tmp_path
     config.mixdepth = 0
 
     wallet = Mock()
@@ -217,8 +224,10 @@ def _build_splice_out_test_doubles() -> tuple[Mock, Mock, Mock]:
 
 
 @pytest.mark.anyio
-async def test_splice_out_uses_cln_output_and_pays_initiator_fee() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_uses_cln_output_and_pays_initiator_fee(
+    tmp_path: Path,
+) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
 
     with (
         patch(
@@ -254,8 +263,10 @@ async def test_splice_out_uses_cln_output_and_pays_initiator_fee() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_out_zero_amount_sweeps_local_balance_after_fee() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_zero_amount_sweeps_local_balance_after_fee(
+    tmp_path: Path,
+) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
 
     with (
         patch(
@@ -284,8 +295,10 @@ async def test_splice_out_zero_amount_sweeps_local_balance_after_fee() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_out_sweep_rejects_balance_insufficient_for_fee() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_sweep_rejects_balance_insufficient_for_fee(
+    tmp_path: Path,
+) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
     cln.get_channel_local_balance_sat.return_value = 321
 
     with (
@@ -307,8 +320,8 @@ async def test_splice_out_sweep_rejects_balance_insufficient_for_fee() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_out_rejects_negative_amount() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_rejects_negative_amount(tmp_path: Path) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
 
     operation = SpliceOutOperation(config, Path("/tmp/lightning-rpc"))
     with pytest.raises(ValueError, match="must not be negative"):
@@ -319,8 +332,8 @@ async def test_splice_out_rejects_negative_amount() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_out_confirmation_decline_does_not_sign() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_confirmation_decline_does_not_sign(tmp_path: Path) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
 
     with (
         patch(
@@ -350,8 +363,8 @@ async def test_splice_out_confirmation_decline_does_not_sign() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_out_init_failure_requires_recovery() -> None:
-    config, jmadapter, cln = _build_splice_out_test_doubles()
+async def test_splice_out_init_failure_requires_recovery(tmp_path: Path) -> None:
+    config, jmadapter, cln = _build_splice_out_test_doubles(tmp_path)
     cln.splice_init.side_effect = RuntimeError("connection lost")
 
     with (
@@ -407,8 +420,10 @@ def _patch_splice_doubles(
 
 
 @pytest.mark.anyio
-async def test_selection_requires_exactly_one_utxo() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_selection_requires_exactly_one_utxo(tmp_path: Path) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     second_coin = replace(
         coin,
         utxo=replace(coin.utxo, txid="22" * 32, vout=1),
@@ -435,8 +450,10 @@ async def test_selection_requires_exactly_one_utxo() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_init_failure_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_init_failure_keeps_utxo_locked(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_init.side_effect = RuntimeError("connection lost")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -457,8 +474,10 @@ async def test_splice_init_failure_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_init_invalid_response_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_init_invalid_response_keeps_utxo_locked(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_init.return_value = {"psbt": ""}
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -479,8 +498,12 @@ async def test_splice_init_invalid_response_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_local_failure_after_splice_init_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_local_failure_after_splice_init_keeps_utxo_locked(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     jmadapter.get_change_address.side_effect = RuntimeError("change address failed")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -498,8 +521,10 @@ async def test_local_failure_after_splice_init_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_update_failure_requires_recovery() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_update_failure_requires_recovery(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_update.side_effect = RuntimeError("update failed")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -521,8 +546,10 @@ async def test_splice_update_failure_requires_recovery() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_update_repeats_until_commitments_secured() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_update_repeats_until_commitments_secured(tmp_path: Path) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_update.side_effect = [
         {
             "psbt": "Zmlyc3QtdXBkYXRlZA==",
@@ -567,8 +594,12 @@ async def test_splice_update_repeats_until_commitments_secured() -> None:
 
 
 @pytest.mark.anyio
-async def test_tx_builder_failure_after_splice_init_keeps_utxo_locked() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_tx_builder_failure_after_splice_init_keeps_utxo_locked(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     tx_builder.add_splice_in_input.side_effect = RuntimeError(
         "transaction build failed"
     )
@@ -589,8 +620,10 @@ async def test_tx_builder_failure_after_splice_init_keeps_utxo_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_happens_before_splice_signed() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_confirmation_happens_before_splice_signed(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     events: list[str] = []
 
     def confirm(channel_id: str, received_plan: object, psbt: bytes) -> bool:
@@ -632,8 +665,10 @@ async def test_confirmation_happens_before_splice_signed() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_rejection_prevents_splice_signed() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_confirmation_rejection_prevents_splice_signed(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
 
     def confirm(channel_id: str, received_plan: object, psbt: bytes) -> bool:
         return False
@@ -656,8 +691,10 @@ async def test_confirmation_rejection_prevents_splice_signed() -> None:
 
 
 @pytest.mark.anyio
-async def test_confirmation_receives_actual_plan_and_psbt() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_confirmation_receives_actual_plan_and_psbt(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     captured: dict[str, object] = {}
 
     def confirm(channel_id: str, received_plan: object, psbt: bytes) -> bool:
@@ -686,8 +723,10 @@ async def test_confirmation_receives_actual_plan_and_psbt() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_signing_failure_requires_recovery() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_signing_failure_requires_recovery(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     tx_builder.sign_splice_psbt.side_effect = RuntimeError("signing failed")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -710,8 +749,10 @@ async def test_splice_signing_failure_requires_recovery() -> None:
 
 
 @pytest.mark.anyio
-async def test_successful_splice_keeps_inputs_locked() -> None:
-    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_successful_splice_keeps_inputs_locked(tmp_path: Path) -> None:
+    config, coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
     with (
@@ -761,8 +802,10 @@ async def test_successful_splice_keeps_inputs_locked() -> None:
 
 
 @pytest.mark.anyio
-async def test_successful_splice_survives_close_failure() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_successful_splice_survives_close_failure(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     jmadapter.close.side_effect = RuntimeError("close failed")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -778,8 +821,10 @@ async def test_successful_splice_survives_close_failure() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_signed_failure_requires_recovery() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_signed_failure_requires_recovery(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_signed.side_effect = RuntimeError("signed failed")
 
     patches = _patch_splice_doubles(jmadapter, cln, plan, tx_builder)
@@ -802,8 +847,10 @@ async def test_splice_signed_failure_requires_recovery() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_signed_mismatched_txid_requires_recovery() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_signed_mismatched_txid_requires_recovery(tmp_path: Path) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_signed.return_value = {
         "tx": "02000000",
         "txid": "44" * 32,
@@ -829,8 +876,12 @@ async def test_splice_signed_mismatched_txid_requires_recovery() -> None:
 
 
 @pytest.mark.anyio
-async def test_splice_signed_invalid_transaction_requires_recovery() -> None:
-    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles()
+async def test_splice_signed_invalid_transaction_requires_recovery(
+    tmp_path: Path,
+) -> None:
+    config, _coin, jmadapter, cln, plan, tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     cln.splice_signed.return_value = {
         "tx": "not-hex",
         "txid": "22" * 32,
@@ -858,8 +909,11 @@ async def test_splice_signed_invalid_transaction_requires_recovery() -> None:
 def test_confirm_splice_in_displays_plan_and_accepts(
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    tmp_path: Path,
 ) -> None:
-    _config, coin, _jmadapter, _cln, plan, _tx_builder = _build_splice_test_doubles()
+    _config, coin, _jmadapter, _cln, plan, _tx_builder = _build_splice_test_doubles(
+        tmp_path
+    )
     plan.inputs = [coin]
     plan.amount = 100_000
     plan.fee = 100
