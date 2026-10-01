@@ -8,7 +8,7 @@ import pytest
 from jmwallet.wallet.service import WalletService
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 
 
 @pytest.mark.anyio
@@ -189,8 +189,8 @@ def test_lock_reserves_utxo_without_persistent_freeze(
     args = adapter.wallet.reserve_coinjoin_inputs.call_args.args
     assert args[0] == {(coin.utxo.txid, coin.utxo.vout)}
     assert adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["owner"]
-    assert (coin.utxo.txid, coin.utxo.vout) in adapter._locked_utxos
-    assert (coin.utxo.txid, coin.utxo.vout) in adapter._lock_owners
+    assert coin.outpoint in adapter._locked_utxos
+    assert coin.outpoint in adapter._lock_owners
     adapter.wallet.freeze_utxo.assert_not_called()
 
 
@@ -209,7 +209,7 @@ def test_lock_uses_atomic_owned_metadata_reservation(
     assert adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["ttl"] == 30 * 60
     owner = adapter.wallet.reserve_coinjoin_inputs.call_args.kwargs["owner"]
     assert owner
-    assert adapter._lock_owners[(coin.utxo.txid, coin.utxo.vout)] == owner
+    assert adapter._lock_owners[coin.outpoint] == owner
 
 
 def test_lock_rejects_utxo_already_reserved_by_another_process(
@@ -226,8 +226,8 @@ def test_lock_rejects_utxo_already_reserved_by_another_process(
 
     adapter.wallet.freeze_utxo.assert_not_called()
     adapter.wallet.release_coinjoin_inputs.assert_not_called()
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
+    assert coin.outpoint not in adapter._locked_utxos
+    assert coin.outpoint not in adapter._lock_owners
 
 
 def test_lock_rejects_already_locked_utxo(
@@ -256,14 +256,14 @@ def test_renew_extends_owned_reservation(
     adapter.wallet.renew_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    outpoint = coin.outpoint
 
     adapter.lock(coin)
     owner = adapter._lock_owners[outpoint]
     adapter.renew(coin)
 
     adapter.wallet.renew_coinjoin_inputs.assert_called_once_with(
-        {outpoint},
+        {outpoint.as_tuple()},
         owner=owner,
         ttl=30 * 60,
     )
@@ -290,7 +290,7 @@ def test_renew_detects_expired_or_replaced_reservation(
     adapter.wallet.renew_coinjoin_inputs.return_value = False
 
     coin = classified_utxos[0]
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    outpoint = coin.outpoint
 
     adapter.lock(coin)
     owner = adapter._lock_owners[outpoint]
@@ -320,7 +320,7 @@ def test_renew_locks_renews_each_owner_generation(
 
     assert adapter.wallet.renew_coinjoin_inputs.call_count == 2
     for coin in coins:
-        outpoint = (coin.utxo.txid, coin.utxo.vout)
+        outpoint = coin.outpoint
         assert adapter._lock_owners[outpoint]
 
 
@@ -357,14 +357,14 @@ def test_unlock_releases_owned_reservation_without_unfreezing(
     adapter.wallet.reserve_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    outpoint = coin.outpoint
 
     adapter.lock(coin)
     owner = adapter._lock_owners[outpoint]
     adapter.unlock(coin)
 
     adapter.wallet.release_coinjoin_inputs.assert_called_once_with(
-        {outpoint},
+        {outpoint.as_tuple()},
         owner=owner,
     )
     adapter.wallet.unfreeze_utxo.assert_not_called()
@@ -380,7 +380,7 @@ def test_unlock_retains_owner_when_release_fails(
     adapter.wallet.reserve_coinjoin_inputs.return_value = True
 
     coin = classified_utxos[0]
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    outpoint = coin.outpoint
 
     adapter.lock(coin)
     owner = adapter._lock_owners[outpoint]
@@ -408,8 +408,8 @@ def test_unlock_untracked_utxo_does_not_unfreeze(
 
     adapter.wallet.unfreeze_utxo.assert_not_called()
     adapter.wallet.release_coinjoin_inputs.assert_not_called()
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._locked_utxos
-    assert (coin.utxo.txid, coin.utxo.vout) not in adapter._lock_owners
+    assert coin.outpoint not in adapter._locked_utxos
+    assert coin.outpoint not in adapter._lock_owners
 
 
 def test_get_utxos_excludes_cross_process_joinmarket_locks(
@@ -450,7 +450,7 @@ def test_get_utxos_excludes_local_and_cross_process_locks(
     local_locked = classified_utxos[0].utxo
     remote_locked = classified_utxos[1].utxo
     available = classified_utxos[2].utxo
-    adapter._locked_utxos.add((local_locked.txid, local_locked.vout))
+    adapter._locked_utxos.add(Outpoint(local_locked.txid, local_locked.vout))
     adapter.wallet.get_locked_input_outpoints.return_value = {
         (remote_locked.txid, remote_locked.vout)
     }
@@ -487,9 +487,7 @@ def test_select_utxos_excludes_cross_process_joinmarket_locks(
     result = adapter.select_utxos(
         mixdepth=0,
         target_amount=50_000,
-        allowed_outpoints={
-            (coin.utxo.txid, coin.utxo.vout) for coin in classified_utxos[:3]
-        },
+        allowed_outpoints={coin.outpoint for coin in classified_utxos[:3]},
     )
 
     assert result == [classified_utxos[1].utxo]
@@ -537,22 +535,22 @@ def test_unlock_after_lease_expiry_cannot_release_new_owner(
     adapter_b.wallet = cast(WalletService, wallet)
 
     coin = classified_utxos[0]
-    outpoint = (coin.utxo.txid, coin.utxo.vout)
+    outpoint = coin.outpoint
+    wallet_outpoint = outpoint.as_tuple()
 
     adapter_a.lock(coin)
     owner_a = adapter_a._lock_owners[outpoint]
-    wallet.expire(outpoint)
+    wallet.expire(wallet_outpoint)
 
     adapter_b.lock(coin)
     owner_b = adapter_b._lock_owners[outpoint]
     assert owner_a != owner_b
-    assert wallet.owners[outpoint] == owner_b
+    assert wallet.owners[wallet_outpoint] == owner_b
 
     # A stale cleanup must compare its owner token. It must not release B's
     # newly acquired reservation after A's lease expired.
     adapter_a.unlock(coin)
 
-    assert wallet.owners[outpoint] == owner_b
     assert outpoint not in adapter_a._lock_owners
     assert outpoint not in adapter_a._locked_utxos
     assert adapter_b._lock_owners[outpoint] == owner_b
@@ -879,7 +877,7 @@ def test_get_utxos_excludes_unconfirmed_fidelity_and_locked_coins(
         is_fidelity_bond=True,
     )
     locked = classified_utxos[1].utxo
-    adapter._locked_utxos.add((locked.txid, locked.vout))
+    adapter._locked_utxos.add(Outpoint(locked.txid, locked.vout))
 
     info = SimpleNamespace(
         status="cj-out",

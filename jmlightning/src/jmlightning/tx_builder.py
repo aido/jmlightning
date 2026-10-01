@@ -46,13 +46,13 @@ from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signing import verify_p2wpkh_signature
 
 from jmlightning.lightning import cln as cln_compat
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.planner import ExecutionPlan
 
 
 @dataclass(frozen=True)
 class SpliceContribution:
-    jm_outpoint: tuple[str, int]
+    jm_outpoint: Outpoint
     jm_value: int
     change_script: bytes | None
     change_value: int
@@ -86,7 +86,7 @@ class TxBuilder:
         if plan.change < 0:
             raise ValueError("Transaction change cannot be negative.")
 
-        outpoints = [(coin.utxo.txid, coin.utxo.vout) for coin in plan.inputs]
+        outpoints = [coin.outpoint for coin in plan.inputs]
 
         if len(outpoints) != len(set(outpoints)):
             raise ValueError("Transaction contains duplicate inputs.")
@@ -387,9 +387,10 @@ class TxBuilder:
                 )
 
         existing_outpoints = {
-            (tx_input.txid, tx_input.vout) for tx_input in parsed.transaction.inputs
+            Outpoint(tx_input.txid, tx_input.vout)
+            for tx_input in parsed.transaction.inputs
         }
-        coin_outpoint = (coin.utxo.txid, coin.utxo.vout)
+        coin_outpoint = coin.outpoint
         if coin_outpoint in existing_outpoints:
             raise ValueError(
                 f"Splice input is already present: {coin.utxo.txid}:{coin.utxo.vout}"
@@ -625,7 +626,7 @@ class TxBuilder:
         matches = [
             i
             for i, tx_input in enumerate(parsed.transaction.inputs)
-            if (tx_input.txid, tx_input.vout) == contribution.jm_outpoint
+            if Outpoint(tx_input.txid, tx_input.vout) == contribution.jm_outpoint
         ]
         if len(matches) != 1:
             raise RuntimeError(
@@ -639,8 +640,7 @@ class TxBuilder:
                 required_matches = [
                     index
                     for index, tx_input in enumerate(parsed.transaction.inputs)
-                    if (tx_input.txid, tx_input.vout)
-                    == (required.utxo.txid, required.utxo.vout)
+                    if Outpoint(tx_input.txid, tx_input.vout) == required.outpoint
                 ]
                 if len(required_matches) != 1:
                     raise RuntimeError(
@@ -795,8 +795,7 @@ class TxBuilder:
         matches = [
             index
             for index, transaction_input in enumerate(parsed_psbt.transaction.inputs)
-            if (transaction_input.txid, transaction_input.vout)
-            == (coin.utxo.txid, coin.utxo.vout)
+            if Outpoint(transaction_input.txid, transaction_input.vout) == coin.outpoint
         ]
 
         if not matches:

@@ -13,7 +13,7 @@ from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
 from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
@@ -146,11 +146,9 @@ class OpenChannelOperation:
                 capability.name,
             )
 
-            allowed_outpoints = {(coin.utxo.txid, coin.utxo.vout) for coin in allowed}
+            allowed_outpoints = {coin.outpoint for coin in allowed}
 
-            classified_by_outpoint = {
-                (coin.utxo.txid, coin.utxo.vout): coin for coin in allowed
-            }
+            classified_by_outpoint = {coin.outpoint: coin for coin in allowed}
 
             # --------------------------------------------------------
             # Fee rate
@@ -189,7 +187,7 @@ class OpenChannelOperation:
 
             else:
                 selection_target = self.config.amount
-                previous_outpoints: set[tuple[str, int]] | None = None
+                previous_outpoints: set[Outpoint] | None = None
 
                 while True:
                     selected_raw = jmadapter.select_utxos(
@@ -200,7 +198,7 @@ class OpenChannelOperation:
 
                     try:
                         selected = [
-                            classified_by_outpoint[(utxo.txid, utxo.vout)]
+                            classified_by_outpoint[Outpoint(utxo.txid, utxo.vout)]
                             for utxo in selected_raw
                         ]
                     except KeyError as exc:
@@ -219,9 +217,7 @@ class OpenChannelOperation:
                         capability,
                     )
 
-                    current_outpoints = {
-                        (coin.utxo.txid, coin.utxo.vout) for coin in selected
-                    }
+                    current_outpoints = {coin.outpoint for coin in selected}
 
                     try:
                         plan = planner.build_plan(
@@ -308,7 +304,7 @@ class OpenChannelOperation:
                         announce=self.config.announce,
                         close_to=self.config.close_to,
                     ),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                 )
             except Exception as exc:
@@ -356,7 +352,7 @@ class OpenChannelOperation:
                         action="fundchannel_cancel",
                         phase=lifecycle.phase.value,
                         fn=lambda: cln.cancel_channel_funding(peer_id),
-                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        locked_outpoints=[c.outpoint for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         txid=txid,
                     )
@@ -389,7 +385,7 @@ class OpenChannelOperation:
                         action="fundchannel_cancel",
                         phase=lifecycle.phase.value,
                         fn=lambda: cln.cancel_channel_funding(peer_id),
-                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        locked_outpoints=[c.outpoint for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         txid=txid,
                     )
@@ -425,7 +421,7 @@ class OpenChannelOperation:
                         peer_id=peer_id,
                         psbt=signed_psbt,
                     ),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                     psbt=signed_psbt,
                     txid=txid,
@@ -453,9 +449,7 @@ class OpenChannelOperation:
                             action="fundchannel_cancel",
                             phase=lifecycle.phase.value,
                             fn=lambda: cln.cancel_channel_funding(peer_id),
-                            locked_outpoints=[
-                                (c.utxo.txid, c.utxo.vout) for c in locked
-                            ],
+                            locked_outpoints=[c.outpoint for c in locked],
                             owner_tokens=jmadapter._owner_tokens(),
                             txid=txid,
                         )
@@ -497,7 +491,7 @@ class OpenChannelOperation:
                     action="sendpsbt",
                     phase=LifecyclePhase.WITHHELD.value,
                     fn=lambda: cln.send_psbt(signed_psbt),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                     psbt=signed_psbt,
                     txid=txid,
@@ -525,9 +519,7 @@ class OpenChannelOperation:
                             action="fundchannel_cancel",
                             phase=lifecycle.phase.value,
                             fn=lambda: cln.cancel_channel_funding(peer_id),
-                            locked_outpoints=[
-                                (c.utxo.txid, c.utxo.vout) for c in locked
-                            ],
+                            locked_outpoints=[c.outpoint for c in locked],
                             owner_tokens=jmadapter._owner_tokens(),
                             txid=txid,
                         )

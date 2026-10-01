@@ -9,6 +9,7 @@ from unittest.mock import AsyncMock, Mock, patch
 import pytest
 
 from jmlightning.lightning.backend import ChannelFundingStatus
+from jmlightning.models import Outpoint
 from jmlightning.recovery import (
     RecoveryJournal,
     RecoveryJournalBusyError,
@@ -65,8 +66,8 @@ def test_recovery_journal_preserves_txid_after_successful_mutation(
         action="splice_signed",
         phase="updated",
         fn=lambda: "ok",
-        locked_outpoints=[("aa" * 32, 0)],
-        owner_tokens={("aa" * 32, 0): "owner"},
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
+        owner_tokens={Outpoint("aa" * 32, 0): "owner"},
         psbt=b"psbt",
         txid=txid,
     )
@@ -88,8 +89,8 @@ def test_recovery_journal_after_mutation_preserves_existing_txid(
         record_id,
         action="renew_coinjoin_inputs",
         phase="locked",
-        locked_outpoints=[("aa" * 32, 0)],
-        owner_tokens={("aa" * 32, 0): "owner"},
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
+        owner_tokens={Outpoint("aa" * 32, 0): "owner"},
     )
     journal.after_mutation(record_id, phase="locked")
 
@@ -108,8 +109,8 @@ def test_recovery_journal_keeps_pending_mutation_after_failure(tmp_path: Path) -
             action="splice_signed",
             phase="updated",
             fn=lambda: (_ for _ in ()).throw(RuntimeError("rpc failed")),
-            locked_outpoints=[("aa" * 32, 0)],
-            owner_tokens={("aa" * 32, 0): "owner"},
+            locked_outpoints=[Outpoint("aa" * 32, 0)],
+            owner_tokens={Outpoint("aa" * 32, 0): "owner"},
             psbt=b"psbt",
             txid="bb" * 32,
         )
@@ -130,7 +131,7 @@ async def test_recovery_does_not_release_when_bitcoin_backend_has_tx(
     record = journal.records()[0]
     journal.update(
         record.id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -169,7 +170,7 @@ async def test_recovery_does_not_release_when_transaction_lookup_is_ambiguous(
     record_id = journal.create("open_channel", {"peer_id": "peer"})
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -205,7 +206,7 @@ async def test_recovery_uses_input_spender_lookup_after_ambiguous_transaction_lo
     record_id = journal.create("open_channel", {"peer_id": "peer"})
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -231,7 +232,7 @@ async def test_recovery_uses_input_spender_lookup_after_ambiguous_transaction_lo
     resolved = await manager.reconcile_all()
 
     assert resolved == [record_id]
-    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+    adapter.recover_release.assert_called_once_with(Outpoint("aa" * 32, 0), "owner")
     backend.get_mempool_spender.assert_awaited_once_with("aa" * 32, 0)
 
 
@@ -243,7 +244,7 @@ async def test_recovery_does_not_release_when_recorded_input_is_spent(
     record_id = journal.create("open_channel", {"peer_id": "peer"})
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -281,7 +282,7 @@ async def test_recovery_does_not_auto_release_with_neutrino_backend(
     record = journal.records()[0]
     journal.update(
         record.id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -310,7 +311,7 @@ async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
     record_id = journal.create("open_channel", {"peer_id": "peer"})
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -342,7 +343,7 @@ async def test_recovery_releases_only_after_cln_and_bitcoin_absent(
 
     assert resolved == [record_id]
     adapter.recover_release.assert_called_once_with(
-        ("aa" * 32, 0),
+        Outpoint("aa" * 32, 0),
         "owner",
     )
     assert journal.records() == []
@@ -358,7 +359,7 @@ async def test_recovery_keeps_all_owner_tokens_across_partial_release(
     second = "bb" * 32
     journal.update(
         record_id,
-        locked_outpoints=[(first, 0), (second, 1)],
+        locked_outpoints=[Outpoint(first, 0), Outpoint(second, 1)],
         owner_tokens={
             f"{first}:0": "owner-a",
             f"{second}:1": "owner-b",
@@ -409,7 +410,7 @@ async def test_peerswap_recovery_never_auto_releases_pending_txsend(
         record_id,
         action="txsend",
         phase="prepared",
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -437,7 +438,7 @@ async def test_peerswap_recovery_releases_after_broadcast_is_observed(
     journal.update(
         record_id,
         phase="broadcast",
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )
@@ -468,7 +469,7 @@ async def test_peerswap_recovery_releases_after_broadcast_is_observed(
     resolved = await manager.reconcile_all()
 
     assert resolved == [record_id]
-    adapter.recover_release.assert_called_once_with(("aa" * 32, 0), "owner")
+    adapter.recover_release.assert_called_once_with(Outpoint("aa" * 32, 0), "owner")
     assert journal.records() == []
 
 
@@ -481,7 +482,7 @@ async def test_multi_open_recovery_leaves_withheld_funding_pending(
     txid = "bb" * 32
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid=txid,
     )
@@ -533,7 +534,7 @@ async def test_recovery_does_not_cancel_withheld_funding(
     record_id = journal.create("open_channel", {"peer_id": "peer"})
     journal.update(
         record_id,
-        locked_outpoints=[("aa" * 32, 0)],
+        locked_outpoints=[Outpoint("aa" * 32, 0)],
         owner_tokens={f"{'aa' * 32}:0": "owner"},
         txid="bb" * 32,
     )

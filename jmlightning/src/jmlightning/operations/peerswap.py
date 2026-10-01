@@ -24,7 +24,7 @@ from pyln.client import LightningRpc
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
 from jmlightning.lightning.cln import CLNBackend
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
@@ -170,7 +170,7 @@ class PreparedPeerSwapTransaction:
     # long-lived lifecycle methods renew and release.
     reservations: tuple[ClassifiedUTXO, ...] = ()
     phase: PeerSwapPhase = PeerSwapPhase.PREPARED
-    released_reservations: set[tuple[str, int]] = field(default_factory=set)
+    released_reservations: set[Outpoint] = field(default_factory=set)
 
     def __post_init__(self) -> None:
         if not self.reservations:
@@ -428,9 +428,7 @@ class PeerSwapPrepareTxOperation:
             recovery_id,
             action="txsend",
             phase=PeerSwapPhase.PREPARED.value,
-            locked_outpoints=[
-                (coin.utxo.txid, coin.utxo.vout) for coin in prepared.reservations
-            ],
+            locked_outpoints=[coin.outpoint for coin in prepared.reservations],
             owner_tokens=prepared.adapter._owner_tokens(),
             psbt=prepared.psbt,
             txid=txid,
@@ -573,7 +571,7 @@ class PeerSwapPrepareTxOperation:
         prepared.require_phase(PeerSwapPhase.PREPARED)
         cleanup_errors: list[Exception] = []
         for coin in reversed(prepared.reservations):
-            outpoint = (coin.utxo.txid, coin.utxo.vout)
+            outpoint = coin.outpoint
             if outpoint in prepared.released_reservations:
                 continue
             try:
@@ -696,10 +694,10 @@ class PeerSwapPrepareTxOperation:
                 selected.append(coin)
             return selected
 
-        allowed_outpoints = {(coin.utxo.txid, coin.utxo.vout) for coin in allowed}
+        allowed_outpoints = {coin.outpoint for coin in allowed}
         target_amount = sum(output.amount for output in request.outputs)
         output_types = [self._output_type(output.address) for output in request.outputs]
-        previous_outpoints: set[tuple[str, int]] | None = None
+        previous_outpoints: set[Outpoint] | None = None
         selection_target = target_amount + ceil(
             estimate_vsize(
                 input_types=["p2wpkh"],
@@ -739,9 +737,7 @@ class PeerSwapPrepareTxOperation:
                 if str(exc) != "Insufficient funds after fees.":
                     raise
 
-                current_outpoints = {
-                    (coin.utxo.txid, coin.utxo.vout) for coin in selected
-                }
+                current_outpoints = {coin.outpoint for coin in selected}
                 if previous_outpoints == current_outpoints:
                     raise
                 previous_outpoints = current_outpoints

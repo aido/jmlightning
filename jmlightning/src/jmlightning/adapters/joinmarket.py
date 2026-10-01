@@ -15,7 +15,7 @@ from jmwallet.wallet.service import WalletService
 from jmwallet.wallet.signer import SignedInput
 
 from jmlightning.config import CLNConfig
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.recovery import RecoveryJournal
 
 logger = logging.getLogger(__name__)
@@ -67,12 +67,12 @@ class JoinMarketAdapter:
         # persisted JoinMarket reservation is the authoritative cross-process
         # lock. This local set only prevents duplicate acquisition within this
         # adapter instance.
-        self._locked_utxos: set[tuple[str, int]] = set()
+        self._locked_utxos: set[Outpoint] = set()
         # Owner generations are retained until the corresponding reservation
         # is successfully released. JoinMarket compares this owner token when
         # releasing a reservation, so an expired stale owner cannot release a
         # newer owner's reservation.
-        self._lock_owners: dict[tuple[str, int], str] = {}
+        self._lock_owners: dict[Outpoint, str] = {}
         # Reservation renewal must not depend on the asyncio event loop.
         # jm-lightning is a oneshot command and some of its synchronous CLN
         # operations can legitimately occupy the loop for longer than the
@@ -91,7 +91,7 @@ class JoinMarketAdapter:
         self._recovery_journal = journal
         self._recovery_id = record_id
 
-    def _owner_tokens(self) -> dict[tuple[str, int], str]:
+    def _owner_tokens(self) -> dict[Outpoint, str]:
         with self._lock_state:
             return dict(self._lock_owners)
 
@@ -99,7 +99,7 @@ class JoinMarketAdapter:
         self,
         *,
         action: str,
-        outpoint: tuple[str, int],
+        outpoint: Outpoint,
     ) -> None:
         if self._recovery_journal is None or self._recovery_id is None:
             return
@@ -311,7 +311,9 @@ class JoinMarketAdapter:
         wallet = self._require_wallet()
         with self._lock_state:
             locked = set(self._locked_utxos)
-        locked.update(wallet.get_locked_input_outpoints())
+        locked.update(
+            Outpoint(txid, vout) for txid, vout in wallet.get_locked_input_outpoints()
+        )
         classified_utxos: list[ClassifiedUTXO] = []
 
         for change in (0, 1):
@@ -326,10 +328,7 @@ class JoinMarketAdapter:
                     if utxo.frozen:
                         continue
 
-                    outpoint = (
-                        utxo.txid,
-                        utxo.vout,
-                    )
+                    outpoint = Outpoint(utxo.txid, utxo.vout)
 
                     # Never expose a UTXO that is already locked
                     # by another jm-lightning operation.
@@ -374,10 +373,7 @@ class JoinMarketAdapter:
 
         wallet = self._require_wallet()
 
-        outpoint = (
-            coin.utxo.txid,
-            coin.utxo.vout,
-        )
+        outpoint = coin.outpoint
 
         with self._lock_state:
             already_locked = outpoint in self._locked_utxos
@@ -403,7 +399,7 @@ class JoinMarketAdapter:
             )
         with self._reservation_io:
             reserved = wallet.reserve_coinjoin_inputs(
-                {outpoint},
+                {outpoint.as_tuple()},
                 ttl=LOCK_TTL_SECONDS,
                 owner=owner,
             )
@@ -485,14 +481,14 @@ class JoinMarketAdapter:
             )
             with self._reservation_io:
                 renewed = wallet.renew_coinjoin_inputs(
-                    {outpoint},
+                    {outpoint.as_tuple()},
                     owner=owner,
                     ttl=LOCK_TTL_SECONDS,
                 )
             self._journal_after_reservation()
             if not renewed:
                 raise RuntimeError(
-                    f"JoinMarket reservation for {outpoint[0]}:{outpoint[1]} "
+                    f"JoinMarket reservation for {outpoint} "
                     "expired or is no longer owned by this operation"
                 )
 
@@ -524,10 +520,7 @@ class JoinMarketAdapter:
         """
         wallet = self._require_wallet()
 
-        outpoint = (
-            coin.utxo.txid,
-            coin.utxo.vout,
-        )
+        outpoint = coin.outpoint
         with self._lock_state:
             owner = self._lock_owners.get(outpoint)
         if owner is None:
@@ -541,7 +534,7 @@ class JoinMarketAdapter:
         )
         with self._reservation_io:
             renewed = wallet.renew_coinjoin_inputs(
-                {outpoint},
+                {outpoint.as_tuple()},
                 owner=owner,
                 ttl=LOCK_TTL_SECONDS,
             )
@@ -577,10 +570,7 @@ class JoinMarketAdapter:
 
         wallet = self._require_wallet()
 
-        outpoint = (
-            coin.utxo.txid,
-            coin.utxo.vout,
-        )
+        outpoint = coin.outpoint
 
         with self._lock_state:
             owner = self._lock_owners.get(outpoint)
@@ -596,7 +586,7 @@ class JoinMarketAdapter:
         )
         try:
             with self._reservation_io:
-                wallet.release_coinjoin_inputs({outpoint}, owner=owner)
+                wallet.release_coinjoin_inputs({outpoint.as_tuple()}, owner=owner)
         except Exception:
             # Retain both the owner and local reservation until cleanup can be
             # retried. In particular, do not drop the owner after a failed
@@ -611,30 +601,30 @@ class JoinMarketAdapter:
 
     def recover_release(
         self,
-        outpoint: tuple[str, int],
+        outpoint: Outpoint,
         owner: str,
     ) -> None:
         """Release a persisted reservation only for its recorded owner."""
         wallet = self._require_wallet()
         with self._reservation_io:
-            wallet.release_coinjoin_inputs({outpoint}, owner=owner)
+            wallet.release_coinjoin_inputs({outpoint.as_tuple()}, owner=owner)
 
     def recover_renew(
         self,
-        outpoint: tuple[str, int],
+        outpoint: Outpoint,
         owner: str,
     ) -> None:
         """Renew a persisted reservation for recovery reconciliation."""
         wallet = self._require_wallet()
         with self._reservation_io:
             renewed = wallet.renew_coinjoin_inputs(
-                {outpoint},
+                {outpoint.as_tuple()},
                 owner=owner,
                 ttl=LOCK_TTL_SECONDS,
             )
         if not renewed:
             raise RuntimeError(
-                f"JoinMarket reservation for {outpoint[0]}:{outpoint[1]} "
+                f"JoinMarket reservation for {outpoint} "
                 "cannot be renewed by the recorded owner"
             )
 
@@ -650,7 +640,7 @@ class JoinMarketAdapter:
         self,
         mixdepth: int,
         target_amount: int,
-        allowed_outpoints: set[tuple[str, int]],
+        allowed_outpoints: set[Outpoint],
     ) -> list[UTXOInfo]:
         """Delegate coin-selection mathematics to JoinMarket.
 
@@ -661,9 +651,9 @@ class JoinMarketAdapter:
         all_utxos = wallet.utxo_cache.get(mixdepth, [])
 
         excluded = {
-            (utxo.txid, utxo.vout)
+            Outpoint(utxo.txid, utxo.vout)
             for utxo in all_utxos
-            if (utxo.txid, utxo.vout) not in allowed_outpoints
+            if Outpoint(utxo.txid, utxo.vout) not in allowed_outpoints
         }
         # Apply the authoritative cross-process reservation set at the
         # selection boundary too. get_utxos() filters these coins for normal
@@ -671,12 +661,14 @@ class JoinMarketAdapter:
         # filtering.
         with self._lock_state:
             excluded.update(self._locked_utxos)
-        excluded.update(wallet.get_locked_input_outpoints())
+        excluded.update(
+            Outpoint(txid, vout) for txid, vout in wallet.get_locked_input_outpoints()
+        )
 
         return wallet.select_utxos(
             mixdepth=mixdepth,
             target_amount=target_amount,
-            exclude=excluded,
+            exclude={outpoint.as_tuple() for outpoint in excluded},
             include_fidelity_bonds=False,
         )
 

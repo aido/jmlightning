@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from uuid import uuid4
 
 from jmlightning.lightning.backend import ChannelFundingStatus
+from jmlightning.models import Outpoint
 
 T = TypeVar("T")
 
@@ -37,7 +38,7 @@ class RecoveryRecord:
     phase: str
     action: str | None = None
     status: str = "pending"
-    locked_outpoints: list[tuple[str, int]] = field(default_factory=list)
+    locked_outpoints: list[Outpoint] = field(default_factory=list)
     owner_tokens: dict[str, str] = field(default_factory=dict)
     psbt: str | None = None
     txid: str | None = None
@@ -51,7 +52,9 @@ class RecoveryRecord:
             "phase": self.phase,
             "action": self.action,
             "status": self.status,
-            "locked_outpoints": [list(item) for item in self.locked_outpoints],
+            "locked_outpoints": [
+                list(item.as_tuple()) for item in self.locked_outpoints
+            ],
             "owner_tokens": self.owner_tokens,
             "psbt": self.psbt,
             "txid": self.txid,
@@ -64,7 +67,7 @@ class RecoveryRecord:
         if not isinstance(raw_outpoints, list):
             raise ValueError("locked_outpoints must be a list")
 
-        outpoints: list[tuple[str, int]] = []
+        outpoints: list[Outpoint] = []
         for item in raw_outpoints:
             if (
                 not isinstance(item, list)
@@ -74,7 +77,7 @@ class RecoveryRecord:
                 or isinstance(item[1], bool)
             ):
                 raise ValueError("invalid locked_outpoints entry")
-            outpoints.append((item[0], item[1]))
+            outpoints.append(Outpoint(item[0], item[1]))
 
         identity = value.get("identity", {})
         if not isinstance(identity, dict):
@@ -242,7 +245,12 @@ class RecoveryJournal:
                 if record.id == record_id:
                     for key, value in changes.items():
                         if key == "locked_outpoints" and value is not None:
-                            value = [tuple(item) for item in value]
+                            value = [
+                                item
+                                if isinstance(item, Outpoint)
+                                else Outpoint(item[0], item[1])
+                                for item in value
+                            ]
                         setattr(record, key, value)
                     record.updated_at = datetime.now(UTC).isoformat()
                     self._write(records)
@@ -255,15 +263,13 @@ class RecoveryJournal:
         *,
         action: str,
         phase: str,
-        locked_outpoints: list[tuple[str, int]] | None = None,
-        owner_tokens: dict[tuple[str, int], str] | None = None,
+        locked_outpoints: list[Outpoint] | None = None,
+        owner_tokens: dict[Outpoint, str] | None = None,
         psbt: bytes | None = None,
         txid: str | None = None,
     ) -> None:
         owners = owner_tokens if isinstance(owner_tokens, dict) else {}
-        encoded_owners = {
-            f"{txid}:{vout}": owner for (txid, vout), owner in owners.items()
-        }
+        encoded_owners = {str(outpoint): owner for outpoint, owner in owners.items()}
         changes: dict[str, Any] = {
             "phase": phase,
             "action": action,
@@ -312,8 +318,8 @@ class RecoveryJournal:
         action: str,
         phase: str,
         fn: Callable[[], T],
-        locked_outpoints: list[tuple[str, int]] | None = None,
-        owner_tokens: dict[tuple[str, int], str] | None = None,
+        locked_outpoints: list[Outpoint] | None = None,
+        owner_tokens: dict[Outpoint, str] | None = None,
         psbt: bytes | None = None,
         txid: str | None = None,
     ) -> T:
@@ -393,9 +399,11 @@ class RecoveryManager:
         # spender reported by Bitcoin Core, proves that the reservation must be
         # retained. A clean result for every recorded input proves that the
         # recorded transaction cannot currently be spending any of them.
-        for input_txid, vout in record.locked_outpoints:
+        for outpoint in record.locked_outpoints:
             try:
-                spender = await backend.get_mempool_spender(input_txid, vout)
+                spender = await backend.get_mempool_spender(
+                    outpoint.txid, outpoint.vout
+                )
             except Exception:
                 return None
             if (
@@ -430,7 +438,7 @@ class RecoveryManager:
                 return False
 
             if set(record.owner_tokens) != {
-                f"{out_txid}:{vout}" for out_txid, vout in record.locked_outpoints
+                str(outpoint) for outpoint in record.locked_outpoints
             }:
                 raise RuntimeError(
                     "Recovery record is missing an owner token for a locked outpoint"
@@ -443,7 +451,7 @@ class RecoveryManager:
                     phase=record.phase,
                     locked_outpoints=record.locked_outpoints,
                     owner_tokens={
-                        (owner_txid, int(owner_vout)): owner_token
+                        Outpoint(owner_txid, int(owner_vout)): owner_token
                         for owner_key, owner_token in record.owner_tokens.items()
                         for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
                     },
@@ -454,7 +462,7 @@ class RecoveryManager:
                     ),
                     txid=record.txid,
                 )
-                self.adapter.recover_release((out_txid, int(vout_text)), owner)
+                self.adapter.recover_release(Outpoint(out_txid, int(vout_text)), owner)
             return True
 
         if txid is not None and record.operation != "peerswap":
@@ -490,7 +498,7 @@ class RecoveryManager:
             return False
 
         if set(record.owner_tokens) != {
-            f"{txid}:{vout}" for txid, vout in record.locked_outpoints
+            str(outpoint) for outpoint in record.locked_outpoints
         }:
             raise RuntimeError(
                 "Recovery record is missing an owner token for a locked outpoint"
@@ -504,7 +512,7 @@ class RecoveryManager:
                 phase=record.phase,
                 locked_outpoints=record.locked_outpoints,
                 owner_tokens={
-                    (owner_txid, int(owner_vout)): owner_token
+                    Outpoint(owner_txid, int(owner_vout)): owner_token
                     for owner_key, owner_token in record.owner_tokens.items()
                     for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
                 },
@@ -513,7 +521,7 @@ class RecoveryManager:
                 ),
                 txid=record.txid,
             )
-            self.adapter.recover_release((txid_text, int(vout_text)), owner)
+            self.adapter.recover_release(Outpoint(txid_text, int(vout_text)), owner)
         return True
 
     async def _peer_statuses(

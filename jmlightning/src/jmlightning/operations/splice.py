@@ -20,7 +20,7 @@ from jmlightning.lightning.cln import (
     estimate_splice_in_fee,
     estimate_splice_out_fee,
 )
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
@@ -43,7 +43,7 @@ class SpliceRecoveryRequiredError(RuntimeError):
         *,
         channel_id: str,
         txid: str | None,
-        locked_outpoints: tuple[tuple[str, int], ...],
+        locked_outpoints: tuple[Outpoint, ...],
     ) -> None:
         super().__init__(message)
         self.channel_id = channel_id
@@ -154,10 +154,8 @@ class SpliceInOperation:
                 capability.name,
             )
 
-            allowed_outpoints = {(coin.utxo.txid, coin.utxo.vout) for coin in allowed}
-            classified_by_outpoint = {
-                (coin.utxo.txid, coin.utxo.vout): coin for coin in allowed
-            }
+            allowed_outpoints = {coin.outpoint for coin in allowed}
+            classified_by_outpoint = {coin.outpoint: coin for coin in allowed}
 
             # --------------------------------------------------------
             # Fee rate
@@ -209,7 +207,7 @@ class SpliceInOperation:
                 )
             else:
                 selection_target = self.config.amount
-                previous_outpoints: set[tuple[str, int]] | None = None
+                previous_outpoints: set[Outpoint] | None = None
 
                 while True:
                     selected_raw = jmadapter.select_utxos(
@@ -220,7 +218,7 @@ class SpliceInOperation:
 
                     try:
                         selected = [
-                            classified_by_outpoint[(utxo.txid, utxo.vout)]
+                            classified_by_outpoint[Outpoint(utxo.txid, utxo.vout)]
                             for utxo in selected_raw
                         ]
                     except KeyError as exc:
@@ -237,9 +235,7 @@ class SpliceInOperation:
 
                     policy.validate(selected, capability)
 
-                    current_outpoints = {
-                        (coin.utxo.txid, coin.utxo.vout) for coin in selected
-                    }
+                    current_outpoints = {coin.outpoint for coin in selected}
 
                     try:
                         plan = planner.build_plan(
@@ -334,7 +330,7 @@ class SpliceInOperation:
                         amount=plan.amount,
                         feerate_per_kw=splice_feerate_per_kw,
                     ),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                 )
             except Exception as exc:
@@ -346,9 +342,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             returned_psbt = result.get("psbt")
@@ -359,9 +353,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             try:
@@ -376,9 +368,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             lifecycle.transition(LifecyclePhase.STARTED)
@@ -404,9 +394,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             splice_change = (
@@ -419,9 +407,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             splice_plan = replace(
@@ -493,9 +479,7 @@ class SpliceInOperation:
                         "JoinMarket UTXOs remain locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     )
 
                 # Each input is added with its share of the fee, but CLN sees
@@ -545,7 +529,7 @@ class SpliceInOperation:
                             channel_id=channel_id,
                             psbt=splice_psbt,
                         ),
-                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        locked_outpoints=[c.outpoint for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         psbt=splice_psbt,
                     )
@@ -555,9 +539,7 @@ class SpliceInOperation:
                         "JoinMarket UTXO remains locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     ) from exc
 
                 returned_psbt = update_result.get("psbt")
@@ -567,9 +549,7 @@ class SpliceInOperation:
                         "JoinMarket UTXO remains locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     )
 
                 try:
@@ -583,9 +563,7 @@ class SpliceInOperation:
                         "JoinMarket UTXO remains locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     ) from exc
 
                 try:
@@ -601,9 +579,7 @@ class SpliceInOperation:
                         "locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     ) from exc
 
                 returned_commitments_secured = update_result.get("commitments_secured")
@@ -613,9 +589,7 @@ class SpliceInOperation:
                         "JoinMarket UTXO remains locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     )
 
                 returned_signatures_secured = update_result.get("signatures_secured")
@@ -628,9 +602,7 @@ class SpliceInOperation:
                         "JoinMarket UTXO remains locked for recovery",
                         channel_id=channel_id,
                         txid=None,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     )
 
                 commitments_secured = returned_commitments_secured
@@ -650,9 +622,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             # --------------------------------------------------------
@@ -702,9 +672,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             # --------------------------------------------------------
@@ -722,7 +690,7 @@ class SpliceInOperation:
                         channel_id=channel_id,
                         psbt=splice_psbt,
                     ),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                     psbt=splice_psbt,
                     txid=txid,
@@ -733,9 +701,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             returned_psbt = signed_result.get("psbt")
@@ -745,9 +711,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             returned_tx = signed_result.get("tx")
@@ -757,9 +721,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             returned_txid = signed_result.get("txid")
@@ -769,9 +731,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=None,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             if returned_txid != txid:
@@ -781,9 +741,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=txid,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             txid = returned_txid
@@ -799,9 +757,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=txid,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             try:
@@ -812,9 +768,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=txid,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 ) from exc
 
             if not signed_tx:
@@ -823,9 +777,7 @@ class SpliceInOperation:
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
                     txid=txid,
-                    locked_outpoints=tuple(
-                        (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                    ),
+                    locked_outpoints=tuple(coin.outpoint for coin in locked),
                 )
 
             lifecycle.transition(LifecyclePhase.SIGNED)
@@ -874,9 +826,7 @@ class SpliceInOperation:
                         "manual recovery is required",
                         channel_id=channel_id,
                         txid=txid,
-                        locked_outpoints=tuple(
-                            (coin.utxo.txid, coin.utxo.vout) for coin in locked
-                        ),
+                        locked_outpoints=tuple(coin.outpoint for coin in locked),
                     ),
                 )
             finally:

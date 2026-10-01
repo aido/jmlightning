@@ -7,7 +7,7 @@ import pytest
 from jmwallet.wallet.models import UTXOInfo
 
 from jmlightning.lightning.backend import FeePriority
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.splice import (
     SpliceInOperation,
     SpliceOutOperation,
@@ -115,7 +115,7 @@ async def test_splice_in_zero_amount_sweeps_all_policy_approved_utxos(
         side_effect=[b"previous-tx-1", b"previous-tx-2"]
     )
     contribution = SpliceContribution(
-        jm_outpoint=(coin.utxo.txid, coin.utxo.vout),
+        jm_outpoint=coin.outpoint,
         jm_value=coin.utxo.value,
         change_script=None,
         change_value=0,
@@ -125,7 +125,7 @@ async def test_splice_in_zero_amount_sweeps_all_policy_approved_utxos(
         max_fee=500,
     )
     second_contribution = SpliceContribution(
-        jm_outpoint=(second_coin.utxo.txid, second_coin.utxo.vout),
+        jm_outpoint=second_coin.outpoint,
         jm_value=second_coin.utxo.value,
         change_script=None,
         change_value=0,
@@ -540,7 +540,7 @@ async def test_splice_update_failure_requires_recovery(tmp_path: Path) -> None:
         ) as exc_info:
             await operation.execute("22" * 32)
 
-    assert exc_info.value.locked_outpoints == (("11" * 32, 0),)
+    assert exc_info.value.locked_outpoints == (Outpoint("11" * 32, 0),)
     jmadapter.unlock.assert_not_called()
     jmadapter.close.assert_awaited_once()
 
@@ -742,7 +742,7 @@ async def test_splice_signing_failure_requires_recovery(tmp_path: Path) -> None:
         ) as exc_info:
             await operation.execute("22" * 32)
 
-    assert exc_info.value.locked_outpoints == (("11" * 32, 0),)
+    assert exc_info.value.locked_outpoints == (Outpoint("11" * 32, 0),)
     cln.splice_signed.assert_not_called()
     jmadapter.unlock.assert_not_called()
     jmadapter.close.assert_awaited_once()
@@ -841,7 +841,7 @@ async def test_splice_signed_failure_requires_recovery(tmp_path: Path) -> None:
             await operation.execute("22" * 32)
 
     assert exc_info.value.channel_id == "22" * 32
-    assert exc_info.value.locked_outpoints == (("11" * 32, 0),)
+    assert exc_info.value.locked_outpoints == (Outpoint("11" * 32, 0),)
     jmadapter.unlock.assert_not_called()
     jmadapter.close.assert_awaited_once()
 

@@ -13,7 +13,7 @@ from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
 from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.lightning.cln import CLNBackend
-from jmlightning.models import ClassifiedUTXO
+from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
@@ -121,8 +121,8 @@ class MultiOpenChannelOperation:
                     f"{self.required_capability.name}"
                 )
 
-            allowed_outpoints = {(c.utxo.txid, c.utxo.vout) for c in allowed}
-            classified = {(c.utxo.txid, c.utxo.vout): c for c in allowed}
+            allowed_outpoints = {c.outpoint for c in allowed}
+            classified = {c.outpoint: c for c in allowed}
 
             # --------------------------------------------------------
             # Fee rate
@@ -137,7 +137,7 @@ class MultiOpenChannelOperation:
 
             selection_reserve = 0
             selection_input_types = ["p2wpkh"]
-            previous_outpoints: set[tuple[str, int]] | None = None
+            previous_outpoints: set[Outpoint] | None = None
 
             while True:
                 # Reserve enough for the funding outputs and a conservative
@@ -160,7 +160,9 @@ class MultiOpenChannelOperation:
                     allowed_outpoints=allowed_outpoints,
                 )
                 try:
-                    selected = [classified[(u.txid, u.vout)] for u in selected_raw]
+                    selected = [
+                        classified[Outpoint(u.txid, u.vout)] for u in selected_raw
+                    ]
                 except KeyError as exc:
                     raise RuntimeError(
                         "JoinMarket selected a UTXO that was not present in the "
@@ -171,9 +173,7 @@ class MultiOpenChannelOperation:
                     raise RuntimeError("Unable to select UTXOs for OPEN_CHANNEL")
 
                 policy.validate(selected, self.required_capability)
-                current_outpoints = {
-                    (coin.utxo.txid, coin.utxo.vout) for coin in selected
-                }
+                current_outpoints = {coin.outpoint for coin in selected}
 
                 try:
                     plan = planner.build_multi_plan(
@@ -240,7 +240,7 @@ class MultiOpenChannelOperation:
                             announce=self.config.announce,
                             **({"close_to": close_to} if close_to is not None else {}),
                         ),
-                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        locked_outpoints=[c.outpoint for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                     )
                 except Exception as exc:
@@ -326,7 +326,7 @@ class MultiOpenChannelOperation:
                         action="fundchannel_complete",
                         phase=LifecyclePhase.STARTED.value,
                         fn=complete_channel,
-                        locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                        locked_outpoints=[c.outpoint for c in locked],
                         owner_tokens=jmadapter._owner_tokens(),
                         psbt=signed_psbt,
                         txid=txid,
@@ -371,7 +371,7 @@ class MultiOpenChannelOperation:
                     action="sendpsbt",
                     phase=LifecyclePhase.WITHHELD.value,
                     fn=lambda: cln.send_psbt(signed_psbt),
-                    locked_outpoints=[(c.utxo.txid, c.utxo.vout) for c in locked],
+                    locked_outpoints=[c.outpoint for c in locked],
                     owner_tokens=jmadapter._owner_tokens(),
                     psbt=signed_psbt,
                     txid=txid,
