@@ -11,7 +11,10 @@ from loguru import logger
 
 from jmlightning.adapters.joinmarket import JoinMarketAdapter
 from jmlightning.config import CLNConfig
-from jmlightning.lightning.backend import ChannelFundingStatus
+from jmlightning.lightning.backend import (
+    ChannelFundingStatus,
+    FundChannelCompleteResult,
+)
 from jmlightning.lightning.cln import CLNBackend
 from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
@@ -315,7 +318,9 @@ class MultiOpenChannelOperation:
             for peer_id in started:
                 try:
 
-                    def complete_channel(peer_id: str = peer_id) -> dict[str, object]:
+                    def complete_channel(
+                        peer_id: str = peer_id,
+                    ) -> FundChannelCompleteResult:
                         return cln.open_channel_complete(
                             peer_id=peer_id,
                             psbt=signed_psbt,

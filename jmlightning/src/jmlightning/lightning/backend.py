@@ -1,8 +1,39 @@
 from abc import ABC, abstractmethod
 from enum import StrEnum, auto
-from typing import TypeAlias
+from typing import NotRequired, TypedDict
 
-RPCResponse: TypeAlias = dict[str, object]
+
+class FundChannelCompleteResult(TypedDict):
+    commitments_secured: bool
+    channel_id: NotRequired[str]
+
+
+class SendPsbtResult(TypedDict):
+    tx: str
+    txid: str
+
+
+class SpliceInitResult(TypedDict):
+    psbt: str
+
+
+class SpliceUpdateResult(TypedDict):
+    psbt: str
+    commitments_secured: bool
+    signatures_secured: NotRequired[bool]
+
+
+class SpliceSignedResult(TypedDict):
+    tx: str
+    txid: str
+    psbt: str
+    outnum: NotRequired[int]
+
+
+class AddPsbtOutputResult(TypedDict):
+    psbt: str
+    estimated_added_weight: int
+    outnum: int
 
 
 class FeePriority(StrEnum):
@@ -35,13 +66,13 @@ class LightningBackend(ABC):
         self,
         peer_id: str,
         psbt: bytes,
-    ) -> RPCResponse:
+    ) -> FundChannelCompleteResult:
         """
         Complete a channel open using the funding transaction PSBT.
         """
 
     @abstractmethod
-    def send_psbt(self, psbt: bytes) -> RPCResponse:
+    def send_psbt(self, psbt: bytes) -> SendPsbtResult:
         """
         Finalise and broadcast a fully signed PSBT.
         """
@@ -63,7 +94,7 @@ class LightningBackend(ABC):
         initial_psbt: bytes | None = None,
         feerate_per_kw: int | None = None,
         force_feerate: bool = False,
-    ) -> RPCResponse:
+    ) -> SpliceInitResult:
         """
         Initiate a channel splice and return the resulting PSBT response.
         """
@@ -74,7 +105,7 @@ class LightningBackend(ABC):
         amount: int,
         destination: str,
         initial_psbt: bytes | None = None,
-    ) -> RPCResponse:
+    ) -> AddPsbtOutputResult:
         """Add a destination output to a PSBT using CLN's wallet.
 
         The output is created by CLN so its splice PSBT metadata, including
@@ -86,7 +117,7 @@ class LightningBackend(ABC):
         self,
         channel_id: str,
         psbt: bytes,
-    ) -> RPCResponse:
+    ) -> SpliceUpdateResult:
         """
         Update the active splice with the supplied PSBT.
         """
@@ -97,7 +128,7 @@ class LightningBackend(ABC):
         channel_id: str,
         psbt: bytes,
         sign_first: bool = False,
-    ) -> RPCResponse:
+    ) -> SpliceSignedResult:
         """
         Complete an active splice using the fully signed PSBT.
         """

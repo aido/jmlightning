@@ -19,9 +19,15 @@ from jmwallet.wallet.psbt import (
 from pyln.client import LightningRpc
 
 from jmlightning.lightning.backend import (
+    AddPsbtOutputResult,
     ChannelFundingStatus,
     FeePriority,
+    FundChannelCompleteResult,
     LightningBackend,
+    SendPsbtResult,
+    SpliceInitResult,
+    SpliceSignedResult,
+    SpliceUpdateResult,
 )
 
 
@@ -288,7 +294,7 @@ class CLNBackend(LightningBackend):
         self,
         peer_id: str,
         psbt: bytes,
-    ) -> dict[str, object]:
+    ) -> FundChannelCompleteResult:
         """Complete channel establishment using the funding transaction PSBT."""
         try:
             result = self.rpc.fundchannel_complete(
@@ -296,7 +302,28 @@ class CLNBackend(LightningBackend):
                 psbt=psbt_to_base64(psbt),
                 withhold=True,
             )
-            return dict(result)
+            if not isinstance(result, dict):
+                raise RuntimeError(
+                    "CLN fundchannel_complete returned an invalid response"
+                )
+            channel_id = result.get("channel_id")
+            commitments_secured = result.get("commitments_secured")
+            if channel_id is not None and (
+                not isinstance(channel_id, str) or not channel_id
+            ):
+                raise RuntimeError(
+                    "CLN fundchannel_complete response has invalid channel_id"
+                )
+            if commitments_secured is not True:
+                raise RuntimeError(
+                    "CLN fundchannel_complete response has invalid commitments_secured"
+                )
+            typed_result: FundChannelCompleteResult = {
+                "commitments_secured": commitments_secured,
+            }
+            if channel_id is not None:
+                typed_result["channel_id"] = channel_id
+            return typed_result
         except Exception as exc:
             raise RuntimeError(f"Failed to complete channel open: {exc}") from exc
 
@@ -317,7 +344,7 @@ class CLNBackend(LightningBackend):
         initial_psbt: bytes | None = None,
         feerate_per_kw: int | None = None,
         force_feerate: bool = False,
-    ) -> dict[str, object]:
+    ) -> SpliceInitResult:
         """Initiate a CLN channel splice."""
         try:
             if force_feerate:
@@ -339,7 +366,7 @@ class CLNBackend(LightningBackend):
             if not isinstance(psbt, str) or not psbt:
                 raise RuntimeError("CLN splice_init response is missing psbt")
 
-            return dict(result)
+            return {"psbt": psbt}
         except RuntimeError:
             raise
         except Exception as exc:
@@ -350,7 +377,7 @@ class CLNBackend(LightningBackend):
         amount: int,
         destination: str,
         initial_psbt: bytes | None = None,
-    ) -> dict[str, object]:
+    ) -> AddPsbtOutputResult:
         """Add a single output to a PSBT using CLN's wallet.
 
         ``addpsbtoutput`` is used for splice-out because CLN must assign the
@@ -374,7 +401,23 @@ class CLNBackend(LightningBackend):
             psbt = result.get("psbt")
             if not isinstance(psbt, str) or not psbt:
                 raise RuntimeError("CLN addpsbtoutput response is missing psbt")
-            return dict(result)
+            estimated_added_weight = result.get("estimated_added_weight")
+            outnum = result.get("outnum")
+            if (
+                not isinstance(estimated_added_weight, int)
+                or isinstance(estimated_added_weight, bool)
+                or estimated_added_weight < 0
+            ):
+                raise RuntimeError(
+                    "CLN addpsbtoutput response has invalid estimated_added_weight"
+                )
+            if not isinstance(outnum, int) or isinstance(outnum, bool) or outnum < 0:
+                raise RuntimeError("CLN addpsbtoutput response has invalid outnum")
+            return {
+                "psbt": psbt,
+                "estimated_added_weight": estimated_added_weight,
+                "outnum": outnum,
+            }
         except (RuntimeError, ValueError):
             raise
         except Exception as exc:
@@ -384,7 +427,7 @@ class CLNBackend(LightningBackend):
         self,
         channel_id: str,
         psbt: bytes,
-    ) -> dict[str, object]:
+    ) -> SpliceUpdateResult:
         """Update an active CLN channel splice."""
         try:
             result = self.rpc.splice_update(
@@ -405,14 +448,21 @@ class CLNBackend(LightningBackend):
                     "CLN splice_update response has invalid commitments_secured"
                 )
 
-            if "signatures_secured" in result and not isinstance(
-                result["signatures_secured"], bool
+            signatures_secured = result.get("signatures_secured")
+            if signatures_secured is not None and not isinstance(
+                signatures_secured, bool
             ):
                 raise RuntimeError(
                     "CLN splice_update response has invalid signatures_secured"
                 )
 
-            return dict(result)
+            typed_result: SpliceUpdateResult = {
+                "psbt": returned_psbt,
+                "commitments_secured": commitments_secured,
+            }
+            if signatures_secured is not None:
+                typed_result["signatures_secured"] = signatures_secured
+            return typed_result
         except RuntimeError:
             raise
         except Exception as exc:
@@ -423,7 +473,7 @@ class CLNBackend(LightningBackend):
         channel_id: str,
         psbt: bytes,
         sign_first: bool = False,
-    ) -> dict[str, object]:
+    ) -> SpliceSignedResult:
         """Complete an active CLN channel splice."""
         try:
             if sign_first:
@@ -450,7 +500,14 @@ class CLNBackend(LightningBackend):
             ):
                 raise RuntimeError("CLN splice_signed response has invalid outnum")
 
-            return dict(result)
+            typed_result: SpliceSignedResult = {
+                "tx": result["tx"],
+                "txid": result["txid"],
+                "psbt": result["psbt"],
+            }
+            if outnum is not None:
+                typed_result["outnum"] = outnum
+            return typed_result
         except RuntimeError:
             raise
         except Exception as exc:
@@ -589,13 +646,21 @@ class CLNBackend(LightningBackend):
                 f"Failed to determine CLN splice status for {channel_id}: {exc}"
             ) from exc
 
-    def send_psbt(self, psbt: bytes) -> dict[str, object]:
+    def send_psbt(self, psbt: bytes) -> SendPsbtResult:
         """Finalise and broadcast a fully signed PSBT through CLN."""
         try:
             result = self.rpc.sendpsbt(
                 psbt=psbt_to_base64(psbt),
             )
-            return dict(result)
+            if not isinstance(result, dict):
+                raise RuntimeError("CLN sendpsbt returned an invalid response")
+            tx = result.get("tx")
+            txid = result.get("txid")
+            if not isinstance(tx, str) or not tx:
+                raise RuntimeError("CLN sendpsbt response is missing tx")
+            if not isinstance(txid, str) or not txid:
+                raise RuntimeError("CLN sendpsbt response is missing txid")
+            return {"tx": tx, "txid": txid}
         except Exception as exc:
             raise RuntimeError(
                 f"Failed to send funding PSBT through CLN: {exc}"
