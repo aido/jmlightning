@@ -28,10 +28,12 @@ from loguru import logger
 
 from jmlightning.config import CLNConfig, build_cln_config
 from jmlightning.operations.multi_open_channel import (
+    MultiOpenChannelCancelledError,
     MultiOpenChannelOperation,
     confirm_multi_open_channel,
 )
 from jmlightning.operations.open_channel import (
+    OpenChannelCancelledError,
     OpenChannelOperation,
     confirm_open_channel,
 )
@@ -188,15 +190,18 @@ def open_channel(
 
     confirm = None if yes else confirm_open_channel
 
-    asyncio.run(
-        OpenChannelOperation(
-            config=config,
-            cln_socket=cln_socket,
-        ).execute(
-            peer_id=peer_id,
-            confirm=confirm,
+    try:
+        asyncio.run(
+            OpenChannelOperation(
+                config=config,
+                cln_socket=cln_socket,
+            ).execute(
+                peer_id=peer_id,
+                confirm=confirm,
+            )
         )
-    )
+    except OpenChannelCancelledError:
+        raise typer.Exit(0)
 
 
 @app.command()
@@ -305,15 +310,18 @@ def multi_open_channel(
 
     confirm = None if yes else confirm_multi_open_channel
 
-    asyncio.run(
-        MultiOpenChannelOperation(
-            config=config,
-            cln_socket=cln_socket,
-        ).execute(
-            destinations=destinations,
-            confirm=confirm,
+    try:
+        asyncio.run(
+            MultiOpenChannelOperation(
+                config=config,
+                cln_socket=cln_socket,
+            ).execute(
+                destinations=destinations,
+                confirm=confirm,
+            )
         )
-    )
+    except MultiOpenChannelCancelledError:
+        raise typer.Exit(0)
 
 
 @app.command()

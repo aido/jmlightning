@@ -13,7 +13,11 @@ from typer.testing import CliRunner
 
 import jmlightning.cli as cli
 import jmlightning.config as config
-from jmlightning.operations.open_channel import confirm_open_channel
+from jmlightning.operations.multi_open_channel import MultiOpenChannelCancelledError
+from jmlightning.operations.open_channel import (
+    OpenChannelCancelledError,
+    confirm_open_channel,
+)
 from jmlightning.operations.splice import confirm_splice_in
 
 runner = CliRunner()
@@ -289,6 +293,34 @@ def test_open_channel_exits_when_mnemonic_cannot_be_resolved(
     assert exc_info.value.exit_code == 1
 
 
+def test_open_channel_exits_cleanly_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(cli, "build_cln_config", lambda **kwargs: object())
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def execute(self, *, peer_id: str, confirm: object) -> None:
+            raise OpenChannelCancelledError("cancelled")
+
+    monkeypatch.setattr(cli, "OpenChannelOperation", FakeOperation)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.open_channel(
+            peer_id="peer",
+            amount=100_000,
+        )
+
+    assert exc_info.value.exit_code == 0
+
+
 def test_open_channel_runs_operation_without_confirmation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -450,6 +482,38 @@ def test_open_channel_passes_confirmation_callback_by_default(
     )
 
     assert confirms == [confirm_open_channel]
+
+
+def test_multi_open_channel_exits_cleanly_when_cancelled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(cli, "build_cln_config", lambda **kwargs: object())
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def execute(
+            self,
+            *,
+            destinations: list[tuple[str, int, str | None]],
+            confirm: object,
+        ) -> None:
+            raise MultiOpenChannelCancelledError("cancelled")
+
+    monkeypatch.setattr(cli, "MultiOpenChannelOperation", FakeOperation)
+
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.multi_open_channel(
+            destination=["peer:100000"],
+        )
+
+    assert exc_info.value.exit_code == 0
 
 
 def test_splice_in_rejects_negative_amount_before_setup(
