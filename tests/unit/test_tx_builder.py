@@ -15,6 +15,7 @@ from jmcore.bitcoin import (
     create_p2wpkh_script_code,
     create_psbt,
     parse_derivation_path,
+    parse_transaction_bytes,
     serialize_transaction,
 )
 from jmwallet.wallet.psbt import (
@@ -45,6 +46,7 @@ from jmwallet.wallet.psbt import (
 )
 from jmwallet.wallet.signing import sign_p2wpkh_input
 
+import jmlightning.tx_builder as tx_builder_module
 from jmlightning.lightning.cln import (
     CLN_PSBT_SERIAL_ID_KEY,
     _input_weight,
@@ -1981,6 +1983,311 @@ def test_validate_splice_psbt_accepts_reordered_inputs_and_outputs(
     _sync_unsigned_tx(parsed)
 
     builder.validate_splice_psbt(parsed.serialize(), contribution)
+
+
+def _splice_psbt_with_record(
+    splice_psbt: bytes,
+    input_index: int,
+    key_prefix: int,
+    value: bytes | None,
+    *,
+    remove_all: bool = False,
+) -> bytes:
+    parsed = parse_psbt(splice_psbt)
+    records = parsed.input_maps[input_index].records
+    if remove_all:
+        parsed.input_maps[input_index].records = [
+            record for record in records if record.key[:1] != bytes([key_prefix])
+        ]
+    else:
+        replaced = False
+        new_records: list[PSBTKeyValue] = []
+        for record in records:
+            if record.key[:1] == bytes([key_prefix]) and not replaced:
+                if value is not None:
+                    new_records.append(
+                        PSBTKeyValue(key=record.key, value=value),
+                    )
+                replaced = True
+            else:
+                new_records.append(record)
+        parsed.input_maps[input_index].records = new_records
+    return parsed.serialize()
+
+
+def test_psbt_input_value_accepts_non_witness_utxo(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+    witness = [
+        record
+        for record in parsed.input_maps[1].records
+        if record.key[:1] == bytes([PSBT_IN_WITNESS_UTXO])
+    ]
+    assert len(witness) == 1
+    parsed.input_maps[1].records.remove(witness[0])
+
+    assert builder._psbt_input_value(parsed, 1) == classified_utxos[2].utxo.value
+
+
+def test_psbt_input_value_rejects_short_witness_utxo(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+    for index, record in enumerate(parsed.input_maps[1].records):
+        if record.key[:1] == bytes([PSBT_IN_WITNESS_UTXO]):
+            parsed.input_maps[1].records[index] = PSBTKeyValue(
+                key=record.key,
+                value=b"\x00" * 7,
+            )
+            break
+    else:
+        raise AssertionError("splice fixture is missing witness UTXO")
+
+    with pytest.raises(RuntimeError, match="invalid witness UTXO"):
+        builder._psbt_input_value(parsed, 1)
+
+
+def test_psbt_input_value_rejects_missing_authoritative_utxo(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    broken = _splice_psbt_with_record(
+        splice_psbt,
+        1,
+        PSBT_IN_WITNESS_UTXO,
+        None,
+        remove_all=True,
+    )
+    broken = _splice_psbt_with_record(
+        broken,
+        1,
+        PSBT_IN_NON_WITNESS_UTXO,
+        None,
+        remove_all=True,
+    )
+    parsed = parse_psbt(broken)
+
+    with pytest.raises(RuntimeError, match="no authoritative UTXO value"):
+        builder._psbt_input_value(parsed, 1)
+
+
+def test_psbt_input_value_rejects_invalid_non_witness_utxo(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    broken = _splice_psbt_with_record(
+        splice_psbt,
+        1,
+        PSBT_IN_WITNESS_UTXO,
+        None,
+        remove_all=True,
+    )
+    broken = _splice_psbt_with_record(
+        broken,
+        1,
+        PSBT_IN_NON_WITNESS_UTXO,
+        b"not-a-transaction",
+    )
+    parsed = parse_psbt(broken)
+
+    with pytest.raises(RuntimeError, match="invalid non-witness UTXO"):
+        builder._psbt_input_value(parsed, 1)
+
+
+def test_validate_splice_psbt_rejects_negative_fee(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, contribution = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    bad_contribution = replace(
+        contribution,
+        channel_contribution=contribution.channel_contribution + 1,
+    )
+    parsed = parse_psbt(splice_psbt)
+    parsed.transaction.outputs[0] = TxOutput(
+        value=bad_contribution.channel_output[0]
+        + bad_contribution.channel_contribution,
+        script=bad_contribution.channel_output[1],
+    )
+    _sync_unsigned_tx(parsed)
+
+    with pytest.raises(RuntimeError, match="negative fee"):
+        builder.validate_splice_psbt(parsed.serialize(), bad_contribution)
+
+
+@pytest.mark.parametrize(
+    ("key_prefix", "message"),
+    [
+        (PSBT_IN_WITNESS_UTXO, "exactly one.*witness UTXO"),
+        (PSBT_IN_NON_WITNESS_UTXO, "exactly one.*non-witness UTXO"),
+    ],
+)
+def test_validate_splice_signing_input_rejects_missing_utxo_records(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+    key_prefix: int,
+    message: str,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    broken = _splice_psbt_with_record(
+        splice_psbt,
+        1,
+        key_prefix,
+        None,
+        remove_all=True,
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        builder.sign_splice_psbt(
+            broken,
+            signing_inputs={1: classified_utxos[2]},
+            wallet=_mock_wallet(),
+        )
+
+
+def test_validate_splice_signing_input_rejects_invalid_non_witness_utxo(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    broken = _splice_psbt_with_record(
+        splice_psbt,
+        1,
+        PSBT_IN_NON_WITNESS_UTXO,
+        b"not-a-transaction",
+    )
+
+    with pytest.raises(RuntimeError, match="invalid non-witness UTXO"):
+        builder.sign_splice_psbt(
+            broken,
+            signing_inputs={1: classified_utxos[2]},
+            wallet=_mock_wallet(),
+        )
+
+
+def test_validate_splice_signing_input_rejects_missing_previous_output(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+    previous = parse_transaction_bytes(splice_prev_tx)
+    truncated = ParsedTransaction(
+        version=previous.version,
+        inputs=previous.inputs,
+        outputs=[],
+        witnesses=previous.witnesses,
+        locktime=previous.locktime,
+        has_witness=previous.has_witness,
+    )
+    monkeypatch.setattr(
+        builder,
+        "_txid",
+        lambda _: classified_utxos[2].utxo.txid,
+    )
+    for index, record in enumerate(parsed.input_maps[1].records):
+        if record.key[:1] == bytes([PSBT_IN_NON_WITNESS_UTXO]):
+            parsed.input_maps[1].records[index] = PSBTKeyValue(
+                key=record.key,
+                value=serialize_transaction(
+                    truncated.version,
+                    truncated.inputs,
+                    truncated.outputs,
+                    truncated.locktime,
+                ),
+            )
+            break
+
+    with pytest.raises(RuntimeError, match="does not contain output"):
+        builder.sign_splice_psbt(
+            parsed.serialize(),
+            signing_inputs={1: classified_utxos[2]},
+            wallet=_mock_wallet(),
+        )
+
+
+def test_sign_splice_psbt_rejects_invalid_signed_psbt_returned_by_wallet(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    wallet = _mock_wallet()
+    parsed = parse_psbt(splice_psbt)
+    monkeypatch.setattr(
+        builder,
+        "_sign_psbt",
+        lambda **_: (parsed.transaction, "00" * 32, b"not-a-psbt"),
+    )
+
+    with pytest.raises(RuntimeError, match="invalid signed PSBT"):
+        builder.sign_splice_psbt(
+            splice_psbt,
+            signing_inputs={1: classified_utxos[2]},
+            wallet=wallet,
+        )
+
+
+def test_sign_splice_psbt_rejects_input_map_count_mismatch(
+    classified_utxos: list[ClassifiedUTXO],
+    splice_prev_tx: bytes,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    builder = TxBuilder()
+    splice_psbt, _ = _capture_splice_contribution(
+        builder, classified_utxos, splice_prev_tx
+    )
+    parsed = parse_psbt(splice_psbt)
+    original_parse_psbt = parse_psbt
+
+    def parse_with_extra_input_map(psbt: bytes) -> ParsedPSBT:
+        result = original_parse_psbt(psbt)
+        result.input_maps.append(PSBTMap())
+        return result
+
+    setattr(tx_builder_module, "parse_psbt", parse_with_extra_input_map)
+
+    with pytest.raises(RuntimeError, match="input map count"):
+        builder.sign_splice_psbt(
+            parsed.serialize(),
+            signing_inputs={1: classified_utxos[2]},
+            wallet=_mock_wallet(),
+        )
 
 
 @pytest.mark.parametrize(
