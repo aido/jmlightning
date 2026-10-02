@@ -1166,6 +1166,7 @@ Use appropriate secret-management mechanisms for production deployments.
     │   ├── test_open_channel_regtest.py
     │   ├── test_peerswap_rpc_regtest.py
     │   ├── test_peerswap_rendezvous_flow.py
+    │   ├── test_recovery_regtest.py
     │   └── test_splice_regtest.py
     │
     └── unit/
@@ -1178,6 +1179,7 @@ Use appropriate secret-management mechanisms for production deployments.
         ├── test_peerswap_rendezvous.py
         ├── test_planner.py
         ├── test_policy.py
+        ├── test_recovery_decisions.py
         ├── test_splice.py
         └── test_tx_builder.py
 ```
