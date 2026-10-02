@@ -1171,6 +1171,7 @@ Use appropriate secret-management mechanisms for production deployments.
     │
     └── unit/
         ├── test_cln.py
+        ├── test_cln_boundaries.py
         ├── test_joinmarket_adapter.py
         ├── test_jmpeerswap_plugin.py
         ├── test_lifecycle.py
