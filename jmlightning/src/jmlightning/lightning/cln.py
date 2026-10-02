@@ -1,6 +1,7 @@
 import secrets
 from dataclasses import dataclass
 from math import isfinite
+from typing import NoReturn
 
 from jmcore.bitcoin import (
     decode_varint,
@@ -42,6 +43,11 @@ class FeeEstimate:
 # helpers for them. Keep the compatibility fork here so TxBuilder remains
 # focused on transaction construction and validation.
 CLN_PSBT_SERIAL_ID_KEY = bytes([PSBT_IN_PROPRIETARY]) + b"\x09lightning\x01"
+
+
+def _raise_cln_error(operation: str, exc: Exception) -> NoReturn:
+    """Translate an RPC/backend exception into the CLN-facing error type."""
+    raise RuntimeError(f"{operation}: {exc}") from exc
 
 
 def new_serial_id(existing: set[int]) -> int:
@@ -213,7 +219,7 @@ class CLNBackend(LightningBackend):
         try:
             result = self.rpc.estimatefees()
         except Exception as exc:
-            raise RuntimeError(f"Failed to retrieve fee estimates: {exc}") from exc
+            _raise_cln_error("Failed to retrieve fee estimates", exc)
 
         if not isinstance(result, dict):
             raise RuntimeError("CLN estimatefees returned an invalid response")
@@ -288,7 +294,7 @@ class CLNBackend(LightningBackend):
         except RuntimeError:
             raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to start channel open: {exc}") from exc
+            _raise_cln_error("Failed to start channel open", exc)
 
     def open_channel_complete(
         self,
@@ -325,7 +331,7 @@ class CLNBackend(LightningBackend):
                 typed_result["channel_id"] = channel_id
             return typed_result
         except Exception as exc:
-            raise RuntimeError(f"Failed to complete channel open: {exc}") from exc
+            _raise_cln_error("Failed to complete channel open", exc)
 
     def cancel_channel_funding(
         self,
@@ -335,7 +341,7 @@ class CLNBackend(LightningBackend):
         try:
             self.rpc.fundchannel_cancel(node_id=peer_id)
         except Exception as exc:
-            raise RuntimeError(f"Failed to cancel channel funding: {exc}") from exc
+            _raise_cln_error("Failed to cancel channel funding", exc)
 
     def splice_init(
         self,
@@ -370,7 +376,7 @@ class CLNBackend(LightningBackend):
         except RuntimeError:
             raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to initiate channel splice: {exc}") from exc
+            _raise_cln_error("Failed to initiate channel splice", exc)
 
     def add_psbt_output(
         self,
@@ -421,7 +427,7 @@ class CLNBackend(LightningBackend):
         except (RuntimeError, ValueError):
             raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to add splice output: {exc}") from exc
+            _raise_cln_error("Failed to add splice output", exc)
 
     def splice_update(
         self,
@@ -466,7 +472,7 @@ class CLNBackend(LightningBackend):
         except RuntimeError:
             raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to update channel splice: {exc}") from exc
+            _raise_cln_error("Failed to update channel splice", exc)
 
     def splice_signed(
         self,
@@ -511,7 +517,7 @@ class CLNBackend(LightningBackend):
         except RuntimeError:
             raise
         except Exception as exc:
-            raise RuntimeError(f"Failed to complete channel splice: {exc}") from exc
+            _raise_cln_error("Failed to complete channel splice", exc)
 
     def get_channel_funding_status(
         self,
@@ -596,9 +602,9 @@ class CLNBackend(LightningBackend):
             return ChannelFundingStatus.ABSENT
 
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to determine CLN funding status for {peer_id}: {exc}"
-            ) from exc
+            _raise_cln_error(
+                f"Failed to determine CLN funding status for {peer_id}", exc
+            )
 
     def get_funding_start_status(self, peer_id: str) -> ChannelFundingStatus:
         """Check whether CLN still reports an in-flight channel open."""
@@ -619,9 +625,9 @@ class CLNBackend(LightningBackend):
                     return ChannelFundingStatus.WITHHELD
             return ChannelFundingStatus.ABSENT
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to determine CLN funding-start status for {peer_id}: {exc}"
-            ) from exc
+            _raise_cln_error(
+                f"Failed to determine CLN funding-start status for {peer_id}", exc
+            )
 
     def get_splice_funding_status(self, channel_id: str) -> ChannelFundingStatus:
         """Check the authoritative CLN state of an in-flight splice."""
@@ -642,9 +648,9 @@ class CLNBackend(LightningBackend):
                     return ChannelFundingStatus.WITHHELD
             return ChannelFundingStatus.ABSENT
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to determine CLN splice status for {channel_id}: {exc}"
-            ) from exc
+            _raise_cln_error(
+                f"Failed to determine CLN splice status for {channel_id}", exc
+            )
 
     def send_psbt(self, psbt: bytes) -> SendPsbtResult:
         """Finalise and broadcast a fully signed PSBT through CLN."""
@@ -662,9 +668,7 @@ class CLNBackend(LightningBackend):
                 raise RuntimeError("CLN sendpsbt response is missing txid")
             return {"tx": tx, "txid": txid}
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to send funding PSBT through CLN: {exc}"
-            ) from exc
+            _raise_cln_error("Failed to send funding PSBT through CLN", exc)
 
     def get_channel_local_balance_sat(self, channel_id: str) -> int:
         """Return the channel balance currently owed to this node in sats.
@@ -676,9 +680,9 @@ class CLNBackend(LightningBackend):
         try:
             result = self.rpc.listpeerchannels(channel_id=channel_id)
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to retrieve channel balance for {channel_id}: {exc}"
-            ) from exc
+            _raise_cln_error(
+                f"Failed to retrieve channel balance for {channel_id}", exc
+            )
 
         if not isinstance(result, dict):
             raise RuntimeError("CLN listpeerchannels returned an invalid response")
@@ -705,9 +709,9 @@ class CLNBackend(LightningBackend):
         try:
             result = self.rpc.listpeerchannels(channel_id=channel_id)
         except Exception as exc:
-            raise RuntimeError(
-                f"Failed to retrieve channel capacity for {channel_id}: {exc}"
-            ) from exc
+            _raise_cln_error(
+                f"Failed to retrieve channel capacity for {channel_id}", exc
+            )
 
         if not isinstance(result, dict) or not isinstance(result.get("channels"), list):
             raise RuntimeError("CLN listpeerchannels returned invalid channel data")
@@ -731,7 +735,7 @@ class CLNBackend(LightningBackend):
         try:
             result = self.rpc.feerates(style="perkw")
         except Exception as exc:
-            raise RuntimeError(f"Failed to retrieve CLN splice feerate: {exc}") from exc
+            _raise_cln_error("Failed to retrieve CLN splice feerate", exc)
 
         if not isinstance(result, dict):
             raise RuntimeError("CLN feerates returned an invalid response")
@@ -760,7 +764,7 @@ class CLNBackend(LightningBackend):
             try:
                 result = self.rpc.parsefeerate(str(feerate))
             except Exception as exc:
-                raise RuntimeError(f"Failed to parse CLN feerate: {exc}") from exc
+                _raise_cln_error("Failed to parse CLN feerate", exc)
 
             if not isinstance(result, dict):
                 raise RuntimeError("CLN parsefeerate returned an invalid response")
