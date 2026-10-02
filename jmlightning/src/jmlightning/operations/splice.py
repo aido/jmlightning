@@ -24,6 +24,7 @@ from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.lifecycle import LifecyclePhase, OperationLifecycle
 from jmlightning.planner import ExecutionPlan, Planner
 from jmlightning.policy import Capability, PolicyEngine
+from jmlightning.psbt import psbt_from_base64
 from jmlightning.recovery import RecoveryJournal
 from jmlightning.tx_builder import TxBuilder
 
@@ -357,10 +358,7 @@ class SpliceInOperation:
                 )
 
             try:
-                initial_psbt = base64.b64decode(
-                    returned_psbt,
-                    validate=True,
-                )
+                initial_psbt = psbt_from_base64(returned_psbt)
             except (ValueError, binascii.Error) as exc:
                 lifecycle.release_locks = False
                 raise SpliceRecoveryRequiredError(
@@ -553,10 +551,7 @@ class SpliceInOperation:
                     )
 
                 try:
-                    splice_psbt = base64.b64decode(
-                        returned_psbt,
-                        validate=True,
-                    )
+                    splice_psbt = psbt_from_base64(returned_psbt)
                 except (ValueError, binascii.Error) as exc:
                     raise SpliceRecoveryRequiredError(
                         "CLN splice_update returned an invalid PSBT encoding; "
@@ -747,10 +742,7 @@ class SpliceInOperation:
             txid = returned_txid
 
             try:
-                base64.b64decode(
-                    returned_psbt,
-                    validate=True,
-                )
+                psbt_from_base64(returned_psbt)
             except (ValueError, binascii.Error) as exc:
                 raise SpliceRecoveryRequiredError(
                     "CLN splice_signed returned an invalid PSBT encoding; "
@@ -913,7 +905,7 @@ class SpliceOutOperation:
                 )
 
             try:
-                output_psbt = base64.b64decode(output_psbt_b64, validate=True)
+                output_psbt = psbt_from_base64(output_psbt_b64)
                 fee, weight = estimate_splice_out_fee(
                     psbt=output_psbt,
                     feerate_per_kw=feerate_per_kw,
@@ -958,7 +950,7 @@ class SpliceOutOperation:
                         locked_outpoints=(),
                     )
                 try:
-                    output_psbt = base64.b64decode(output_psbt_b64, validate=True)
+                    output_psbt = psbt_from_base64(output_psbt_b64)
                 except (ValueError, binascii.Error) as exc:
                     raise SpliceRecoveryRequiredError(
                         "CLN addpsbtoutput returned an invalid sweep PSBT encoding",
@@ -1008,7 +1000,7 @@ class SpliceOutOperation:
                     locked_outpoints=(),
                 )
             try:
-                splice_psbt = base64.b64decode(returned_psbt, validate=True)
+                splice_psbt = psbt_from_base64(returned_psbt)
             except (ValueError, binascii.Error) as exc:
                 raise SpliceRecoveryRequiredError(
                     "CLN splice_init returned an invalid PSBT encoding",
@@ -1044,7 +1036,7 @@ class SpliceOutOperation:
                         locked_outpoints=(),
                     )
                 try:
-                    splice_psbt = base64.b64decode(returned_psbt, validate=True)
+                    splice_psbt = psbt_from_base64(returned_psbt)
                 except (ValueError, binascii.Error) as exc:
                     raise SpliceRecoveryRequiredError(
                         "CLN splice_update returned an invalid PSBT encoding",

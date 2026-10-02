@@ -1127,6 +1127,7 @@ Use appropriate secret-management mechanisms for production deployments.
 │           ├── models.py
 │           ├── policy.py
 │           ├── planner.py
+│           ├── psbt.py
 │           ├── recovery.py
 │           ├── tx_builder.py
 │           │

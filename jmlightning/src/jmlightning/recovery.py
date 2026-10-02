@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from jmlightning.lightning.backend import ChannelFundingStatus
 from jmlightning.models import Outpoint
+from jmlightning.psbt import psbt_from_base64
 
 T = TypeVar("T")
 
@@ -456,7 +457,7 @@ class RecoveryManager:
                         for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
                     },
                     psbt=(
-                        base64.b64decode(record.psbt)
+                        psbt_from_base64(record.psbt)
                         if record.psbt is not None
                         else None
                     ),
@@ -517,7 +518,7 @@ class RecoveryManager:
                     for owner_txid, owner_vout in [owner_key.rsplit(":", 1)]
                 },
                 psbt=(
-                    base64.b64decode(record.psbt) if record.psbt is not None else None
+                    psbt_from_base64(record.psbt) if record.psbt is not None else None
                 ),
                 txid=record.txid,
             )
