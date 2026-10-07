@@ -13,6 +13,7 @@ from typer.testing import CliRunner
 
 import jmlightning.cli as cli
 import jmlightning.config as config
+from jmlightning.lightning.backend import FeePriority
 from jmlightning.operations.multi_open_channel import MultiOpenChannelCancelledError
 from jmlightning.operations.open_channel import (
     OpenChannelCancelledError,
@@ -185,6 +186,7 @@ def test_build_cln_config_resolves_backend_and_maps_settings(
     assert result.creation_height == resolved.creation_height
     assert result.amount == 250_000
     assert result.mixdepth == 0
+    assert result.fee_priority == FeePriority.NORMAL
     assert result.network.value == "regtest"
     assert result.bitcoin_network is not None
     assert result.bitcoin_network.value == "regtest"
@@ -266,6 +268,33 @@ def test_build_cln_config_maps_close_to(
     )
 
     assert captured["close_to"] == "bcrt1qexample"
+
+
+def test_build_cln_config_maps_fee_priority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    backend = _backend()
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        config,
+        "resolve_backend_settings",
+        lambda *args, **kwargs: backend,
+    )
+    monkeypatch.setattr(
+        config,
+        "CLNConfig",
+        lambda **kwargs: captured.update(kwargs) or kwargs,
+    )
+
+    config.build_cln_config(
+        settings=settings,
+        resolved_mnemonic=_resolved_mnemonic(),
+        fee_priority=FeePriority.HIGH,
+    )
+
+    assert captured["fee_priority"] == FeePriority.HIGH
 
 
 def test_open_channel_exits_when_mnemonic_cannot_be_resolved(
@@ -430,6 +459,45 @@ def test_open_channel_passes_close_to_to_config_builder(
     assert build_calls["close_to"] == "bcrt1qexample"
 
 
+def test_open_channel_passes_fee_priority_to_config_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    build_calls: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: build_calls.update(kwargs) or object(),
+    )
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def execute(self, *, peer_id: str, confirm: object) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "OpenChannelOperation", FakeOperation)
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.open_channel(
+        peer_id="peer",
+        amount=100_000,
+        fee_priority=FeePriority.HIGH,
+        yes=True,
+    )
+
+    assert build_calls["fee_priority"] == FeePriority.HIGH
+
+
 def test_open_channel_passes_confirmation_callback_by_default(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -482,6 +550,49 @@ def test_open_channel_passes_confirmation_callback_by_default(
     )
 
     assert confirms == [confirm_open_channel]
+
+
+def test_multi_open_channel_passes_fee_priority_to_config_builder(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    build_calls: dict[str, object] = {}
+
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(
+        cli,
+        "build_cln_config",
+        lambda **kwargs: build_calls.update(kwargs) or object(),
+    )
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        def execute(
+            self,
+            *,
+            destinations: list[tuple[str, int, str | None]],
+            confirm: object,
+        ) -> None:
+            pass
+
+    monkeypatch.setattr(cli, "MultiOpenChannelOperation", FakeOperation)
+    monkeypatch.setattr(
+        asyncio,
+        "run",
+        lambda awaitable: _close_awaitable(awaitable),
+    )
+
+    cli.multi_open_channel(
+        destination=["peer:100000"],
+        fee_priority=FeePriority.ECONOMY,
+        yes=True,
+    )
+
+    assert build_calls["fee_priority"] == FeePriority.ECONOMY
 
 
 def test_multi_open_channel_exits_cleanly_when_cancelled(

@@ -27,6 +27,7 @@ from jmcore.settings import ensure_config_file
 from loguru import logger
 
 from jmlightning.config import CLNConfig, build_cln_config
+from jmlightning.lightning.backend import FeePriority
 from jmlightning.operations.multi_open_channel import (
     MultiOpenChannelCancelledError,
     MultiOpenChannelOperation,
@@ -120,6 +121,13 @@ def open_channel(
             help="Source mixdepth (default 0)",
         ),
     ] = None,
+    fee_priority: Annotated[
+        FeePriority,
+        typer.Option(
+            "--fee-priority",
+            help="Fee priority for channel funding (default normal)",
+        ),
+    ] = FeePriority.NORMAL,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -186,6 +194,7 @@ def open_channel(
         amount=amount,
         mixdepth=mixdepth,
         close_to=close_to,
+        fee_priority=fee_priority,
     )
 
     confirm = None if yes else confirm_open_channel
@@ -229,6 +238,13 @@ def multi_open_channel(
             help="Source mixdepth (default 0)",
         ),
     ] = None,
+    fee_priority: Annotated[
+        FeePriority,
+        typer.Option(
+            "--fee-priority",
+            help="Fee priority for channel funding (default normal)",
+        ),
+    ] = FeePriority.NORMAL,
     data_dir: Annotated[
         Path | None,
         typer.Option(
@@ -306,6 +322,7 @@ def multi_open_channel(
         resolved_mnemonic=resolved,
         amount=sum(amount for _, amount, _ in destinations),
         mixdepth=mixdepth,
+        fee_priority=fee_priority,
     )
 
     confirm = None if yes else confirm_multi_open_channel

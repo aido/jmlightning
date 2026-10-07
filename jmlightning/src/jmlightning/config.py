@@ -49,6 +49,7 @@ def build_cln_config(
     amount: int = 0,
     mixdepth: int | None = None,
     close_to: str | None = None,
+    fee_priority: FeePriority = FeePriority.NORMAL,
 ) -> CLNConfig:
     """Build the JoinMarket Lightning configuration from common settings."""
     wallet = settings.wallet
@@ -93,4 +94,5 @@ def build_cln_config(
         amount=amount,
         mixdepth=0 if mixdepth is None else mixdepth,
         close_to=close_to,
+        fee_priority=fee_priority,
     )

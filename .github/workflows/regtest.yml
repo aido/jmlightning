@@ -18,7 +18,7 @@ env:
   PYTHON_VERSION: "3.11"
   JMNG_VERSION: "0.40.0"
   BITCOIN_VERSION: "30.2"
-  CLN_VERSION: "26.06.8"
+  CLN_VERSION: "26.06.9"
   PEERSWAP_VERSION: "7.0.0"
   GO_VERSION: "1.23.4"
 
@@ -327,7 +327,15 @@ jobs:
         run: |
           set -euo pipefail
 
-          mkdir -p "$CLN_PEER1_DATADIR"
+          mkdir -p "$CLN_PEER1_DATADIR/regtest/peerswap"
+
+          cat > "$CLN_PEER1_DATADIR/regtest/peerswap/peerswap.conf" <<'EOF'
+          [Bitcoin]
+          rpcuser="test"
+          rpcpassword="test"
+          rpchost="http://127.0.0.1"
+          rpcport=18443
+          EOF
 
           CLN_PEER1_RPC_SOCKET="$CLN_PEER1_DATADIR/regtest/lightning-rpc"
 
@@ -409,7 +417,15 @@ jobs:
           set -euo pipefail
 
           rm -rf "$CLN_PEER2_DATADIR"
-          mkdir -p "$CLN_PEER2_DATADIR"
+          mkdir -p "$CLN_PEER2_DATADIR/regtest/peerswap"
+
+          cat > "$CLN_PEER2_DATADIR/regtest/peerswap/peerswap.conf" <<'EOF'
+          [Bitcoin]
+          rpcuser="test"
+          rpcpassword="test"
+          rpchost="http://127.0.0.1"
+          rpcport=18443
+          EOF
 
           CLN_PEER2_RPC_SOCKET="$CLN_PEER2_DATADIR/regtest/lightning-rpc"
 
@@ -422,13 +438,13 @@ jobs:
             --lightning-dir="$CLN_PEER2_DATADIR" \
             --rpc-file="$CLN_PEER2_RPC_SOCKET" \
             --plugin="$(command -v jm-peerswap)" \
-            --addr=127.0.0.1:19735 \
-            --grpc-host=127.0.0.1 \
-            --grpc-port=19736 \
             --bitcoin-rpcconnect=127.0.0.1 \
             --bitcoin-rpcport=18443 \
             --bitcoin-rpcuser=test \
             --bitcoin-rpcpassword=test \
+            --addr=127.0.0.1:19735 \
+            --grpc-host=127.0.0.1 \
+            --grpc-port=19736 \
             --log-file="$CLN_PEER2_DATADIR/lightningd.log" \
             --daemon
 
@@ -481,7 +497,15 @@ jobs:
           set -euo pipefail
 
           rm -rf "$CLN_PEER3_DATADIR"
-          mkdir -p "$CLN_PEER3_DATADIR"
+          mkdir -p "$CLN_PEER3_DATADIR/regtest/peerswap"
+
+          cat > "$CLN_PEER3_DATADIR/regtest/peerswap/peerswap.conf" <<'EOF'
+          [Bitcoin]
+          rpcuser="test"
+          rpcpassword="test"
+          rpchost="http://127.0.0.1"
+          rpcport=18443
+          EOF
 
           CLN_PEER3_RPC_SOCKET="$CLN_PEER3_DATADIR/regtest/lightning-rpc"
 
@@ -493,13 +517,13 @@ jobs:
             --lightning-dir="$CLN_PEER3_DATADIR" \
             --rpc-file="$CLN_PEER3_RPC_SOCKET" \
             --plugin="$(command -v jm-peerswap)" \
-            --addr=127.0.0.1:19737 \
-            --grpc-host=127.0.0.1 \
-            --grpc-port=19738 \
             --bitcoin-rpcconnect=127.0.0.1 \
             --bitcoin-rpcport=18443 \
             --bitcoin-rpcuser=test \
             --bitcoin-rpcpassword=test \
+            --addr=127.0.0.1:19737 \
+            --grpc-host=127.0.0.1 \
+            --grpc-port=19738 \
             --log-file="$CLN_PEER3_DATADIR/lightningd.log" \
             --daemon
 

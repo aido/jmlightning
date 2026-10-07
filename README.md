@@ -212,6 +212,17 @@ jm-lightning open-channel \
 
 `close_to` is the address supplied to CLN's `fundchannel_start` for the channel's upfront shutdown script. If `--close-to` is requested, `jmlightning` requires CLN to confirm that the address was negotiated; it does not silently continue without the requested setting. This affects the agreed upfront shutdown script for a future mutual close and is not a close-time command.
 
+The transaction fee priority can be selected with `--fee-priority`. It accepts `high`, `normal` or `economy` and defaults to **`normal`** when the option is not provided. The priority is passed to CLN when obtaining the channel funding fee rate: `high` targets a faster confirmation, `normal` uses the standard target and `economy` targets a slower confirmation.
+
+For example:
+
+```bash
+jm-lightning open-channel \
+  02abc1234567890abcdef1234567890abcdef1234567890abcdef1234567890 \
+  --amount 1000000 \
+  --fee-priority high
+```
+
 The important part of this command is not simply the requested amount.
 
 The application will:
@@ -273,6 +284,8 @@ jm-lightning multi-open-channel \
 ```
 
 The amounts are the individual channel funding amounts. `close_to` is optional and is specified independently for each destination. Existing `PEER_ID:AMOUNT_SATS` destinations remain valid without it. If a `close_to` address is supplied, CLN must confirm that it was negotiated for that channel. The JoinMarket planner selects enough policy-approved UTXOs to fund their combined value, the transaction fee and any required change.
+
+The same `--fee-priority` option is available for multi-channel funding. It accepts `high`, `normal` or `economy` and defaults to **`normal`** when omitted. The selected priority applies to the shared Bitcoin transaction's CLN fee estimate.
 
 The application will:
 
