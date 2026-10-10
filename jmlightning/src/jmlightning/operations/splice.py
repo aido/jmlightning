@@ -52,6 +52,15 @@ class SpliceRecoveryRequiredError(RuntimeError):
         self.locked_outpoints = locked_outpoints
 
 
+class SpliceCancelledError(SpliceRecoveryRequiredError):
+    """Raised when the user declines after CLN has started splice negotiation.
+
+    CLN's low-level splice flow has no supported abort RPC in the bundled
+    version. Keep recovery metadata and JoinMarket locks rather than pretending
+    the operation was cancelled safely.
+    """
+
+
 class SpliceInOperation:
     """
     Execute a CLN channel splice-in using JoinMarket UTXOs.
@@ -612,7 +621,7 @@ class SpliceInOperation:
                 splice_psbt,
             ):
                 logger.info("Channel splice-in declined by user.")
-                raise SpliceRecoveryRequiredError(
+                raise SpliceCancelledError(
                     "Channel splice-in declined by user; "
                     "JoinMarket UTXO remains locked for recovery",
                     channel_id=channel_id,
@@ -1065,8 +1074,9 @@ class SpliceOutOperation:
             if confirm is not None and not confirm(
                 channel_id, amount, fee, splice_psbt
             ):
-                raise SpliceRecoveryRequiredError(
-                    "Channel splice-out declined by user",
+                raise SpliceCancelledError(
+                    "Channel splice-out declined by user; "
+                    "CLN splice state may require recovery",
                     channel_id=channel_id,
                     txid=None,
                     locked_outpoints=(),

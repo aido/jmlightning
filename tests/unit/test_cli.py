@@ -19,7 +19,10 @@ from jmlightning.operations.open_channel import (
     OpenChannelCancelledError,
     confirm_open_channel,
 )
-from jmlightning.operations.splice import confirm_splice_in
+from jmlightning.operations.splice import (
+    SpliceCancelledError,
+    confirm_splice_in,
+)
 
 runner = CliRunner()
 
@@ -945,3 +948,71 @@ def test_main_hardens_process_and_starts_typer_app(
     cli.main()
 
     assert calls == ["harden", "app"]
+
+
+def test_splice_in_decline_exits_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(cli, "build_cln_config", lambda **kwargs: object())
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def execute(self, **kwargs: object) -> str:
+            raise SpliceCancelledError(
+                "Channel splice-in declined by user; JoinMarket UTXO "
+                "remains locked for recovery",
+                channel_id="22" * 32,
+                txid=None,
+                locked_outpoints=(),
+            )
+
+    monkeypatch.setattr(cli, "SpliceInOperation", FakeOperation)
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.splice_in(channel_id="22" * 32, amount=100_000)
+
+    assert exc_info.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "declined by user" in captured.err
+    assert "Recovery state" in captured.err
+    assert "Traceback" not in captured.err
+
+
+def test_splice_out_decline_exits_without_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    settings = _settings()
+    resolved = _resolved_mnemonic()
+    monkeypatch.setattr(cli, "setup_cli", lambda **kwargs: settings)
+    monkeypatch.setattr(cli, "resolve_mnemonic", lambda *args, **kwargs: resolved)
+    monkeypatch.setattr(cli, "build_cln_config", lambda **kwargs: object())
+
+    class FakeOperation:
+        def __init__(self, **kwargs: object) -> None:
+            pass
+
+        async def execute(self, **kwargs: object) -> str:
+            raise SpliceCancelledError(
+                "Channel splice-out declined by user; CLN splice state "
+                "may require recovery",
+                channel_id="22" * 32,
+                txid=None,
+                locked_outpoints=(),
+            )
+
+    monkeypatch.setattr(cli, "SpliceOutOperation", FakeOperation)
+    with pytest.raises(typer.Exit) as exc_info:
+        cli.splice_out(channel_id="22" * 32, amount=100_000)
+
+    assert exc_info.value.exit_code == 1
+    captured = capsys.readouterr()
+    assert "declined by user" in captured.err
+    assert "no automatic abort was confirmed" in captured.err
+    assert "Traceback" not in captured.err

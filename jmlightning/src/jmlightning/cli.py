@@ -40,6 +40,7 @@ from jmlightning.operations.open_channel import (
 )
 from jmlightning.operations.peerswap import PeerSwapPrepareTxOperation, PeerSwapRuntime
 from jmlightning.operations.splice import (
+    SpliceCancelledError,
     SpliceInOperation,
     SpliceOutOperation,
     confirm_splice_in,
@@ -125,7 +126,7 @@ def open_channel(
         FeePriority,
         typer.Option(
             "--fee-priority",
-            help="Fee priority for channel funding (default normal)",
+            help="Fee priority for channel funding",
         ),
     ] = FeePriority.NORMAL,
     data_dir: Annotated[
@@ -242,7 +243,7 @@ def multi_open_channel(
         FeePriority,
         typer.Option(
             "--fee-priority",
-            help="Fee priority for channel funding (default normal)",
+            help="Fee priority for channel funding",
         ),
     ] = FeePriority.NORMAL,
     data_dir: Annotated[
@@ -437,15 +438,24 @@ def splice_in(
 
     confirm = None if yes else confirm_splice_in
 
-    splice_txid = asyncio.run(
-        SpliceInOperation(
-            config=config,
-            cln_socket=cln_socket,
-        ).execute(
-            channel_id=channel_id,
-            confirm=confirm,
+    try:
+        splice_txid = asyncio.run(
+            SpliceInOperation(
+                config=config,
+                cln_socket=cln_socket,
+            ).execute(
+                channel_id=channel_id,
+                confirm=confirm,
+            )
         )
-    )
+    except SpliceCancelledError as exc:
+        typer.echo(str(exc), err=True)
+        typer.echo(
+            "The splice was not signed by JoinMarket. Recovery state and any "
+            "existing UTXO locks have been retained for safety.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
     typer.echo(f"Splice transaction: {splice_txid}")
 
 
@@ -504,13 +514,22 @@ def splice_out(
         mixdepth=mixdepth,
     )
     confirm = None if yes else confirm_splice_out
-    splice_txid = asyncio.run(
-        SpliceOutOperation(config=config, cln_socket=cln_socket).execute(
-            channel_id=channel_id,
-            amount=amount,
-            confirm=confirm,
+    try:
+        splice_txid = asyncio.run(
+            SpliceOutOperation(config=config, cln_socket=cln_socket).execute(
+                channel_id=channel_id,
+                amount=amount,
+                confirm=confirm,
+            )
         )
-    )
+    except SpliceCancelledError as exc:
+        typer.echo(str(exc), err=True)
+        typer.echo(
+            "The splice was not signed by JoinMarket. CLN's splice state may "
+            "require recovery; no automatic abort was confirmed.",
+            err=True,
+        )
+        raise typer.Exit(1) from None
     typer.echo(f"Splice transaction: {splice_txid}")
 
 

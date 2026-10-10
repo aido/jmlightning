@@ -9,6 +9,7 @@ from jmwallet.wallet.models import UTXOInfo
 from jmlightning.lightning.backend import FeePriority
 from jmlightning.models import ClassifiedUTXO, Outpoint
 from jmlightning.operations.splice import (
+    SpliceCancelledError,
     SpliceInOperation,
     SpliceOutOperation,
     SpliceRecoveryRequiredError,
@@ -352,7 +353,7 @@ async def test_splice_out_confirmation_decline_does_not_sign(tmp_path: Path) -> 
         ),
     ):
         operation = SpliceOutOperation(config, Path("/tmp/lightning-rpc"))
-        with pytest.raises(SpliceRecoveryRequiredError, match="declined"):
+        with pytest.raises(SpliceCancelledError, match="declined"):
             await operation.execute(
                 "22" * 32,
                 100_000,
@@ -681,7 +682,7 @@ async def test_confirmation_rejection_prevents_splice_signed(tmp_path: Path) -> 
         )
 
         with pytest.raises(
-            SpliceRecoveryRequiredError,
+            SpliceCancelledError,
             match="splice-in declined",
         ):
             await operation.execute("22" * 32, confirm=confirm)
