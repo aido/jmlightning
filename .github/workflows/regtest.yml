@@ -14,19 +14,38 @@ on:
 permissions:
   contents: read
 
-env:
-  PYTHON_VERSION: "3.11"
-  JMNG_VERSION: "0.40.0"
-  BITCOIN_VERSION: "30.2"
-  CLN_VERSION: "26.06.9"
-  PEERSWAP_VERSION: "7.0.0"
-  GO_VERSION: "1.23.4"
-
 jobs:
   regtest:
     name: Integration tests & Coverage
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+          fail-fast: false
+          matrix:
+            include:
+              # Target 1: Minimum Supported Stack
+              - name: "Min Stack (Py3.11 / JM 0.40 / CLN 26.06.9 / BTC 30.2)"
+                python-version: "3.11"
+                jmng-version: "0.40.0"
+                cln-version: "26.06.9"
+                bitcoin-version: "30.2"
+                peerswap-version: "7.0.0"
+
+              # Target 2: Current Production Stack (Default)
+              - name: "Production Stack (Py3.13 / JM 0.41 / CLN 26.06.9 / BTC 31.0)"
+                python-version: "3.13"
+                jmng-version: "0.41.0"
+                cln-version: "26.06.9"
+                bitcoin-version: "31.0"
+                peerswap-version: "7.0.0"
+
+              # Target 3: Bleeding-Edge Stack
+              - name: "Production Stack (Py3.14 / JM 0.41 / CLN 26.06.9 / BTC 31.1)"
+                python-version: "3.14"
+                jmng-version: "0.41.0"
+                cln-version: "26.06.9"
+                bitcoin-version: "31.1"
+                peerswap-version: "7.0.0"
 
     steps:
       - name: Checkout jmlightning
@@ -35,7 +54,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v7
         with:
-          python-version: ${{ env.PYTHON_VERSION }}
+          python-version: ${{ matrix.python-version }}
 
       - name: Install runtime dependencies
         run: |
@@ -59,9 +78,9 @@ jobs:
         run: |
           set -euo pipefail
 
-          BITCOIN_ARCHIVE="bitcoin-${BITCOIN_VERSION}-x86_64-linux-gnu.tar.gz"
-          BITCOIN_BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${BITCOIN_VERSION}"
-          BITCOIN_DIR="/opt/bitcoin-${BITCOIN_VERSION}"
+          BITCOIN_ARCHIVE="bitcoin-${{ matrix.bitcoin-version }}-x86_64-linux-gnu.tar.gz"
+          BITCOIN_BASE_URL="https://bitcoincore.org/bin/bitcoin-core-${{ matrix.bitcoin-version }}"
+          BITCOIN_DIR="/opt/bitcoin-${{ matrix.bitcoin-version }}"
 
           curl --fail --location --silent --show-error \
             --retry 5 \
@@ -100,18 +119,18 @@ jobs:
           bitcoind --version
           bitcoin-cli --version
 
-          bitcoind --version | grep -F "${BITCOIN_VERSION}"
+          bitcoind --version | grep -F "${{ matrix.bitcoin-version }}"
 
       - name: Set up Go
-        uses: actions/setup-go@v6
+        uses: actions/setup-go@v7
         with:
-          go-version: ${{ env.GO_VERSION }}
+          go-version: "stable"
 
       - name: Build PeerSwap
         run: |
           set -euo pipefail
 
-          git clone --depth 1 --branch "v${PEERSWAP_VERSION}" \
+          git clone --depth 1 --branch "v${{ matrix.peerswap-version }}" \
             https://github.com/ElementsProject/peerswap.git \
             "$RUNNER_TEMP/peerswap"
 
@@ -128,8 +147,8 @@ jobs:
         run: |
           set -euo pipefail
 
-          CLN_ARCHIVE="clightning-v${CLN_VERSION}-${CLN_PLATFORM}.tar.xz"
-          CLN_BASE_URL="https://github.com/ElementsProject/lightning/releases/download/v${CLN_VERSION}"
+          CLN_ARCHIVE="clightning-v${{ matrix.cln-version }}-${CLN_PLATFORM}.tar.xz"
+          CLN_BASE_URL="https://github.com/ElementsProject/lightning/releases/download/v${{ matrix.cln-version }}"
           CLN_INSTALL_DIR="/usr/local"
 
           curl --fail --location --silent --show-error \
@@ -141,12 +160,12 @@ jobs:
           curl --fail --location --silent --show-error \
             --retry 5 \
             --retry-delay 2 \
-            --output "$RUNNER_TEMP/SHA256SUMS-v${CLN_VERSION}" \
-            "$CLN_BASE_URL/SHA256SUMS-v${CLN_VERSION}"
+            --output "$RUNNER_TEMP/SHA256SUMS-v${{ matrix.cln-version }}" \
+            "$CLN_BASE_URL/SHA256SUMS-v${{ matrix.cln-version }}"
 
           cd "$RUNNER_TEMP"
 
-          grep -F " $CLN_ARCHIVE" "SHA256SUMS-v${CLN_VERSION}" \
+          grep -F " $CLN_ARCHIVE" "SHA256SUMS-v${{ matrix.cln-version }}" \
             | sha256sum --check --strict -
 
           sudo tar \
@@ -161,7 +180,7 @@ jobs:
           lightningd --version
           lightning-cli --version
 
-          lightningd --version | grep -F "$CLN_VERSION"
+          lightningd --version | grep -F "${{ matrix.cln-version }}"
 
       - name: Install JoinMarket-NG
         run: |
@@ -169,8 +188,8 @@ jobs:
 
           python -m pip install --upgrade pip
           python -m pip install \
-            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmcore" \
-            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${JMNG_VERSION}#subdirectory=jmwallet"
+            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${{ matrix.jmng-version }}#subdirectory=jmcore" \
+            "git+https://github.com/joinmarket-ng/joinmarket-ng.git@${{ matrix.jmng-version }}#subdirectory=jmwallet"
           python -m pip install ./jmlightning
           python -m pip install ./jmpeerswap
           python -m pip install pytest pytest-cov

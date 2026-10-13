@@ -14,7 +14,7 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.11"
-  JMNG_VERSION: "0.40.0"
+  JMNG_VERSION: "0.41.0"
 
 jobs:
   analyse:
