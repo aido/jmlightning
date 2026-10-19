@@ -23,15 +23,13 @@ jobs:
           fail-fast: false
           matrix:
             include:
-              # Target 1: Minimum Supported Stack
-              - name: "Min Stack (Py3.11 / JM 0.40 / CLN 26.06.9 / BTC 30.2)"
+              - name: "Minimum Supported Stack (Py3.11 / JM 0.40 / CLN 26.06.9 / BTC 30.2)"
                 python-version: "3.11"
                 jmng-version: "0.40.0"
                 cln-version: "26.06.9"
                 bitcoin-version: "30.2"
                 peerswap-version: "7.0.0"
 
-              # Target 2: Current Production Stack (Default)
               - name: "Production Stack (Py3.13 / JM 0.41 / CLN 26.06.9 / BTC 31.0)"
                 python-version: "3.13"
                 jmng-version: "0.41.0"
@@ -39,10 +37,9 @@ jobs:
                 bitcoin-version: "31.0"
                 peerswap-version: "7.0.0"
 
-              # Target 3: Bleeding-Edge Stack
-              - name: "Production Stack (Py3.14 / JM 0.41 / CLN 26.06.9 / BTC 31.1)"
+              - name: "Bleeding-edge Stack (Py3.14 / JM 0.42 / CLN 26.06.9 / BTC 31.1)"
                 python-version: "3.14"
-                jmng-version: "0.41.0"
+                jmng-version: "0.42.0"
                 cln-version: "26.06.9"
                 bitcoin-version: "31.1"
                 peerswap-version: "7.0.0"

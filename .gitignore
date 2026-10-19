@@ -3,6 +3,8 @@ __pycache__/
 .ruff_cache/
 .mypy_cache/
 mypy-html/
+dist/
+*.egg-info/
 .coverage
 mypy-junit.xml
 ruff-junit.xml
