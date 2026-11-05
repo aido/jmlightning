@@ -54,6 +54,7 @@ async def test_txprepare_builds_and_locks_joinmarket_transaction() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -64,6 +65,7 @@ async def test_txprepare_builds_and_locks_joinmarket_transaction() -> None:
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     plan.funding_outputs = [Mock()]
 
     tx_builder = Mock()
@@ -113,6 +115,7 @@ async def test_txprepare_builds_and_locks_joinmarket_transaction() -> None:
         change_address=PEERSWAP_CHANGE_ADDRESS,
         wallet=adapter.require_wallet.return_value,
         finalise_psbt=True,
+        previous_transactions=[b"previous-tx"],
     )
     adapter.close.assert_not_awaited()
 
@@ -125,6 +128,7 @@ async def test_txprepare_raises_fee_to_bitcoin_mempool_minimum() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -135,6 +139,7 @@ async def test_txprepare_raises_fee_to_bitcoin_mempool_minimum() -> None:
     cln.get_fee_rate.return_value = 0.06325
 
     plan = Mock()
+    plan.inputs = [coin]
     tx_builder = Mock()
     tx_builder.build_and_sign_multifunding_tx.return_value = (
         Mock(),
@@ -183,6 +188,7 @@ async def test_txprepare_releases_locks_when_transaction_build_fails() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -193,6 +199,7 @@ async def test_txprepare_releases_locks_when_transaction_build_fails() -> None:
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     tx_builder = Mock()
     tx_builder.build_and_sign_multifunding_tx.side_effect = RuntimeError("build failed")
 
@@ -228,6 +235,7 @@ async def test_prepared_result_matches_cln_txprepare_response() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = "bcrt1qchange"
@@ -238,6 +246,7 @@ async def test_prepared_result_matches_cln_txprepare_response() -> None:
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     plan.funding_outputs = [Mock()]
 
     tx_builder = Mock()
@@ -321,6 +330,7 @@ async def test_send_broadcasts_prepared_transaction_and_retains_reservations(
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -332,6 +342,7 @@ async def test_send_broadcasts_prepared_transaction_and_retains_reservations(
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     plan.funding_outputs = [Mock()]
 
     tx_builder = Mock()
@@ -386,6 +397,7 @@ async def test_send_keeps_prepared_transaction_when_broadcast_fails(
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -396,6 +408,7 @@ async def test_send_keeps_prepared_transaction_when_broadcast_fails(
     cln = Mock()
     cln.get_fee_rate.return_value = 1.0
     plan = Mock()
+    plan.inputs = [coin]
     plan.funding_outputs = [Mock()]
     tx_builder = Mock()
     tx_builder.build_and_sign_multifunding_tx.return_value = (
@@ -870,6 +883,7 @@ async def test_txprepare_canonicalises_builder_transaction_id() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -880,6 +894,7 @@ async def test_txprepare_canonicalises_builder_transaction_id() -> None:
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     tx_builder = Mock()
     tx_builder.build_and_sign_multifunding_tx.return_value = (
         Mock(),
@@ -917,6 +932,7 @@ async def test_txprepare_rejects_invalid_transaction_id_from_builder() -> None:
     adapter = Mock()
     adapter.connect = AsyncMock()
     adapter.close = AsyncMock()
+    adapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     adapter.get_utxos.return_value = [coin]
     adapter.select_utxos.return_value = [coin.utxo]
     adapter.get_change_address.return_value = PEERSWAP_CHANGE_ADDRESS
@@ -927,6 +943,7 @@ async def test_txprepare_rejects_invalid_transaction_id_from_builder() -> None:
     cln.get_fee_rate.return_value = 1.0
 
     plan = Mock()
+    plan.inputs = [coin]
     tx_builder = Mock()
     tx_builder.build_and_sign_multifunding_tx.return_value = (
         Mock(),

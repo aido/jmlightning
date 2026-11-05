@@ -84,6 +84,7 @@ async def test_execute_funds_multiple_channels_with_one_transaction(
         funding_addresses=["bc1qfunding-a", "bc1qfunding-b"],
         change_address="bc1qchange",
         wallet=jmadapter.require_wallet.return_value,
+        previous_transactions=[b"previous-tx"],
     )
     assert cln.open_channel_complete.call_count == 2
     cln.open_channel_complete.assert_any_call(peer_id=PEER_A, psbt=b"signed-psbt")
@@ -494,6 +495,7 @@ def _build_test_doubles(
     jmadapter = Mock()
     jmadapter.connect = AsyncMock()
     jmadapter.close = AsyncMock()
+    jmadapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     jmadapter.get_utxos.return_value = [coin]
     jmadapter.select_utxos.return_value = [utxo]
     jmadapter.get_change_address.return_value = "bc1qchange"

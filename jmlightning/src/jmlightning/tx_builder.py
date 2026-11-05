@@ -112,6 +112,7 @@ class TxBuilder:
         change_address: str | None,
         wallet: WalletService,
         finalise_psbt: bool = False,
+        previous_transactions: list[bytes] | None = None,
     ) -> tuple[ParsedTransaction, str, int, bytes]:
 
         self._validate_plan(plan)
@@ -208,6 +209,7 @@ class TxBuilder:
             psbt_inputs=psbt_inputs,
             wallet=wallet,
             finalise_transaction=finalise_psbt,
+            previous_transactions=previous_transactions,
         )
 
         return tx, txid, funding_vout, signed_psbt
@@ -219,6 +221,7 @@ class TxBuilder:
         change_address: str,
         wallet: WalletService,
         finalise_psbt: bool = False,
+        previous_transactions: list[bytes] | None = None,
     ) -> tuple[ParsedTransaction, str, bytes]:
         """Build and sign one transaction funding multiple channels."""
         self._validate_plan(plan)
@@ -308,6 +311,7 @@ class TxBuilder:
             psbt_inputs=psbt_inputs,
             wallet=wallet,
             finalise_transaction=finalise_psbt,
+            previous_transactions=previous_transactions,
         )
 
     def add_splice_in_input(
@@ -898,6 +902,7 @@ class TxBuilder:
         psbt_inputs: list[PSBTInput],
         wallet: WalletService,
         finalise_transaction: bool,
+        previous_transactions: list[bytes] | None = None,
     ) -> tuple[ParsedTransaction, str, bytes]:
         """Build and cryptographically validate a signed transaction PSBT."""
 
@@ -908,6 +913,53 @@ class TxBuilder:
             locktime=tx.locktime,
             psbt_inputs=psbt_inputs,
         )
+        if previous_transactions is not None:
+            if len(previous_transactions) != len(tx.inputs):
+                raise ValueError(
+                    "Previous transaction count must match funding input count"
+                )
+            parsed_psbt = parse_psbt(unsigned_psbt)
+            for index, (previous_tx, tx_input, input_map) in enumerate(
+                zip(
+                    previous_transactions,
+                    tx.inputs,
+                    parsed_psbt.input_maps,
+                    strict=True,
+                )
+            ):
+                try:
+                    parent = parse_transaction_bytes(previous_tx)
+                    parent_txid = hash256(
+                        serialize_transaction(
+                            parent.version,
+                            parent.inputs,
+                            parent.outputs,
+                            parent.locktime,
+                        )
+                    )[::-1].hex()
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(
+                        f"Invalid previous transaction for funding input {index}"
+                    ) from exc
+                if parent_txid != tx_input.txid:
+                    raise ValueError(
+                        f"Previous transaction txid mismatch for funding input {index}"
+                    )
+                if tx_input.vout >= len(parent.outputs):
+                    raise ValueError(
+                        f"Previous transaction output missing for funding input {index}"
+                    )
+                prevout = parent.outputs[tx_input.vout]
+                if (
+                    prevout.value != tx_input.value
+                    or prevout.script != tx_input.scriptpubkey
+                ):
+                    raise ValueError(
+                        "Previous transaction output mismatch "
+                        f"for funding input {index}"
+                    )
+                input_map.append(bytes([PSBT_IN_NON_WITNESS_UTXO]), previous_tx)
+            unsigned_psbt = parsed_psbt.serialize()
         signed_tx, txid, signed_psbt = self._sign_psbt(
             unsigned_psbt=unsigned_psbt,
             tx=tx,

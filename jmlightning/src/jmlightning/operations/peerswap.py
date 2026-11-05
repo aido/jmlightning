@@ -312,12 +312,17 @@ class PeerSwapPrepareTxOperation:
                 jmadapter.start_lock_renewal()
 
                 change_address = jmadapter.get_change_address(self.config.mixdepth)
+                previous_transactions = [
+                    await jmadapter.get_raw_transaction(coin.utxo.txid)
+                    for coin in plan.inputs
+                ]
                 tx, txid, psbt = tx_builder.build_and_sign_multifunding_tx(
                     plan=plan,
                     funding_addresses=[output.address for output in request.outputs],
                     change_address=change_address,
                     wallet=jmadapter.require_wallet(),
                     finalise_psbt=True,
+                    previous_transactions=previous_transactions,
                 )
                 self._validate_txid(txid, "JoinMarket transaction id")
                 logger.info(

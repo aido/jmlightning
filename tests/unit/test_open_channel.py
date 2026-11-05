@@ -47,6 +47,7 @@ async def test_send_psbt_failure_cancels_withheld_channel(tmp_path: Path) -> Non
     jmadapter = Mock()
     jmadapter.connect = AsyncMock()
     jmadapter.close = AsyncMock()
+    jmadapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     jmadapter.get_utxos.return_value = [coin]
     jmadapter.select_utxos.return_value = [utxo]
 
@@ -197,6 +198,7 @@ def _build_open_channel_test_doubles(
     jmadapter = Mock()
     jmadapter.connect = AsyncMock()
     jmadapter.close = AsyncMock()
+    jmadapter.get_raw_transaction = AsyncMock(return_value=b"previous-tx")
     jmadapter.get_utxos.return_value = [coin]
     jmadapter.select_utxos.return_value = [utxo]
 

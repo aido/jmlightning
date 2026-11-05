@@ -267,11 +267,16 @@ class MultiOpenChannelOperation:
 
             try:
                 change_address = jmadapter.get_change_address(self.config.mixdepth)
+                previous_transactions = [
+                    await jmadapter.get_raw_transaction(coin.utxo.txid)
+                    for coin in plan.inputs
+                ]
                 tx, txid, signed_psbt = tx_builder.build_and_sign_multifunding_tx(
                     plan=plan,
                     funding_addresses=funding_addresses,
                     change_address=change_address,
                     wallet=jmadapter.require_wallet(),
+                    previous_transactions=previous_transactions,
                 )
             except Exception as exc:
                 cleanup_errors.extend(self._cancel_started_channels(cln, started))
